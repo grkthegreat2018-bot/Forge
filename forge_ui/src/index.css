@@ -1,42 +1,47 @@
 @import "tailwindcss";
 
 @theme {
-  /* ── ForgeAI design tokens — edit here to retheme the whole app ── */
-  --color-bg: #0a0d13;
-  --color-bg-alt: #0e1219;
-  --color-panel: #12161f;
-  --color-panel-alt: #171d29;
-  --color-input: #0f141d;
-  --color-deep: #080a0f;
-  --color-border: #1e2534;
-  --color-border-hi: #2c3850;
-  --color-text: #e8edf5;
-  --color-text-dim: #93a0b4;
-  --color-text-faint: #5d687c;
-  --color-accent: #8aa3ff;
-  --color-accent-hi: #aebdff;
-  --color-accent-dim: #40508a;
-  --color-accent2: #3ad9c9;
-  --color-ok: #3fb950;
-  --color-warn: #d29922;
-  --color-err: #f85149;
-  --color-think: #bc8cff;
-  --color-grad-a: #8aa3ff;
-  --color-grad-b: #a06bff;
-  --color-bubble-user: #1d2740;
-  --color-bubble-user-border: #33436e;
-  --color-bubble-sys: #141a26;
-  --color-tool-bg: #111620;
-  --color-tool-border: #2a3450;
-  --color-think-bg: #0f1420;
-  --color-think-border: #3a2a5a;
-  --color-on-accent: #0b0e14;
+  /* ── ForgeAI Design System: Next-Gen AI Studio Tokens ── */
+  --color-bg: #080a0f;
+  --color-bg-alt: #0d1118;
+  --color-panel: #121722;
+  --color-panel-alt: #171d2b;
+  --color-panel-hover: #1e2638;
+  --color-input: #0c1017;
+  --color-deep: #05070a;
+  --color-border: #1c2436;
+  --color-border-hi: #2c3852;
+  --color-border-glow: #42557d;
+  --color-text: #eef3fb;
+  --color-text-dim: #9aa7bd;
+  --color-text-faint: #5b677d;
+  --color-accent: #7a97ff;
+  --color-accent-hi: #a7bcff;
+  --color-accent-dim: #3b4978;
+  --color-accent2: #2dd4bf;
+  --color-ok: #34d399;
+  --color-warn: #fbbf24;
+  --color-err: #f87171;
+  --color-think: #c084fc;
+  --color-grad-a: #6366f1;
+  --color-grad-b: #8b5cf6;
+  --color-bubble-user: #182238;
+  --color-bubble-user-border: #2e3d63;
+  --color-bubble-sys: #111622;
+  --color-tool-bg: #0f1420;
+  --color-tool-border: #232d44;
+  --color-think-bg: #111220;
+  --color-think-border: #352654;
+  --color-on-accent: #ffffff;
 
   --font-sans: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
   --font-mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
 
-  --radius-card: 0.75rem;
-  --shadow-card: 0 1px 3px rgb(0 0 0 / 0.35);
+  --radius-card: 0.85rem;
+  --shadow-card: 0 4px 20px -2px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.03);
+  --shadow-glow: 0 0 24px -4px rgba(122, 151, 255, 0.25);
+  --shadow-glow-warn: 0 0 24px -4px rgba(251, 191, 36, 0.25);
+  --shadow-glow-err: 0 0 24px -4px rgba(248, 113, 113, 0.25);
 }
 
 html, body, #root {
@@ -48,59 +53,103 @@ body {
   font-size: 14px;
 }
 
-/* scrollbars */
+/* custom scrollbars with hover transition */
 * {
   scrollbar-width: thin;
   scrollbar-color: var(--color-border-hi) transparent;
 }
-*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar { width: 6px; height: 6px; }
 *::-webkit-scrollbar-thumb {
   background: var(--color-border-hi);
-  border-radius: 4px;
+  border-radius: 9999px;
+  transition: background-color 0.2s ease;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-border-glow);
 }
 *::-webkit-scrollbar-track { background: transparent; }
 
-/* streaming token fade-in */
+/* Modern animations */
 @keyframes tok-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
+  from { opacity: 0; transform: translateY(2px); }
+  to { opacity: 1; transform: translateY(0); }
 }
-.tok-in { animation: tok-in 120ms ease-out; }
+.tok-in { animation: tok-in 140ms ease-out; }
 
 @keyframes pulse-dot {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.35; }
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.85); }
 }
-.pulse-dot { animation: pulse-dot 1.6s ease-in-out infinite; }
+.pulse-dot { animation: pulse-dot 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+
+@keyframes pulse-ring {
+  0% { transform: scale(0.95); opacity: 0.8; }
+  50% { transform: scale(1.15); opacity: 0.3; }
+  100% { transform: scale(0.95); opacity: 0.8; }
+}
+.pulse-ring { animation: pulse-ring 2.4s ease-in-out infinite; }
 
 @keyframes slide-in-left {
-  from { opacity: 0; transform: translateX(-8px); }
+  from { opacity: 0; transform: translateX(-10px); }
   to { opacity: 1; transform: translateX(0); }
 }
-.slide-in-left { animation: slide-in-left 160ms ease-out; }
+.slide-in-left { animation: slide-in-left 180ms cubic-bezier(0.16, 1, 0.3, 1); }
 
 @keyframes fade-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
+  from { opacity: 0; transform: scale(0.99); }
+  to { opacity: 1; transform: scale(1); }
 }
-.fade-in { animation: fade-in 140ms ease-out; }
+.fade-in { animation: fade-in 160ms cubic-bezier(0.16, 1, 0.3, 1); }
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.shimmer {
+  background: linear-gradient(90deg, rgba(255,255,255,0) 0%, rgba(255,255,255,0.06) 50%, rgba(255,255,255,0) 100%);
+  background-size: 200% 100%;
+  animation: shimmer 2s infinite;
+}
+
+/* Glass panel utility */
+.glass-panel {
+  background: rgba(18, 23, 34, 0.75);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--color-border);
+}
+
+.glass-dropdown {
+  background: rgba(15, 19, 29, 0.92);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--color-border-hi);
+  box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.6);
+}
 
 /* markdown-ish chat content */
-.chat-body p { margin: 0.35em 0; }
+.chat-body p { margin: 0.4em 0; line-height: 1.55; }
 .chat-body pre {
-  @apply bg-deep border border-border rounded-lg p-3 my-2 overflow-x-auto text-[12.5px] font-mono;
+  @apply bg-deep border border-border rounded-xl p-3.5 my-2.5 overflow-x-auto text-[12.5px] font-mono shadow-inner;
 }
 .chat-body code {
-  @apply font-mono text-[0.92em] bg-panel-alt px-1 py-0.5 rounded;
+  @apply font-mono text-[0.9em] bg-panel-alt/80 border border-border/50 px-1.5 py-0.5 rounded-md text-accent-hi;
 }
-.chat-body pre code { @apply bg-transparent p-0; }
-.chat-body ul, .chat-body ol { @apply pl-5 my-1; }
+.chat-body pre code { @apply bg-transparent border-none p-0 text-text; }
+.chat-body ul, .chat-body ol { @apply pl-5 my-1.5 space-y-0.5; }
 .chat-body ul { list-style: disc; }
 .chat-body ol { list-style: decimal; }
 .chat-body h1, .chat-body h2, .chat-body h3 {
-  @apply font-semibold mt-3 mb-1;
+  @apply font-semibold mt-3 mb-1.5 text-text;
 }
-.chat-body table { @apply border-collapse my-2; }
+.chat-body h1 { @apply text-lg; }
+.chat-body h2 { @apply text-base; }
+.chat-body h3 { @apply text-sm; }
+.chat-body table { @apply border-collapse my-2.5 w-full text-[12.5px]; }
 .chat-body th, .chat-body td {
-  @apply border border-border px-2 py-1 text-left;
+  @apply border border-border px-2.5 py-1.5 text-left;
+}
+.chat-body th { @apply bg-panel-alt/60 font-medium text-text-dim; }
+.chat-body blockquote {
+  @apply border-l-2 border-accent/60 pl-3 my-2 text-text-dim italic;
 }

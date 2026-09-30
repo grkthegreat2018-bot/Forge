@@ -6,7 +6,11 @@ CPU fallback only when CUDA is critically unavailable.
 import os
 import tempfile
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# expandable_segments is unsupported on Windows (torch warns on every
+# CUDA alloc) — set it only where the cuMemMap path exists.
+if os.name != "nt":
+    os.environ.setdefault(
+        "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 # Triton kernel filenames can exceed Windows MAX_PATH under the default
 # %TEMP%/torchinductor_<user> cache root — use a shorter cache dir.
 if os.name == "nt":

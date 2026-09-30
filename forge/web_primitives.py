@@ -32,6 +32,10 @@ from urllib.request import Request, urlopen
 # ── constants ───────────────────────────────────────────────────────────
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+# Wikimedia robot policy (w.wiki/4wJS) 403s browser-spoofed UAs on its
+# API hosts; it requires a descriptive UA naming the client.
+BOT_UA = ("ForgeAI/1.0 (self-play research; python-urllib; "
+          "contact: local-dev)")
 TIMEOUT_S = 12
 MAX_FETCH_CHARS = 4000
 MAX_SNIPPET = 400
@@ -51,6 +55,21 @@ ALLOWED_SCHEMES = {"http", "https"}
 # A leading "word:" prefix means the token is a real scheme
 # (javascript:/file:/data:) — reject it rather than upgrading to https.
 _RE_SCHEME_PREFIX = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
+
+_RE_WIKIMEDIA_HOST = re.compile(
+    r"(^|\.)(wikimedia|wikipedia|wiktionary|wikidata|wikibooks|"
+    r"wikiquote|wikisource|wikinews|wikiversity|wikivoyage|mediawiki|"
+    r"wikifunctions)\.org$", re.IGNORECASE)
+
+
+def _ua_for(url: str) -> str:
+    """Pick the UA a host expects: descriptive bot UA for Wikimedia
+    (their robot policy blocks browser UAs), browser UA elsewhere."""
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return UA
+    return BOT_UA if _RE_WIKIMEDIA_HOST.search(host) else UA
 
 
 def is_safe_url(url: str) -> bool:
@@ -105,7 +124,7 @@ def http_get_full(url: str, timeout: float = TIMEOUT_S,
     to the real article); ``content_type`` is the bare MIME type or ""
     when the response doesn't declare one.
     """
-    req = Request(url, headers={"User-Agent": UA,
+    req = Request(url, headers={"User-Agent": _ua_for(url),
                                 "Accept-Language": accept_language,
                                 "Accept": ("text/html,application/xhtml+xml,"
                                            "application/json;q=0.9,"
@@ -342,12 +361,16 @@ def arxiv_search(query: str, n: int = 3) -> dict[str, Any]:
             summary = re.search(r"<summary>(.*?)</summary>", entry, re.DOTALL)
             link = re.search(r'<id>(.*?)</id>', entry, re.DOTALL)
             published = re.search(r"<published>(.*?)</published>", entry, re.DOTALL)
+            authors = re.findall(r"<author>\s*<name>(.*?)</name>",
+                                 entry, re.DOTALL)
             if title:
                 results.append({
                     "title": RE_TAG.sub("", title.group(1)).strip()[:MAX_TITLE],
                     "summary": summary.group(1).strip()[:MAX_SNIPPET] if summary else "",
                     "url": link.group(1).strip() if link else "",
                     "published": published.group(1)[:10] if published else "",
+                    "authors": [RE_TAG.sub("", a).strip()
+                                for a in authors[:8]],
                 })
         return {"results": results, "error": None if results else "no results"}
     except Exception as e:

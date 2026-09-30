@@ -47,6 +47,15 @@ class _LoRAMixin:
             FileNotFoundError: If lora_path doesn't exist.
             ValueError: If LoRA checkpoint doesn't match model structure.
         """
+        # Serialise against in-flight generation: adapter attachment
+        # monkey-patches module forwards — unsafe mid-forward.
+        with self._gen_lock:
+            return self._load_lora_impl(
+                lora_path, rank, alpha, target_modules)
+
+    def _load_lora_impl(self, lora_path: str, rank: int,
+                        alpha: int | None,
+                        target_modules: list[str] | None) -> int:
         from pathlib import Path
 
         from safetensors.torch import load_file as _load
@@ -105,6 +114,10 @@ class _LoRAMixin:
         Returns:
             True if any LoRA adapters were removed, False if none were attached.
         """
+        with self._gen_lock:
+            return self._unload_lora_impl()
+
+    def _unload_lora_impl(self) -> bool:
         removed = 0
         for name, module in self.model.named_modules():
             # IRIFP4Linear: lora_adapter is a submodule attribute

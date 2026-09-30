@@ -5,13 +5,13 @@ import {
   GitMerge, Layers, Pin, PinOff, RefreshCw, Sparkles,
   Square, Upload,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { api } from '../lib/api'
 import { useForge } from '../lib/store'
 import type { LoraStatus, ModelEntry } from '../lib/types'
 import {
   Btn, Card, Check, EmptyState, IconBtn, Input, KvRow,
-  NumInput, Select, Spinner, StatusDot, Tag,
+  NumInput, SearchInput, Select, Spinner, StatusDot, Tag,
 } from '../components/ui'
 
 // adapter records are defensive-typed — the scan may produce
@@ -64,6 +64,7 @@ export default function Lora() {
 
   const [adapters, setAdapters] = useState<LoraRec[]>([])
   const [models, setModels] = useState<ModelEntry[]>([])
+  const [search, setSearch] = useState('')
   const [info, setInfo] = useState<Record<string, unknown> | null>(null)
   const [selPath, setSelPath] = useState<string | null>(null)
   const [err, setErr] = useState('')
@@ -120,6 +121,16 @@ export default function Lora() {
       .then((r) => setRec(r.adapter ?? null))
       .catch(() => setRec(null))
   }, [curMode])
+
+  const filteredAdapters = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    if (!q) return adapters
+    return adapters.filter((a) =>
+      (a.name && a.name.toLowerCase().includes(q)) ||
+      (a.path && a.path.toLowerCase().includes(q)) ||
+      (a.category && a.category.toLowerCase().includes(q))
+    )
+  }, [adapters, search])
 
   const sel = adapters.find((a) => a.path === selPath) ?? null
   const ready = engine.state === 'ready'
@@ -245,8 +256,14 @@ export default function Lora() {
           )}
         </Card>
 
-        <Card title={`Adapters (${adapters.length})`}>
-          {adapters.length ? (
+        <Card title={`Adapters (${filteredAdapters.length}${adapters.length !== filteredAdapters.length ? ` / ${adapters.length}` : ''})`}>
+          <SearchInput
+            value={search}
+            onChange={setSearch}
+            placeholder="Search adapters by name, path, or category…"
+            className="mb-3"
+          />
+          {filteredAdapters.length ? (
             <div className="overflow-x-auto -mx-1">
               <table className="w-full text-[12px]">
                 <thead>
@@ -261,7 +278,7 @@ export default function Lora() {
                   </tr>
                 </thead>
                 <tbody>
-                  {adapters.map((a) => {
+                  {filteredAdapters.map((a: LoraRec) => {
                     const open = selPath === a.path
                     const pinned = !!a.path && lora.pinned === a.path
                     const loaded = !!a.path && lora.current === a.path

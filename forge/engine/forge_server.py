@@ -460,6 +460,27 @@ def _strip_markers(text: str) -> str:
     return text
 
 
+def _token_count(engine, text: str) -> int:
+    """Count tokens via the engine's tokenizer (usage reporting)."""
+    tok = getattr(engine, "tokenizer", None)
+    if tok is None or not text:
+        return 0
+    try:
+        if hasattr(tok, "encode"):
+            return len(tok.encode(text))
+        return int(tok(text, return_tensors="pt").input_ids.shape[-1])
+    except Exception:
+        return 0
+
+
+def _usage_dict(engine, prompt: str, completion: str) -> dict:
+    """Build an OpenAI-style usage object with real token counts."""
+    p = _token_count(engine, prompt)
+    c = _token_count(engine, completion)
+    return {"prompt_tokens": p, "completion_tokens": c,
+            "total_tokens": p + c}
+
+
 class _ToolCallStreamFilter:
     """Incremental filter that hides tool-call regions from a token stream.
 
@@ -882,7 +903,8 @@ class ForgeServer:
                     "finish_reason": finish,
                     "logprobs": lp_data,
                 }],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "usage": _usage_dict(
+                    registry.get_engine(req.model), prompt, raw_text or ""),
             }
             return resp
 
@@ -908,9 +930,15 @@ class ForgeServer:
                 dry_penalty_last_n=req.dry_penalty_last_n,
                 stop=req.stop,
                 seed=req.seed,
+                logprobs=req.logprobs,
+                prompt_logprobs=req.prompt_logprobs,
+                return_logprobs=bool(req.logprobs or req.prompt_logprobs),
             )
-            # Extract logprobs if requested
-            lp_data = getattr(raw_text, '_forge_logprobs', None)
+            # Unwrap dict return when logprobs were requested
+            lp_data = None
+            if isinstance(raw_text, dict):
+                lp_data = raw_text.get("logprobs")
+                raw_text = raw_text.get("text", "")
             resp_id = f"cmpl-{uuid.uuid4().hex[:12]}"
             choice = {"index": 0, "text": _strip_markers(raw_text),
                       "finish_reason": "stop"}
@@ -924,7 +952,9 @@ class ForgeServer:
                 "created": int(time.time()),
                 "model": req.model,
                 "choices": [choice],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "usage": _usage_dict(
+                    registry.get_engine(req.model), req.prompt,
+                    raw_text or ""),
             }
 
         @app.post("/v1/embeddings")
@@ -938,12 +968,16 @@ class ForgeServer:
             for text in inputs:
                 emb = engine.embed(text)
                 embeddings_list.append(emb)
+            emb_tokens = sum(_token_count(engine, t) for t in inputs)
             return {
                 "object": "list",
                 "data": [{"object": "embedding", "embedding": emb, "index": i}
                          for i, emb in enumerate(embeddings_list)],
                 "model": req.model,
-                "usage": {"prompt_tokens": 0, "total_tokens": 0},
+                "usage": {
+                    "prompt_tokens": emb_tokens,
+                    "total_tokens": emb_tokens,
+                },
             }
 
         @app.post("/v1/reranking")
@@ -983,7 +1017,8 @@ class ForgeServer:
                 "model": req.model,
                 "choices": [{"index": 0, "text": _strip_markers(raw_text),
                              "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "usage": _usage_dict(
+                    registry.get_engine(req.model), prompt, raw_text or ""),
             }
 
         @app.post("/v1/messages")
@@ -1008,7 +1043,12 @@ class ForgeServer:
                 "model": req.model,
                 "stop_reason": "end_turn",
                 "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "usage": {
+                    "input_tokens": _token_count(
+                        registry.get_engine(req.model), prompt),
+                    "output_tokens": _token_count(
+                        registry.get_engine(req.model), raw_text or ""),
+                },
             }
 
         @app.post("/v1/batch/completions")
@@ -1840,11 +1880,15 @@ class ForgeServer:
                 max_new_tokens=req.max_tokens,
                 temperature=req.temperature,
                 top_p=req.top_p,
+                top_k=req.top_k,
+                repetition_penalty=req.repetition_penalty,
                 min_p=req.min_p,
                 dry_multiplier=req.dry_multiplier,
                 dry_base=req.dry_base,
                 dry_allowed_length=req.dry_allowed_length,
                 dry_penalty_last_n=req.dry_penalty_last_n,
+                stop=req.stop,
+                seed=req.seed,
             ):
                 accumulated += text_chunk
                 # Incremental marker state machine — handles markers split
@@ -1952,11 +1996,15 @@ class ForgeServer:
                 max_new_tokens=req.max_tokens,
                 temperature=req.temperature,
                 top_p=req.top_p,
+                top_k=req.top_k,
+                repetition_penalty=req.repetition_penalty,
                 min_p=req.min_p,
                 dry_multiplier=req.dry_multiplier,
                 dry_base=req.dry_base,
                 dry_allowed_length=req.dry_allowed_length,
                 dry_penalty_last_n=req.dry_penalty_last_n,
+                stop=req.stop,
+                seed=req.seed,
             ):
                 clean = _strip_markers(text_chunk)
                 if clean:

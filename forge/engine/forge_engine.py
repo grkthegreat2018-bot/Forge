@@ -1,9 +1,9 @@
 """Forge Inference Engine — unified runtime backend for ForgeAI models.
 
 Pluggable strategy architecture with auto-detection and auto-activation:
-  - KV cache: standard, paged, rotorquant, hadamard_int4, compressed,
-    streaming, snapkv, snapkv_4bit, paged_eviction, xquant, cpu_offload,
-    s4r (15x compression, default), hqe_kv, 2bit
+  - KV cache: standard, paged, rotorquant (4-bit default), hadamard_int4,
+    compressed, streaming, snapkv, snapkv_4bit, paged_eviction, xquant,
+    cpu_offload, s4r (15x compression), hqe_kv, 2bit
   - Decoding: standard, speculative, medusa, dspark, eagle3, mtp_selfspec
   - Quantization: none, int8, int4, fp8, w8a8, nvfp4, BitNet ternary
     (auto-selected based on VRAM + GPU capability)
@@ -56,7 +56,6 @@ Usage:
         engine.generate("...")
 """
 import logging
-import os
 import threading
 
 import torch
@@ -66,7 +65,6 @@ logger = logging.getLogger(__name__)
 # Helpers moved to engine_common.py (re-exported for backward compatibility).
 from .engine_activation import _ActivationMixin
 from .engine_checkpoints import _CheckpointLoadingMixin
-from .engine_common import *  # noqa: F403
 from .activation import ActivationConfig  # noqa: F401
 from .feature_registry import _FEATURE_REGISTRY  # noqa: F401
 from .engine_common import (  # noqa: F401
@@ -82,6 +80,7 @@ from .engine_common import (  # noqa: F401
     _min_k_filter,
     _ScalingModelAdapter,
     _tokenizer_for_vocab,
+    SamplingParams,
 )
 from .engine_diagnostics import _DiagnosticsMixin
 from .engine_generation import _GenerationMixin
@@ -126,8 +125,12 @@ class ForgeEngine(_CheckpointLoadingMixin, _ActivationMixin,
 
     def __init__(self, model, tokenizer, device="cuda",
                  checkpoint_path: str | None = None):
-        # Reduce CUDA memory fragmentation (critical for 12GB VRAM)
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        # Runtime side effects (CUDA alloc conf, cache dirs, TF32) live in
+        # forge.runtime.configure — idempotent, effective only if it runs
+        # before CUDA init (entrypoints call it at startup; direct engine
+        # construction still gets the non-CUDA settings).
+        from forge.runtime.configure import configure
+        configure()
         self.model = model
         self.tokenizer = tokenizer
         self.device = torch.device(device)
@@ -227,9 +230,21 @@ class ForgeEngine(_CheckpointLoadingMixin, _ActivationMixin,
         Replaces scattered ``print()`` calls with a single chanel that
         both shows the message to the user and stores it for
         ``read_log()`` / ``diagnose()`` diagnostics.
+
+        Emits through the ``logging`` module when handlers are configured
+        (server/GUI contexts capture it properly); falls back to stdout
+        for interactive/script use so the status line still shows.
         """
-        print(f"  [{source.title()}] {message}" if source != "engine"
-              else f"  [ForgeEngine] {message}")
+        line = (f"  [{source.title()}] {message}" if source != "engine"
+                else f"  [ForgeEngine] {message}")
+        lvl = {"debug": logging.DEBUG, "info": logging.INFO,
+               "warn": logging.WARNING, "warning": logging.WARNING,
+               "error": logging.ERROR}.get(level, logging.INFO)
+        if logging.getLogger().handlers:
+            logger.log(lvl, "%s%s", line,
+                       f" {data}" if data else "")
+        else:
+            print(line)
         self.events.log(message, level=level, source=source, **data)
 
     def _clear_cuda_cache(self):
@@ -412,9 +427,20 @@ class ForgeEngine(_CheckpointLoadingMixin, _ActivationMixin,
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Auto-sleep level 1 on context exit to release VRAM."""
+        self.close()
+        return False
+
+    def close(self):
+        """Explicit teardown: disable crash recovery + release VRAM.
+
+        Preferred over relying on ``__del__`` (which still runs as a
+        backstop) — deterministic and safe to call more than once.
+        """
+        rec = getattr(self, "_recovery", None)
+        if rec is not None:
+            rec.close()
         if self._awake:
             self.sleep(level=1)
-        return False
 
     # ── Checkpoint loading ────────────────────────────────────────────────
 

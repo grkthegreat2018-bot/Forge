@@ -21,8 +21,8 @@ import { Composer } from '../components/chat/Composer'
 import { Markdown } from '../components/chat/Markdown'
 import { ScrollFeed } from '../components/chat/ScrollFeed'
 import {
-  Btn, Card, Chip, Check as CheckBox, EmptyState, IconBtn, Input,
-  NumInput, Slider, Spinner, Tag, Textarea,
+  Btn, Card, Chip, Check as CheckBox, EmptyState, IconBtn,
+  Modal, NumInput, SearchInput, Slider, Spinner, Tag, Textarea,
 } from '../components/ui'
 import { api, ssePost } from '../lib/api'
 import { dayBucket, fmtClock, relTime } from '../lib/format'
@@ -72,11 +72,18 @@ const PRESETS: { name: string; apply: Partial<ChatSettings> }[] = [
   { name: 'Creative', apply: { temperature: 1.0, topP: 0.95, topK: 80, repPenalty: 1.02, minP: 0.02, dryMult: 0.8 } },
 ]
 
+const PROMPT_TEMPLATES = [
+  { label: 'Assistant', prompt: 'You are ForgeAI, an expert AI assistant specialized in machine learning and software engineering.' },
+  { label: 'Architect', prompt: 'You are a principal software architect. Provide direct, production-grade solutions, complete files, and rigorous technical rationale without preamble.' },
+  { label: 'Concise', prompt: 'Answer concisely in bullet points or code snippets. Avoid conversational filler or unnecessary explanations.' },
+  { label: 'Researcher', prompt: 'Act as an AI research scientist. Analyze deep architectural tradeoffs, numerical stability, algorithmic complexity, and hardware constraints.' },
+]
+
 const STARTERS = [
-  'Explain what this project does, at a high level',
-  'List the files in the workspace',
-  'Search the web for Mamba-3 architecture notes',
-  'What time is it? Set a timer for 5 minutes',
+  { title: 'Architecture Overview', desc: 'High-level structure & modules', prompt: 'Explain what this project does at a high level and detail its main components.' },
+  { title: 'Workspace Files', desc: 'Directory tree & assets', prompt: 'List the files in the workspace and explain the directory layout.' },
+  { title: 'Mamba-3 Research', desc: 'Web search & paper summary', prompt: 'Search the web for Mamba-3 architecture notes and summarize its key innovations.' },
+  { title: 'System Diagnostics', desc: 'GPU & engine check', prompt: 'What time is it? Check system status and verify engine readiness.' },
 ]
 
 interface StreamState {
@@ -429,8 +436,12 @@ export default function Chat() {
               <ClipboardPaste size={13} />
             </IconBtn>
           </div>
-          <Input value={search} onChange={(e) => setSearch(e.target.value)}
-            placeholder="Filter…" className="w-full !py-1" />
+          <SearchInput
+            value={search}
+            onChange={setSearch}
+            placeholder="Search chats…"
+            className="w-full"
+          />
         </div>
         <div className="flex-1 overflow-y-auto px-1.5 pb-2">
           {grouped.map((g) => (
@@ -443,12 +454,13 @@ export default function Chat() {
                   key={c.id}
                   onClick={() => loadConv(c.id)}
                   className={clsx(
-                    'w-full text-left px-2.5 py-2 rounded-lg mb-0.5 group cursor-pointer transition-colors',
+                    'w-full text-left px-2.5 py-2 rounded-xl mb-1 group cursor-pointer transition-all duration-150',
                     conv?.id === c.id
-                      ? 'bg-accent/15 text-text border border-accent/25'
-                      : 'text-text-dim hover:bg-panel-alt border border-transparent')}>
+                      ? 'bg-accent/15 text-text border border-accent/30 shadow-[0_0_12px_rgba(122,151,255,0.15)]'
+                      : 'text-text-dim hover:bg-panel-alt/80 border border-transparent hover:text-text'
+                  )}>
                   <div className="flex items-center gap-1.5">
-                    <span className="text-[12.5px] truncate flex-1">{c.title}</span>
+                    <span className="text-[12.5px] font-medium truncate flex-1">{c.title}</span>
                     <IconBtn
                       className="!w-5 !h-5 opacity-0 group-hover:opacity-100 hover:!text-err"
                       title="Delete conversation"
@@ -456,19 +468,21 @@ export default function Chat() {
                       <Trash2 size={11} />
                     </IconBtn>
                   </div>
-                  <div className="text-[10.5px] text-text-faint mt-0.5 flex gap-2">
-                    <span>{c.n_messages} msgs</span>
+                  <div className="text-[10.5px] text-text-faint mt-1 flex items-center gap-2">
+                    <span className="bg-panel px-1.5 py-0.2 rounded border border-border/40 font-mono text-[9.5px]">
+                      {c.n_messages}m
+                    </span>
                     <span>{relTime(c.updated_at)}</span>
-                    {c.good > 0 && <span className="text-ok">+{c.good}</span>}
-                    {c.bad > 0 && <span className="text-err">−{c.bad}</span>}
+                    {c.good > 0 && <span className="text-ok font-semibold">+{c.good}</span>}
+                    {c.bad > 0 && <span className="text-err font-semibold">−{c.bad}</span>}
                   </div>
                 </button>
               ))}
             </div>
           ))}
           {!grouped.length && (
-            <div className="text-[11.5px] text-text-faint text-center py-6">
-              no conversations
+            <div className="text-[11.5px] text-text-faint text-center py-8">
+              no conversations found
             </div>
           )}
         </div>
@@ -477,7 +491,7 @@ export default function Chat() {
       {/* ---- transcript ---- */}
       <div className="flex-1 min-w-0 flex flex-col">
         {/* chat header */}
-        <div className="flex items-center gap-2 px-5 h-11 border-b border-border shrink-0">
+        <div className="flex items-center gap-2 px-5 h-12 border-b border-border/80 glass-panel shrink-0">
           {renaming && conv ? (
             <input
               autoFocus
@@ -488,14 +502,14 @@ export default function Chat() {
                 if (e.key === 'Enter') void commitRename()
                 if (e.key === 'Escape') setRenaming(false)
               }}
-              className="bg-input border border-accent/50 rounded-md px-2 py-0.5 text-[13px] text-text focus:outline-none w-72" />
+              className="bg-input border border-accent/50 rounded-lg px-2.5 py-1 text-[13px] text-text focus:outline-none w-72" />
           ) : (
             <>
-              <span className="text-[13px] font-medium truncate max-w-[45%]">
-                {conv?.title ?? 'Chat'}
+              <span className="text-[13.5px] font-semibold truncate max-w-[40%] text-text">
+                {conv?.title ?? 'Chat Studio'}
               </span>
               {conv?.id && (
-                <IconBtn title="Rename" className="!w-6 !h-6"
+                <IconBtn title="Rename conversation" className="!w-6 !h-6"
                   onClick={() => { setRenaming(true); setRenameDraft(conv.title) }}>
                   <Pencil size={11} />
                 </IconBtn>
@@ -503,19 +517,37 @@ export default function Chat() {
             </>
           )}
           {conv && conv.messages.length > 0 && (
-            <span className="text-[10.5px] text-text-faint shrink-0">
-              {conv.messages.length} msgs
+            <span className="text-[11px] text-text-faint bg-panel px-2 py-0.5 rounded-full border border-border/50 shrink-0 font-mono">
+              {conv.messages.length} messages
             </span>
           )}
+
+          {/* Quick Preset Selector Chips in Header */}
+          <div className="hidden lg:flex items-center gap-1 ml-3 border-l border-border/60 pl-3">
+            {PRESETS.map((p) => (
+              <button
+                key={p.name}
+                onClick={() => setCfg((c) => ({ ...c, ...p.apply }))}
+                className={clsx(
+                  'px-2 py-0.5 rounded-md text-[11px] font-medium transition-colors cursor-pointer',
+                  cfg.temperature === p.apply.temperature && cfg.topP === p.apply.topP
+                    ? 'bg-accent/20 text-accent-hi border border-accent/40'
+                    : 'text-text-faint hover:text-text hover:bg-panel-alt'
+                )}>
+                {p.name}
+              </button>
+            ))}
+          </div>
+
           <div className="ml-auto flex items-center gap-2">
             {ready && (
-              <Tag kind="idle" className="font-mono !text-[10.5px]">
+              <Tag kind="accent" className="font-mono !text-[10.5px]">
                 {engine.info.checkpoint?.split(/[\\/]/).pop() ?? 'model'}
               </Tag>
             )}
             <IconBtn
-              title={cfg.panelOpen ? 'Hide settings' : 'Show settings'}
-              className={clsx(cfg.panelOpen && '!text-accent-hi bg-panel-alt')}
+              title={cfg.panelOpen ? 'Hide settings drawer' : 'Show settings drawer'}
+              className={clsx(cfg.panelOpen && '!text-accent-hi bg-panel-alt border border-accent/30')}
               onClick={() => set('panelOpen', !cfg.panelOpen)}>
               <SlidersHorizontal size={13} />
             </IconBtn>
@@ -524,20 +556,28 @@ export default function Chat() {
 
         <ScrollFeed watch={`${items.length}:${stream?.raw.length ?? 0}:${stream?.toolResults.length ?? 0}`}
           className="px-6 py-5">
-          <div className="max-w-[780px] mx-auto space-y-5">
+          <div className="max-w-[800px] mx-auto space-y-5">
             {!items.length && !stream && (
               <EmptyState
-                icon={<MessageSquare size={40} strokeWidth={1.2} />}
+                icon={<MessageSquare size={36} strokeWidth={1.5} />}
                 title={ready ? 'Start a conversation' : 'Engine not loaded'}
                 desc={ready
-                  ? 'Plain assistant chat — or let the model call tools like read_file, list_dir, web_search.'
-                  : 'Load a checkpoint on the Models page to start chatting.'}
+                  ? 'Chat directly with your model, inspect its internal thinking pass, or execute live tool harnesses.'
+                  : 'Load a checkpoint on the Models page to initialize generation.'}
                 action={ready ? (
-                  <div className="flex flex-wrap justify-center gap-2 max-w-lg">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 max-w-xl text-left mt-3">
                     {STARTERS.map((s) => (
-                      <button key={s} onClick={() => setDraft(s)}
-                        className="px-3 py-1.5 rounded-full border border-border text-[12px] text-text-dim hover:text-text hover:border-accent/50 hover:bg-panel-alt transition-colors cursor-pointer">
-                        {s}
+                      <button
+                        key={s.title}
+                        onClick={() => void doSend(s.prompt)}
+                        className="p-3 rounded-xl border border-border/80 bg-panel/60 hover:bg-panel-alt hover:border-accent/50 transition-all text-left group cursor-pointer shadow-sm">
+                        <div className="text-[12.5px] font-semibold text-text group-hover:text-accent-hi transition-colors flex items-center justify-between">
+                          {s.title}
+                          <Sparkles size={12} className="text-text-faint group-hover:text-accent transition-colors" />
+                        </div>
+                        <div className="text-[11px] text-text-dim mt-0.5 leading-snug">
+                          {s.desc}
+                        </div>
                       </button>
                     ))}
                   </div>
@@ -650,6 +690,16 @@ export default function Chat() {
             </div>
           </Card>
           <Card title="System prompt">
+            <div className="flex flex-wrap gap-1 mb-2">
+              {PROMPT_TEMPLATES.map((t) => (
+                <button
+                  key={t.label}
+                  onClick={() => set('systemPrompt', t.prompt)}
+                  className="px-2 py-0.5 rounded text-[10.5px] bg-panel border border-border/80 hover:border-accent/40 text-text-dim hover:text-text cursor-pointer transition-colors">
+                  {t.label}
+                </button>
+              ))}
+            </div>
             <Textarea
               value={cfg.systemPrompt}
               onChange={(e) => set('systemPrompt', e.target.value)}
@@ -687,49 +737,43 @@ export default function Chat() {
       )}
 
       {/* ---- import transcript modal ---- */}
-      {importOpen && (
-        <div
-          className="fixed inset-0 z-50 bg-black/50 flex items-start justify-center pt-[12vh] fade-in"
-          onClick={() => setImportOpen(false)}>
-          <div
-            className="w-[560px] max-w-[92vw] bg-panel border border-border-hi rounded-card shadow-2xl overflow-hidden"
-            onClick={(e) => e.stopPropagation()}>
-            <div className="px-4 py-3 border-b border-border text-[13px] font-medium">
-              Import a pasted chat
+      <Modal
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
+        title="Import Chat Transcript"
+        maxWidth="max-w-xl">
+        <div className="space-y-3">
+          <Textarea
+            autoFocus
+            value={importText}
+            onChange={(e) => setImportText(e.target.value)}
+            rows={12}
+            placeholder={
+              'Paste a transcript — accepts:\n'
+              + '  • "User:" / "Assistant:" markers (also **User:**, ChatGPT said:, ## Assistant)\n'
+              + '  • ChatML  <|im_start|>user … <|im_end|>\n'
+              + '  • JSON  [{"role": "user", "content": "…"}]\n'
+              + '  • plain text — blank-line paragraphs alternate user/assistant'}
+            className="w-full !text-[12px] font-mono resize-y" />
+          {importErr && (
+            <div className="px-3 py-2 text-[12px] text-err border border-err/30 bg-err/10 rounded-lg">
+              {importErr}
             </div>
-            <Textarea
-              autoFocus
-              value={importText}
-              onChange={(e) => setImportText(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Escape') setImportOpen(false)
-              }}
-              rows={14}
-              placeholder={
-                'Paste a transcript — accepts:\n'
-                + '  • "User:" / "Assistant:" markers (also **User:**, ChatGPT said:, ## Assistant)\n'
-                + '  • ChatML  <|im_start|>user … <|im_end|>\n'
-                + '  • JSON  [{"role": "user", "content": "…"}]\n'
-                + '  • plain text — blank-line paragraphs alternate user/assistant'}
-              className="w-full !text-[12px] font-mono resize-y !rounded-none !border-0 focus:!ring-0" />
-            {importErr && (
-              <div className="px-4 py-2 text-[12px] text-err border-t border-err/30 bg-err/10">
-                {importErr}
-              </div>
-            )}
-            <div className="flex items-center gap-1.5 p-3 border-t border-border">
-              <span className="text-[10.5px] text-text-faint flex-1">
-                becomes a new conversation you can continue
-              </span>
-              <Btn variant="ghost" onClick={() => setImportOpen(false)}>Cancel</Btn>
-              <Btn variant="primary" disabled={!importText.trim()}
+          )}
+          <div className="flex items-center justify-between pt-2">
+            <span className="text-[11px] text-text-faint">
+              Import creates a new conversation you can steer and continue
+            </span>
+            <div className="flex gap-2">
+              <Btn variant="ghost" size="sm" onClick={() => setImportOpen(false)}>Cancel</Btn>
+              <Btn variant="primary" size="sm" disabled={!importText.trim()}
                 onClick={() => void doImport()}>
-                <ClipboardPaste size={12} /> Import
+                <ClipboardPaste size={13} /> Import Chat
               </Btn>
             </div>
           </div>
         </div>
-      )}
+      </Modal>
     </div>
   )
 }

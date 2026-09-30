@@ -1,13 +1,14 @@
-// Collapsible navigation sidebar — brand, grouped sections, live status.
+// Collapsible navigation sidebar — brand, grouped sections, live status badges & quick controls.
 
 import { clsx } from 'clsx'
 import {
   Activity, Bot, Box, ChevronsLeft, ChevronsRight, Cpu,
   FileText, Gauge, Hammer, Layers, LayoutDashboard, ListTodo,
-  MessageSquare, Play, Search, Sparkles, TrendingUp, Zap,
+  MessageSquare, Moon, Play, Search, Sparkles, Sun, TrendingUp, X, Zap,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import { NavLink } from 'react-router-dom'
+import { NavLink, useNavigate } from 'react-router-dom'
+import { api } from '../lib/api'
 import { useForge } from '../lib/store'
 import { useUi } from '../lib/ui'
 
@@ -39,156 +40,252 @@ export const PAGES: PageDef[] = [
 const SECTIONS = ['Agentic', 'Model', 'Train', 'System']
 
 export function Sidebar() {
+  const navigate = useNavigate()
   const collapsed = useUi((s) => s.collapsed)
   const toggle = useUi((s) => s.toggleCollapsed)
   const [query, setQuery] = useState('')
+
   const engine = useForge((s) => s.engine)
   const gpu = useForge((s) => s.gpu)
+  const lora = useForge((s) => s.lora)
+  const runs = useForge((s) => s.runs)
+  const tasks = useForge((s) => s.tasks)
+  const agentRuns = useForge((s) => s.agentRuns)
+  const selfplayStatus = useForge((s) => s.selfplayStatus)
   const connected = useForge((s) => s.connected)
+  const refreshStatus = useForge((s) => s.refreshStatus)
+
+  // Live telemetry metrics for badges
+  const activeAgents = useMemo(() => agentRuns.filter((r) => r.status === 'running').length, [agentRuns])
+  const activeTasks = useMemo(() => tasks.filter((t) => t.is_live).length, [tasks])
+  const activeRuns = useMemo(() => runs.filter((r) => r.is_live).length, [runs])
+  const isSelfPlayRunning = useMemo(() => !!selfplayStatus?.status?.running, [selfplayStatus])
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
     if (!q) return PAGES
-    return PAGES.filter((p) => p.label.toLowerCase().includes(q))
+    return PAGES.filter((p) => p.label.toLowerCase().includes(q) || p.section.toLowerCase().includes(q))
   }, [query])
 
   const engKind = engine.state === 'ready' ? 'ok'
     : engine.state === 'loading' ? 'warn'
     : engine.state === 'error' ? 'err' : 'idle'
 
+  const handleQuickPower = async () => {
+    if (engine.state === 'ready') {
+      await api.post('/api/engine/sleep').catch(() => undefined)
+      await refreshStatus()
+    } else if (engine.state === 'idle') {
+      await api.post('/api/engine/wake').catch(() => undefined)
+      await refreshStatus()
+    }
+  }
+
   return (
     <aside
       className={clsx(
-        'flex flex-col h-full bg-bg-alt border-r border-border transition-all duration-200 shrink-0',
-        collapsed ? 'w-[60px]' : 'w-[248px]')}>
-      {/* brand */}
-      <div className={clsx('flex items-center gap-2.5 pt-4 pb-3',
+        'flex flex-col h-full bg-bg-alt border-r border-border transition-all duration-200 shrink-0 select-none z-20',
+        collapsed ? 'w-[64px]' : 'w-[252px]'
+      )}>
+      {/* brand header */}
+      <div className={clsx('flex items-center gap-3 pt-4 pb-3',
         collapsed ? 'px-3 justify-center' : 'px-4')}>
-        <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-grad-a to-grad-b flex items-center justify-center shrink-0">
-          <Activity size={17} className="text-on-accent" />
+        <div
+          onClick={() => navigate('/')}
+          className="w-8 h-8 rounded-xl bg-gradient-to-br from-grad-a to-grad-b flex items-center justify-center shrink-0 shadow-[0_0_16px_rgba(99,102,241,0.4)] cursor-pointer hover:scale-105 transition-transform">
+          <Activity size={18} className="text-white" />
         </div>
         {!collapsed && (
-          <div className="min-w-0">
-            <div className="text-[14px] font-semibold leading-tight">ForgeAI</div>
-            <div className="text-[9.5px] uppercase tracking-[0.14em] text-text-faint">
-              Control Center
+          <div className="min-w-0 cursor-pointer" onClick={() => navigate('/')}>
+            <div className="text-[14.5px] font-bold tracking-tight text-text leading-tight flex items-center gap-1.5">
+              ForgeAI
+              <span className="text-[9px] font-mono px-1 py-0.2 rounded bg-accent/15 text-accent-hi border border-accent/30 font-normal">
+                v12
+              </span>
+            </div>
+            <div className="text-[9.5px] uppercase tracking-[0.16em] text-text-faint font-medium">
+              Intelligence Studio
             </div>
           </div>
         )}
         {!collapsed && (
           <button
             onClick={toggle}
-            className="ml-auto text-text-faint hover:text-text transition-colors cursor-pointer"
+            className="ml-auto text-text-faint hover:text-text p-1 rounded-md hover:bg-panel-alt transition-colors cursor-pointer"
             title="Collapse (Ctrl+B)">
             <ChevronsLeft size={16} />
           </button>
         )}
       </div>
+
       {collapsed && (
         <button
           onClick={toggle}
-          className="mx-auto mb-1 text-text-faint hover:text-text transition-colors cursor-pointer"
+          className="mx-auto mb-2 text-text-faint hover:text-text p-1 rounded-md hover:bg-panel-alt transition-colors cursor-pointer"
           title="Expand (Ctrl+B)">
           <ChevronsRight size={16} />
         </button>
       )}
 
-      {/* search */}
+      {/* search input */}
       {!collapsed && (
         <div className="px-3 pb-2">
-          <div className="relative">
-            <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-faint" />
+          <div className="relative flex items-center">
+            <Search size={13} className="absolute left-2.5 text-text-faint pointer-events-none" />
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search pages…"
-              className="w-full bg-input border border-border rounded-lg pl-7 pr-2 py-1.5 text-[12px] text-text placeholder:text-text-faint focus:outline-none focus:border-accent/60" />
+              placeholder="Search features… (/)"
+              className="w-full bg-input border border-border rounded-lg pl-7 pr-7 py-1.5 text-[12px] text-text placeholder:text-text-faint focus:outline-none focus:border-accent/70 focus:ring-1 focus:ring-accent/30 transition-all" />
+            {query && (
+              <button
+                onClick={() => setQuery('')}
+                className="absolute right-2 text-text-faint hover:text-text cursor-pointer p-0.5">
+                <X size={12} />
+              </button>
+            )}
           </div>
         </div>
       )}
 
-      {/* nav */}
-      <nav className="flex-1 overflow-y-auto px-2 pb-2">
+      {/* nav menu */}
+      <nav className="flex-1 overflow-y-auto px-2.5 pb-2 space-y-3">
         {SECTIONS.map((sec) => {
           const items = filtered.filter((p) => p.section === sec)
           if (!items.length) return null
           return (
-            <div key={sec} className="mt-2">
+            <div key={sec}>
               {!collapsed && (
-                <div className="px-2 pb-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-text-faint">
+                <div className="px-2.5 pb-1 text-[10px] font-bold uppercase tracking-[0.16em] text-text-faint/80">
                   {sec}
                 </div>
               )}
-              {items.map((p) => (
-                <NavLink
-                  key={p.path}
-                  to={p.path}
-                  end={p.path === '/'}
-                  title={collapsed ? p.label : undefined}
-                  className={({ isActive }) => clsx(
-                    'flex items-center gap-2.5 rounded-lg mb-0.5 text-[13px] transition-all duration-100 slide-in-left',
-                    collapsed ? 'justify-center px-0 py-2' : 'px-2.5 py-1.5',
-                    isActive
-                      ? 'bg-accent/15 text-accent-hi border border-accent/25'
-                      : 'text-text-dim border border-transparent hover:bg-panel-alt hover:text-text',
-                  )}>
-                  <span className="shrink-0">{p.icon}</span>
-                  {!collapsed && <span className="truncate">{p.label}</span>}
-                </NavLink>
-              ))}
+              <div className="space-y-0.5">
+                {items.map((p) => {
+                  let badge = null
+                  if (p.path === '/agent' && activeAgents > 0) {
+                    badge = <span className="ml-auto text-[10px] px-1.5 py-0.2 rounded-full font-bold bg-accent/20 text-accent-hi border border-accent/40 shadow-[0_0_8px_rgba(122,151,255,0.25)]">{activeAgents}</span>
+                  } else if (p.path === '/tasks' && activeTasks > 0) {
+                    badge = <span className="ml-auto text-[10px] px-1.5 py-0.2 rounded-full font-bold bg-accent2/20 text-accent2 border border-accent2/40 shadow-[0_0_8px_rgba(45,212,191,0.25)]">{activeTasks}</span>
+                  } else if (p.path === '/training' && activeRuns > 0) {
+                    badge = <span className="ml-auto w-2 h-2 rounded-full bg-ok shadow-[0_0_8px_rgba(52,211,153,0.6)] pulse-dot" />
+                  } else if (p.path === '/selfplay' && isSelfPlayRunning) {
+                    badge = <span className="ml-auto w-2 h-2 rounded-full bg-warn shadow-[0_0_8px_rgba(251,191,36,0.6)] pulse-dot" />
+                  } else if (p.path === '/lora' && lora.current) {
+                    badge = <span className="ml-auto text-[9.5px] px-1.5 py-0.2 rounded bg-panel border border-border text-text-dim truncate max-w-[65px]">{lora.current.split(/[\/\\]/).pop()}</span>
+                  }
+
+                  return (
+                    <NavLink
+                      key={p.path}
+                      to={p.path}
+                      end={p.path === '/'}
+                      title={collapsed ? `${p.label} — ${p.subtitle}` : undefined}
+                      className={({ isActive }) => clsx(
+                        'group flex items-center gap-2.5 rounded-lg text-[13px] transition-all duration-150',
+                        collapsed ? 'justify-center px-0 py-2' : 'px-3 py-2',
+                        isActive
+                          ? 'bg-accent/15 text-accent-hi border border-accent/30 font-medium shadow-[0_0_14px_-2px_rgba(122,151,255,0.2)]'
+                          : 'text-text-dim border border-transparent hover:bg-panel-alt hover:text-text'
+                      )}>
+                      <span className={clsx('shrink-0 transition-transform group-hover:scale-110')}>
+                        {p.icon}
+                      </span>
+                      {!collapsed && <span className="truncate flex-1">{p.label}</span>}
+                      {!collapsed && badge}
+                    </NavLink>
+                  )
+                })}
+              </div>
             </div>
           )
         })}
       </nav>
 
       {/* status footer */}
-      <div className={clsx('border-t border-border px-3 py-2.5',
-        collapsed && 'flex flex-col items-center gap-1.5')}>
+      <div className={clsx('border-t border-border/80 px-3 py-3 bg-panel/30',
+        collapsed && 'flex flex-col items-center gap-2')}>
         {collapsed ? (
           <>
             <span
-              title={`engine: ${engine.state}`}
-              className={clsx('w-2 h-2 rounded-full',
-                engKind === 'ok' ? 'bg-ok' : engKind === 'warn' ? 'bg-warn pulse-dot'
-                : engKind === 'err' ? 'bg-err' : 'bg-text-faint')} />
+              title={`Engine: ${engine.state} ${engine.info.config_name ? `(${engine.info.config_name})` : ''}`}
+              className={clsx('w-2.5 h-2.5 rounded-full cursor-pointer',
+                engKind === 'ok' ? 'bg-ok shadow-[0_0_8px_rgba(52,211,153,0.6)]'
+                : engKind === 'warn' ? 'bg-warn pulse-dot'
+                : engKind === 'err' ? 'bg-err' : 'bg-text-faint')}
+              onClick={() => navigate('/engine')} />
             <span
-              title={`GPU ${gpu.vram_used_mb}/${gpu.vram_total_mb} MB`}
-              className="w-2 h-2 rounded-full bg-accent" />
+              title={`GPU: ${Math.round(gpu.vram_used_mb)} / ${Math.round(gpu.vram_total_mb)} MB (${Math.round(gpu.vram_pct)}%)`}
+              className="w-2.5 h-2.5 rounded-full bg-accent cursor-pointer shadow-[0_0_8px_rgba(122,151,255,0.5)]"
+              onClick={() => navigate('/compute')} />
           </>
         ) : (
-          <>
-            <div className="flex items-center gap-2 text-[11.5px] text-text-dim">
-              <span className={clsx('w-2 h-2 rounded-full',
-                engKind === 'ok' ? 'bg-ok' : engKind === 'warn' ? 'bg-warn pulse-dot'
-                : engKind === 'err' ? 'bg-err' : 'bg-text-faint')} />
-              <span className="truncate">
-                {engine.state === 'ready'
-                  ? (engine.info.config_name || 'engine ready')
-                  : engine.state}
-              </span>
-              <span className="ml-auto flex items-center gap-1">
-                <span className={clsx('w-1.5 h-1.5 rounded-full',
-                  connected ? 'bg-ok' : 'bg-err')} />
-                {connected ? 'live' : 'off'}
-              </span>
+          <div className="space-y-2">
+            {/* engine status line */}
+            <div className="flex items-center justify-between text-[11.5px]">
+              <div
+                className="flex items-center gap-2 min-w-0 cursor-pointer hover:text-text transition-colors"
+                onClick={() => navigate('/engine')}>
+                <span className={clsx('w-2 h-2 rounded-full shrink-0',
+                  engKind === 'ok' ? 'bg-ok shadow-[0_0_8px_rgba(52,211,153,0.6)]'
+                  : engKind === 'warn' ? 'bg-warn pulse-dot'
+                  : engKind === 'err' ? 'bg-err' : 'bg-text-faint')} />
+                <span className="truncate font-medium text-text-dim">
+                  {engine.state === 'ready'
+                    ? (engine.info.config_name || 'engine ready')
+                    : engine.state}
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                {engine.state === 'ready' && (
+                  <button
+                    onClick={handleQuickPower}
+                    title="Sleep engine"
+                    className="text-text-faint hover:text-accent p-0.5 rounded hover:bg-panel-alt transition-colors cursor-pointer">
+                    <Moon size={12} />
+                  </button>
+                )}
+                {engine.state === 'idle' && (
+                  <button
+                    onClick={handleQuickPower}
+                    title="Wake engine"
+                    className="text-text-faint hover:text-ok p-0.5 rounded hover:bg-panel-alt transition-colors cursor-pointer">
+                    <Sun size={12} />
+                  </button>
+                )}
+                <span
+                  title={connected ? 'WebSocket connected' : 'WebSocket disconnected'}
+                  className="flex items-center gap-1 text-[10px] text-text-faint font-mono">
+                  <span className={clsx('w-1.5 h-1.5 rounded-full', connected ? 'bg-ok' : 'bg-err')} />
+                  {connected ? 'live' : 'off'}
+                </span>
+              </div>
             </div>
+
+            {/* GPU VRAM progress */}
             {gpu.available && (
-              <div className="mt-1.5">
-                <div className="flex justify-between text-[10.5px] text-text-faint mb-0.5">
-                  <span>VRAM</span>
-                  <span>{gpu.vram_used_mb}/{Math.round(gpu.vram_total_mb / 1024)}GB</span>
+              <div
+                className="cursor-pointer group"
+                onClick={() => navigate('/compute')}
+                title="Click to view detailed GPU telemetry">
+                <div className="flex justify-between text-[10.5px] text-text-faint group-hover:text-text-dim transition-colors mb-1">
+                  <span>RTX 5070</span>
+                  <span className="font-mono tabular-nums">
+                    {(gpu.vram_used_mb / 1024).toFixed(1)} / {Math.round(gpu.vram_total_mb / 1024)}GB ({Math.round(gpu.vram_pct)}%)
+                  </span>
                 </div>
-                <div className="h-1 rounded-full bg-panel-alt overflow-hidden">
+                <div className="h-1.5 rounded-full bg-panel-alt overflow-hidden">
                   <div
-                    className={clsx('h-full rounded-full',
-                      gpu.vram_pct > 85 ? 'bg-err' : 'bg-accent')}
-                    style={{ width: `${gpu.vram_pct}%` }} />
+                    className={clsx('h-full rounded-full transition-all duration-300',
+                      gpu.vram_pct > 85 ? 'bg-err' : 'bg-gradient-to-r from-grad-a to-grad-b')}
+                    style={{ width: `${Math.max(3, gpu.vram_pct)}%` }} />
                 </div>
               </div>
             )}
-          </>
+          </div>
         )}
       </div>
     </aside>
   )
 }
+

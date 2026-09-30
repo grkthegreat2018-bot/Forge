@@ -87,6 +87,8 @@ class ForgeEvolveConfig:
     filter_ratio: int = 20        # N_generated / N_evaluated
     min_evaluate: int = 10        # minimum candidates to evaluate per gen
     max_evaluate: int = 150       # maximum candidates to evaluate per gen (raised for throughput)
+    elite_mutants: int = 0        # per-gen domain-space mutants of archive elites
+                                  # (0=off; domains define propose_elite_mutants)
 
     # Training
     generator_lr: float = 1e-3
@@ -788,6 +790,23 @@ class ForgeEvolve:
                 candidates = self.population.generate(n_per_gen=1)
                 n_generated = len(candidates)
                 t_gen = time.time() - t0
+
+                # ── PHASE 1.5: DOMAIN-SPACE ELITE MUTANTS ──
+                # Some domains (e.g. program synthesis) can mutate elite
+                # configs directly in their own representation — a much
+                # stronger operator than generator-weight noise when the
+                # decode map is rugged. Opt-in via domain.propose_elite_mutants.
+                if self.cfg.elite_mutants > 0 and gen > 0:
+                    _mut_hook = getattr(self.domain, "propose_elite_mutants", None)
+                    if _mut_hook is not None:
+                        try:
+                            for mc in _mut_hook(self.archive,
+                                                self.cfg.elite_mutants, gen) or []:
+                                candidates.append({"params": None,
+                                                   "template_config": mc,
+                                                   "generator_idx": -1})
+                        except Exception as e:
+                            self._log(f"  elite-mutant hook failed (gen {gen}): {e}")
 
                 # ── PHASE 2: FILTER (surrogate on GPU + epsilon-greedy exploration) ──
                 t0 = time.time()

@@ -40,13 +40,15 @@ class _MergingMixin:
         config_name as the parents). All parents in an evolutionary run
         MUST share the same architecture for this to work.
         """
-        # Move tensors to the model's device and assign
-        dev_state = {k: (v.to(self.device) if not v.is_meta else v)
-                     for k, v in state.items()}
-        missing, unexpected = self.model.load_state_dict(
-            dev_state, strict=False, assign=True)
-        if dev_state and self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+        # Serialise against in-flight generation: load_state_dict(assign=True)
+        # rebinding mid-forward corrupts the active decode.
+        with self._gen_lock:
+            dev_state = {k: (v.to(self.device) if not v.is_meta else v)
+                         for k, v in state.items()}
+            missing, unexpected = self.model.load_state_dict(
+                dev_state, strict=False, assign=True)
+            if dev_state and self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
 
     def merge_checkpoints(
         self,

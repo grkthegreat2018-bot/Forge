@@ -102,17 +102,31 @@ class CrashRecoveryManager:
             return
         self.recovery_dir.mkdir(parents=True, exist_ok=True)
 
-        # atexit: flush everything to disk
+        # Weakref callbacks: atexit and the signal table are GC roots —
+        # registering bound methods directly would pin the manager (and,
+        # through ``self.engine``, the entire engine + model) alive until
+        # process exit, defeating ForgeEngine.__del__'s VRAM cleanup.
         import atexit
-        atexit.register(self._cleanup)
+        import weakref
+        mgr_ref = weakref.ref(self)
+
+        def _atexit_cleanup():
+            mgr = mgr_ref()
+            if mgr is not None:
+                mgr._cleanup()
+        atexit.register(_atexit_cleanup)
+        self._atexit_fn = _atexit_cleanup  # for explicit unregister
 
         # Signal handlers for graceful shutdown
         old_sigterm = signal.getsignal(signal.SIGTERM)
         old_sigint = signal.getsignal(signal.SIGINT)
 
         def _handler(signum, frame):
-            self._log(f"Signal {signum} received, flushing recovery state...")
-            self._cleanup()
+            mgr = mgr_ref()
+            if mgr is None:
+                return
+            mgr._log(f"Signal {signum} received, flushing recovery state...")
+            mgr._cleanup()
             # Re-raise to default handler so the process actually exits
             if signum == signal.SIGINT:
                 signal.signal(signal.SIGINT, old_sigint)
@@ -133,6 +147,22 @@ class CrashRecoveryManager:
 
         self._installed = True
         self._log("Crash recovery enabled", recovery_dir=str(self.recovery_dir))
+
+    def close(self):
+        """Disable recovery and unregister the atexit hook.
+
+        Explicit teardown for engine.close()-style lifecycles — signal
+        handlers are left installed (harmless no-ops once the manager is
+        dead) since restoring them safely needs the main thread.
+        """
+        self.enabled = False
+        if self._installed:
+            import atexit
+            try:
+                atexit.unregister(self._atexit_fn)
+            except Exception:
+                pass
+            self._installed = False
 
     def _log(self, message: str, **data):
         """Log via the engine's event log if available."""

@@ -3,7 +3,8 @@
 
 import { clsx } from 'clsx'
 import {
-  ChevronDown, ChevronRight, Play, Sparkles, Square,
+  Check as CheckIcon, ChevronDown, ChevronRight, Copy, Download, Play,
+  Sparkles, Square, Trash2,
 } from 'lucide-react'
 import type { ReactNode, RefObject } from 'react'
 import { useEffect, useRef, useState } from 'react'
@@ -11,7 +12,8 @@ import { useNavigate } from 'react-router-dom'
 import { api, ssePost } from '../lib/api'
 import { useForge } from '../lib/store'
 import {
-  Btn, Card, Check, EmptyState, NumInput, Spinner, Tag, Textarea,
+  Btn, Card, Check as CheckBox, EmptyState, NumInput,
+  Spinner, Tag, Textarea,
 } from '../components/ui'
 
 type Mode = 'stream' | 'adaptive' | 'batch' | 'raw'
@@ -227,20 +229,62 @@ function StreamMode() {
     }
   }
 
+  const [copied, setCopied] = useState(false)
+  const copyOut = () => {
+    if (!out) return
+    void navigator.clipboard.writeText(out).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1200)
+    })
+  }
+
+  const STREAM_SUGGESTIONS = [
+    { label: 'Fibonacci', p: 'def fibonacci(n):\n    """Compute the n-th Fibonacci number efficiently."""' },
+    { label: 'Mamba-3', p: 'Explain the core difference between Mamba-3 state-space duality and multi-head attention:' },
+    { label: 'SQL Optimizer', p: 'Write an optimized PostgreSQL query with indexed CTEs to find monthly active users:' },
+  ]
+
   return (
     <GenLayout
       contentRef={outRef}
       meta={<>
         {(out.length > 0 || nTok > 0) && (
-          <span className="text-[10.5px] text-text-faint">
+          <span className="text-[10.5px] text-text-faint font-mono">
             {out.length} chars · {nTok} tok
           </span>
         )}
-        {tokS != null && <Tag kind="idle">{tokS.toFixed(1)} tok/s</Tag>}
-        {busy && <Tag kind="accent"><Spinner /> streaming</Tag>}
+        {tokS != null && <Tag kind="accent">{tokS.toFixed(1)} tok/s</Tag>}
+        {busy && <Tag kind="accent" pulse><Spinner /> streaming</Tag>}
+        {out && !busy && (
+          <div className="flex items-center gap-1 border-l border-border/60 pl-2">
+            <button
+              onClick={copyOut}
+              title="Copy output"
+              className="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] bg-panel-alt hover:bg-panel-hover border border-border text-text-dim hover:text-text cursor-pointer transition-colors">
+              {copied ? <CheckIcon size={11} className="text-ok" /> : <Copy size={11} />}
+              {copied ? 'Copied' : 'Copy'}
+            </button>
+            <button
+              onClick={() => { setOut(''); setNTok(0); setTokS(null) }}
+              title="Clear output"
+              className="p-1 rounded text-text-faint hover:text-err hover:bg-err/10 transition-colors cursor-pointer">
+              <Trash2 size={12} />
+            </button>
+          </div>
+        )}
       </>}
       side={<>
         <Card title="Prompt">
+          <div className="flex flex-wrap gap-1 mb-2">
+            {STREAM_SUGGESTIONS.map((s) => (
+              <button
+                key={s.label}
+                onClick={() => setPrompt(s.p)}
+                className="px-2 py-0.5 rounded text-[10.5px] bg-panel border border-border/80 hover:border-accent/40 text-text-dim hover:text-text cursor-pointer transition-colors">
+                {s.label}
+              </button>
+            ))}
+          </div>
           <Textarea
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
@@ -256,6 +300,11 @@ function StreamMode() {
               <Btn variant="primary" className="flex-1 justify-center"
                 disabled={!prompt.trim()} onClick={run}>
                 <Play size={13} /> Generate
+              </Btn>
+            )}
+            {prompt && !busy && (
+              <Btn variant="ghost" size="sm" onClick={() => setPrompt('')} title="Clear prompt">
+                Clear
               </Btn>
             )}
           </div>
@@ -397,16 +446,43 @@ function BatchMode() {
     finally { setBusy(false) }
   }
 
+  const exportJson = () => {
+    if (!pairs.length) return
+    const blob = new Blob([JSON.stringify(pairs, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `batch_generations_${Date.now()}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
   return (
     <GenLayout
       meta={<>
         {pairs.length > 0 && (
-          <span className="text-[10.5px] text-text-faint">
+          <span className="text-[10.5px] text-text-faint font-mono">
             {pairs.length} result{pairs.length > 1 ? 's' : ''}
           </span>
         )}
-        {tokS != null && <Tag kind="idle">{tokS.toFixed(1)} tok/s</Tag>}
-        {busy && <Tag kind="accent"><Spinner /> generating</Tag>}
+        {tokS != null && <Tag kind="accent">{tokS.toFixed(1)} tok/s</Tag>}
+        {busy && <Tag kind="accent" pulse><Spinner /> generating</Tag>}
+        {pairs.length > 0 && !busy && (
+          <div className="flex items-center gap-1 border-l border-border/60 pl-2">
+            <button
+              onClick={exportJson}
+              title="Download results as JSON"
+              className="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] bg-panel-alt hover:bg-panel-hover border border-border text-text-dim hover:text-text cursor-pointer transition-colors">
+              <Download size={11} /> Export JSON
+            </button>
+            <button
+              onClick={() => { setPairs([]); setTokS(null) }}
+              title="Clear results"
+              className="p-1 rounded text-text-faint hover:text-err hover:bg-err/10 transition-colors cursor-pointer">
+              <Trash2 size={12} />
+            </button>
+          </div>
+        )}
       </>}
       side={<>
         <Card title="Prompts">
@@ -526,7 +602,7 @@ function RawMode() {
             min={0} max={1} step={0.01} />
           <Num label="Min-k" value={minK} onChange={setMinK}
             min={0} max={500} step={1} />
-          <Check label="Skip special tokens" checked={skipSpecial}
+          <CheckBox label="Skip special tokens" checked={skipSpecial}
             onChange={setSkipSpecial} />
         </ParamsCard>
       </>}>

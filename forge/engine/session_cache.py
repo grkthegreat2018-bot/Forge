@@ -1,5 +1,13 @@
 """Session-aware KV cache management for ForgeEngine.
 
+Layer map (three similarly-named modules):
+  - session_cache.py  — per-session KV reuse *inside* the engine
+    (SessionCacheManager, radix prefix match + TTL). This file.
+  - engine_sessions.py — the engine-facing mixin that exposes it as
+    begin_session()/continue_session().
+  - session_manager.py — server-side conversation history + request
+    batching queue (BatchQueue/BatchedDecoding driver). Different layer.
+
 Provides:
   - SessionCacheManager: per-session KV cache with radix tree prefix matching
   - KV cache TTL: pin KV cache during tool calls / pauses, auto-evict on expiry

@@ -188,12 +188,18 @@ class ModelRegistry:
                         dry_penalty_last_n: int = 512,
                         eos_token_ids: list[int] | None = None,
                         skip_special_tokens: bool = True,
-                        logits_processor=None):
+                        logits_processor=None,
+                        seed: int | None = None,
+                        stop: list[str] | None = None):
         """Token-by-token streaming generator. Auto-wakes if asleep.
 
         Yields decoded text chunks (one per token) as they are generated.
         Sampling args mirror ForgeEngine.generate_stream.
         """
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
         with self._lock:
             if model_id not in self._entries:
                 raise KeyError(f"Model '{model_id}' not registered. "
@@ -213,6 +219,7 @@ class ModelRegistry:
             dry_penalty_last_n=dry_penalty_last_n,
             skip_special_tokens=skip_special_tokens,
             logits_processor=logits_processor,
+            stop=stop,
         ):
             yield chunk
 

@@ -1,4 +1,8 @@
-"""Session/KV-cache management mixin for ForgeEngine."""
+"""Session/KV-cache management mixin for ForgeEngine.
+
+Layer map: session_cache.py = per-session KV reuse implementation;
+session_manager.py = server-side history + batching (different layer).
+This mixin is the engine-facing surface (begin/continue/end_session)."""
 from .engine_common import *  # noqa: F403
 from forge.model_loader import unpack_output_with_kv  # noqa: F401
 from .prefix_cache import (
@@ -60,22 +64,21 @@ class _SessionMixin:
             Generated text string.
         """
         self._require_awake()
-        self._validate_generation_params(
-            prompt, max_new_tokens, temperature, top_p, top_k,
-            repetition_penalty)
+        params = SamplingParams(
+            max_new_tokens=max_new_tokens, temperature=temperature,
+            top_p=top_p, top_k=top_k,
+            repetition_penalty=repetition_penalty)
+        self._validate_generation_params(prompt, params)
 
         ids, past_kv, cached_len, recurrent = \
             self._session_cache.continue_session(session_id, prompt)
 
         with self._gen_lock:
             return self._continue_session_impl(
-                session_id, ids, past_kv, cached_len, recurrent,
-                max_new_tokens, temperature, top_p, top_k,
-                repetition_penalty)
+                session_id, ids, past_kv, cached_len, recurrent, params)
 
     def _continue_session_impl(self, session_id, ids, past_kv, cached_len,
-                               recurrent, max_new_tokens, temperature,
-                               top_p, top_k, repetition_penalty) -> str:
+                               recurrent, params) -> str:
         # If we have cached KV, only prefill the delta — and restore the
         # conv/recurrent boundary context first so the delta doesn't
         # zero-pad its first kernel-1 positions.
@@ -91,17 +94,14 @@ class _SessionMixin:
             # Decode from current logits
             eos_set = self._eos_token_ids()
             for _ in self._decode_tokens(
-                logits, past_kv, max_new_tokens, temperature, top_p, top_k,
-                repetition_penalty, eos_set, generated_ids,
+                logits, past_kv, params, eos_set, generated_ids,
             ):
                 pass
             result = self._safe_decode_ids(generated_ids)
         else:
             # No cache hit — full prefill + decode
             result = self._generate_with_oom_recovery(
-                lambda: self._full_generate(
-                    ids, max_new_tokens, temperature, top_p, top_k,
-                    repetition_penalty))
+                lambda: self._full_generate(ids, params))
             # _full_generate records its own token count; generated_ids stays empty here.
 
         # Update session KV + recurrent state
@@ -136,15 +136,13 @@ class _SessionMixin:
         """Get session cache statistics."""
         return self._session_cache.stats()
 
-    def _full_generate(self, ids, max_new_tokens, temperature, top_p, top_k,
-                       repetition_penalty) -> str:
+    def _full_generate(self, ids, params) -> str:
         """Full prefill + decode (no session cache)."""
         eos_set = self._eos_token_ids()
         generated_ids: list[int] = []
         logits, past_kv = self._prefill(ids)
         for _ in self._decode_tokens(
-            logits, past_kv, max_new_tokens, temperature, top_p, top_k,
-            repetition_penalty, eos_set, generated_ids,
+            logits, past_kv, params, eos_set, generated_ids,
         ):
             pass
         self._record_generation(len(generated_ids))

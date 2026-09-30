@@ -21,7 +21,8 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+if os.name != "nt":  # expandable_segments unsupported on Windows
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 if sys.platform == "win32":
     try:

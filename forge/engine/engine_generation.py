@@ -1,4 +1,5 @@
 """Generation, batching, tool-calling, streaming, and logprobs mixin for ForgeEngine."""
+import dataclasses
 import json
 import time
 from collections.abc import Iterator
@@ -17,14 +18,17 @@ from .engine_common import (  # noqa: F401
     _ckpt_cache_lock,
     _apply_dry,
     _dry_penalties,
+    _is_memory_model,
     _map_gguf_to_forge,
     _min_k_filter,
     _ScalingModelAdapter,
     _tokenizer_for_vocab,
     logger,
+    SamplingParams,
 )
 from .airllm_streamer import AirLLMStreamer  # noqa: F401
 from .cascade import ModelCascade  # noqa: F401
+from .crash_recovery import _CHECKPOINT_INTERVAL as _RECOVERY_CKPT_EVERY  # noqa: F401
 from .errors import ConfigurationError, GenerationOOMError  # noqa: F401
 from .kv.cacheblend import CacheBlend  # noqa: F401
 from .test_time_scaling import (  # noqa: F401
@@ -54,7 +58,9 @@ class _GenerationMixin:
                  stop: list[str] | None = None,
                  logprobs: int | None = None,
                  prompt_logprobs: int | None = None,
-                 return_logprobs: bool = False) -> str | dict:
+                 return_logprobs: bool = False,
+                 learn: bool | None = None,
+                 mem_bias: float | None = None) -> str | dict:
         """Generate text from a prompt using active strategies.
 
         Args:
@@ -87,36 +93,69 @@ class _GenerationMixin:
                 logits processor to mask tokens that would produce
                 schema-invalid JSON. Bypasses prefix cache / CacheBlend /
                 AirLLM paths (constrained decoding needs per-step masking).
+            learn: memory-model gate (FluxLM only). ``False`` runs the whole
+                call observe-only — no prompt ingestion, no decode-time
+                writes, no journal entries — so held-out evaluation cannot
+                contaminate live memory.  ``None``/``True`` keeps the
+                default live-learning behavior.  Ignored by KV-cache models.
+            mem_bias: recall<->generation dial (FluxLM only). Scales the
+                gcell/gsyn lift weights for this call — <1 leans on
+                verbatim recall, >1 leans on generalized generation.
+                ``None`` keeps the model default. Ignored by KV-cache models.
         """
+        params = SamplingParams(
+            max_new_tokens=max_new_tokens, temperature=temperature,
+            top_p=top_p, top_k=top_k,
+            repetition_penalty=repetition_penalty, min_p=min_p,
+            min_k=min_k, dry_multiplier=dry_multiplier, dry_base=dry_base,
+            dry_allowed_length=dry_allowed_length,
+            dry_penalty_last_n=dry_penalty_last_n, stop=stop,
+            skip_special_tokens=skip_special_tokens, learn=learn,
+            mem_bias=mem_bias)
         with self._gen_lock:
+            if params.learn is False and _is_memory_model(self.model):
+                prev = self.model.learning
+                self.model.learning = False
+                try:
+                    return self._generate_with_oom_recovery(
+                        self._generate_impl, prompt, params,
+                        finish_sentence, context_limit,
+                        json_schema=json_schema,
+                        logprobs=logprobs,
+                        prompt_logprobs=prompt_logprobs,
+                        return_logprobs=return_logprobs)
+                finally:
+                    self.model.learning = prev
+            if params.mem_bias is not None \
+                    and _is_memory_model(self.model):
+                prev_b = self.model._gen_bias
+                self.model._gen_bias = float(params.mem_bias)
+                try:
+                    return self._generate_with_oom_recovery(
+                        self._generate_impl, prompt, params,
+                        finish_sentence, context_limit,
+                        json_schema=json_schema,
+                        logprobs=logprobs,
+                        prompt_logprobs=prompt_logprobs,
+                        return_logprobs=return_logprobs)
+                finally:
+                    self.model._gen_bias = prev_b
             return self._generate_with_oom_recovery(
-                self._generate_impl, prompt, max_new_tokens, temperature,
-                top_p, top_k, repetition_penalty, finish_sentence,
-                context_limit, skip_special_tokens, min_p, min_k,
-                dry_multiplier=dry_multiplier, dry_base=dry_base,
-                dry_allowed_length=dry_allowed_length,
-                dry_penalty_last_n=dry_penalty_last_n,
-                json_schema=json_schema, stop=stop,
+                self._generate_impl, prompt, params,
+                finish_sentence, context_limit,
+                json_schema=json_schema,
                 logprobs=logprobs, prompt_logprobs=prompt_logprobs,
                 return_logprobs=return_logprobs)
 
-    def _generate_impl(self, prompt, max_new_tokens, temperature, top_p,
-                       top_k, repetition_penalty, finish_sentence,
-                       context_limit, skip_special_tokens,
-                       min_p: float = 0.0, min_k: float = 0.0,
-                       dry_multiplier: float = 0.0, dry_base: float = 1.75,
-                       dry_allowed_length: int = 2,
-                       dry_penalty_last_n: int = 512,
+    def _generate_impl(self, prompt, params: SamplingParams,
+                       finish_sentence, context_limit,
                        json_schema: dict | None = None,
-                       stop: list[str] | None = None,
                        logprobs: int | None = None,
                        prompt_logprobs: int | None = None,
                        return_logprobs: bool = False) -> str | dict:
         """Internal generate implementation (no OOM wrapper)."""
         self._require_awake()
-        self._validate_generation_params(
-            prompt, max_new_tokens, temperature, top_p, top_k,
-            repetition_penalty, min_p, min_k, dry_multiplier)
+        self._validate_generation_params(prompt, params)
         self._check_vram_and_offload_if_needed()
 
         # Apply pending hot-swap changes before generation
@@ -141,25 +180,37 @@ class _GenerationMixin:
             add_special_tokens=True,  # BOS <|startoftext|> — required for sane raw prompts
         ).input_ids.to(self.device)
 
-        # Constrained decoding (R39-5): when a JSON schema is provided,
-        # build an XGrammar logits processor and use the per-step
-        # _decode_tokens path.  This bypasses prefix cache / CacheBlend /
-        # AirLLM because constrained decoding requires per-step masking
-        # that those fast paths don't support.
-        if json_schema is not None:
-            processor = self._build_xgrammar_processor(json_schema)
+        # Logprobs capture: record raw (pre-sampling) logits per decode
+        # step via step_observer — avoids the old second full generation
+        # pass, and on memory models (FluxLM) avoids re-ingesting the
+        # sequence into live memory (which silently double-counted every
+        # token and appended duplicate journal entries).
+        lp_steps: list[dict] = []
+        lp_observer = None
+        if logprobs is not None and logprobs > 0:
+            def lp_observer(lg, tid):
+                lp = torch.log_softmax(lg[0].float(), dim=-1)
+                n = min(logprobs, lp.shape[-1])
+                tv, ti = lp.topk(n)
+                lp_steps.append({
+                    "token_id": tid, "token_lp": float(lp[tid]),
+                    "top_ids": ti.tolist(), "top_vals": tv.tolist()})
+
+        # Per-step decode paths: constrained decoding (json_schema) and
+        # logprobs capture share the _decode_tokens loop — the schema
+        # masks per step, the observer records raw logits per step.  Both
+        # bypass prefix cache / CacheBlend / AirLLM (those fast paths
+        # can't run per-step processors or observers).
+        if json_schema is not None or lp_observer is not None:
+            processor = (self._build_xgrammar_processor(json_schema)
+                         if json_schema is not None else None)
             eos_set = self._eos_token_ids()
             generated_ids: list[int] = []
             logits, past_kv = self._prefill(ids)
             gen_tokens = []
             for next_token, _ in self._decode_tokens(
-                logits, past_kv, max_new_tokens, temperature, top_p,
-                top_k, repetition_penalty, eos_set, generated_ids,
-                processor, min_p, min_k,
-                context_ids=ids[0].tolist(),
-                dry_multiplier=dry_multiplier, dry_base=dry_base,
-                dry_allowed_length=dry_allowed_length,
-                dry_penalty_last_n=dry_penalty_last_n,
+                logits, past_kv, params, eos_set, generated_ids, processor,
+                context_ids=ids[0].tolist(), step_observer=lp_observer,
             ):
                 gen_tokens.append(next_token)
             if gen_tokens:
@@ -183,16 +234,11 @@ class _GenerationMixin:
                     if suffix.shape[1] > 0 and blend_kv is not None:
                         with torch.inference_mode():
                             out = self.model(
-                                suffix, past_key_values=blend_kv, use_cache=True)
+                                suffix, past_key_values=blend_kv,
+                                use_cache=True, logits_last_only=True)
                             logits, past_kv = unpack_output_with_kv(out)
                         output_ids = self._decode_with_kv(
-                            ids, logits, past_kv, max_new_tokens, temperature,
-                            top_p, top_k=top_k,
-                            repetition_penalty=repetition_penalty,
-                            min_p=min_p, min_k=min_k,
-                            dry_multiplier=dry_multiplier, dry_base=dry_base,
-                            dry_allowed_length=dry_allowed_length,
-                            dry_penalty_last_n=dry_penalty_last_n)
+                            ids, logits, past_kv, params)
                         self._log(f"CacheBlend HIT (reused {covered_len} "
                                   f"tokens, suffix {suffix.shape[1]} to "
                                   f"prefill)")
@@ -200,34 +246,31 @@ class _GenerationMixin:
             # Prefix caching: check if we've seen this prompt prefix before
             if output_ids is None:
                 output_ids = _generate_from_prefix_cache(
-                    self, ids, max_new_tokens, temperature, top_p, top_k,
-                    repetition_penalty)
+                    self, ids, params)
             if output_ids is None and self.acceleration == "airllm_streaming":
                 output_ids = AirLLMStreamer.generate(
-                    self, ids, max_new_tokens, temperature)
+                    self, ids, params.max_new_tokens, params.temperature)
             elif output_ids is None:
                 output_ids = self.decoding.generate(
-                    self.model, ids, max_new_tokens, temperature, top_p,
-                    top_k=top_k, repetition_penalty=repetition_penalty,
-                    min_p=min_p, min_k=min_k,
-                    dry_multiplier=dry_multiplier, dry_base=dry_base,
-                    dry_allowed_length=dry_allowed_length,
-                    dry_penalty_last_n=dry_penalty_last_n)
+                    self.model, ids, params.max_new_tokens,
+                    params.temperature, params.top_p,
+                    top_k=params.top_k,
+                    repetition_penalty=params.repetition_penalty,
+                    min_p=params.min_p, min_k=params.min_k,
+                    dry_multiplier=params.dry_multiplier,
+                    dry_base=params.dry_base,
+                    dry_allowed_length=params.dry_allowed_length,
+                    dry_penalty_last_n=params.dry_penalty_last_n)
 
         # Capture KV cache from decoding step for fast finish-to-stop path
         captured_kv = getattr(self.model, '_forge_last_kv', None)
 
         # Smart cutoff: if we hit max_new_tokens without EOS, extend to next
         # natural stopping point (up to 32 extra tokens).
-        if finish_sentence and output_ids.shape[1] - ids.shape[1] >= max_new_tokens:
+        if finish_sentence and output_ids.shape[1] - ids.shape[1] >= params.max_new_tokens:
             output_ids = self._finish_to_stop(
-                output_ids, ids.shape[1], temperature, top_p,
-                extra_budget=32, past_kv=captured_kv,
-                top_k=top_k, repetition_penalty=repetition_penalty,
-                min_p=min_p, min_k=min_k,
-                dry_multiplier=dry_multiplier, dry_base=dry_base,
-                dry_allowed_length=dry_allowed_length,
-                dry_penalty_last_n=dry_penalty_last_n)
+                output_ids, ids.shape[1], params,
+                extra_budget=32, past_kv=captured_kv)
 
         # Store prefix KV cache for future reuse — reuse the KV captured
         # during decoding instead of paying a second full prefill.
@@ -237,28 +280,31 @@ class _GenerationMixin:
         self._record_generation(n_gen)
         prompt_len = ids.shape[1]
         generated_ids = output_ids[0, prompt_len:]
-        result = self.tokenizer.decode(generated_ids, skip_special_tokens=skip_special_tokens)
+        result = self.tokenizer.decode(generated_ids, skip_special_tokens=params.skip_special_tokens)
 
-        # Stop-string truncation: if any stop string appears in the output,
-        # truncate at the first occurrence and discard the rest (OpenAI API spec).
-        if stop:
-            for s in stop:
+        # Stop-string truncation: cut at the EARLIEST occurrence across all
+        # stop strings (OpenAI API spec — the first stop hit ends output).
+        if params.stop:
+            cut = -1
+            for s in params.stop:
                 idx = result.find(s)
-                if idx != -1:
-                    result = result[:idx]
-                    break
+                if idx != -1 and (cut == -1 or idx < cut):
+                    cut = idx
+            if cut != -1:
+                result = result[:cut]
 
         _gen_ms = (time.perf_counter() - _t0) * 1000
-        self._record_output(prompt, result, n_gen, _gen_ms, temperature)
+        self._record_output(prompt, result, n_gen, _gen_ms,
+                            params.temperature)
 
-        # Logprobs extraction (OpenAI API compat)
+        # Logprobs extraction (OpenAI API compat). Any logprobs request
+        # returns the dict form — str cannot carry an attribute, so the
+        # previous _forge_logprobs attach crashed on this line.
         if return_logprobs or logprobs is not None or prompt_logprobs is not None:
             lp_data = self._extract_logprobs(
-                ids, output_ids, logprobs, prompt_logprobs)
-            if return_logprobs:
-                return {"text": result, "logprobs": lp_data}
-            # Otherwise attach to result via attribute (server reads it)
-            result._forge_logprobs = lp_data  # type: ignore[attr-defined]
+                ids, output_ids, logprobs, prompt_logprobs,
+                captured_steps=lp_steps)
+            return {"text": result, "logprobs": lp_data}
 
         # Save semantic KV anchors for future reuse (FreeToken-style)
         try:
@@ -456,6 +502,8 @@ class _GenerationMixin:
         stops: list[list[str] | None] | None = None,
         logits_processors: list | None = None,
         skip_special_tokens: bool = True,
+        prompt_rewards: bool = True,
+        cf_topk: int = 0,
     ) -> list[str]:
         """Generate text for multiple prompts in a single batched forward pass.
 
@@ -481,6 +529,14 @@ class _GenerationMixin:
             skip_special_tokens: decode flag. Pass False when callers need
                 structural markers preserved (e.g. ``</think>`` for
                 reasoning-split post-processing).
+            prompt_rewards: FluxLM only — ``False`` skips the per-prompt-token
+                reward gather during pool prefill (faster; stream-internal
+                hedge drift only — canonical memory is never touched and
+                packets are re-ingested on apply anyway). Ignored by
+                KV-cache models.
+            cf_topk: FluxLM only — >0 logs each generated token's top-k
+                alternative propensities into ``FluxPacket.alts`` for
+                counterfactual credit (``reinforce_alts``).
 
         Returns:
             list of generated text strings (same order as prompts)
@@ -490,7 +546,7 @@ class _GenerationMixin:
         self._check_vram_and_offload_if_needed()
 
         with self._gen_lock:
-            if self.model.__class__.__name__ == "FluxLM":
+            if _is_memory_model(self.model):
                 return self._generate_batch_flux(
                     prompts, max_new_tokens, temperature, top_p, top_k,
                     repetition_penalty,
@@ -499,7 +555,9 @@ class _GenerationMixin:
                     repetition_penalties=repetition_penalties,
                     seeds=seeds, stops=stops,
                     logits_processors=logits_processors,
-                    skip_special_tokens=skip_special_tokens)
+                    skip_special_tokens=skip_special_tokens,
+                    prompt_rewards=prompt_rewards,
+                    cf_topk=cf_topk)
             return self._generate_batch_impl(
                 prompts, max_new_tokens, temperature, top_p, top_k,
                 repetition_penalty,
@@ -515,6 +573,8 @@ class _GenerationMixin:
         repetition_penalties=None, seeds=None, stops=None,
         logits_processors=None,
         skip_special_tokens=True,
+        prompt_rewards: bool = True,
+        cf_topk: int = 0,
     ) -> list[str]:
         """FluxLM batched generation via shared-memory stream pool.
 
@@ -585,6 +645,8 @@ class _GenerationMixin:
                 tokenizer=self.tokenizer,
                 eos_ids=eos_ids,
                 tag_fn=lambda j: f"batch:{off + j}",
+                prompt_rewards=prompt_rewards,
+                cf_topk=cf_topk,
             )
             for j, gi in enumerate(o):
                 outs[off + j] = gi
@@ -859,7 +921,7 @@ class _GenerationMixin:
         ``model(ids, use_cache=True) + unpack`` pattern.
         """
         with torch.inference_mode():
-            out = self.model(ids, use_cache=True)
+            out = self.model(ids, use_cache=True, logits_last_only=True)
             return unpack_output_with_kv(out)
 
     def _sample_next_token(self, logits: torch.Tensor, temperature: float,
@@ -896,17 +958,23 @@ class _GenerationMixin:
         Returns:
             next_token tensor of shape (batch, 1).
         """
-        if temperature <= 0:
-            return logits.argmax(-1, keepdim=True)
         if repetition_penalty <= 0:
             raise ConfigurationError("repetition_penalty must be positive")
 
-        next_logits = logits / temperature
-        # Repetition penalty (last 64 tokens)
-        if generated_ids:
+        # Repetition penalty BEFORE temperature (HF ordering; also applies
+        # to greedy argmax). One index_copy instead of a kernel per unique
+        # token; clone first since `logits` may be an inference tensor.
+        next_logits = logits
+        if repetition_penalty != 1.0 and generated_ids:
+            next_logits = logits.clone()
             repeated = torch.tensor(
                 tuple(set(generated_ids[-64:])), device=logits.device)
-            next_logits[:, repeated] /= repetition_penalty
+            next_logits.index_copy_(
+                -1, repeated,
+                next_logits.index_select(-1, repeated) / repetition_penalty)
+        if temperature <= 0:
+            return next_logits.argmax(-1, keepdim=True)
+        next_logits = next_logits / temperature
 
         # DRY penalty: precomputed {token_id: penalty} logit subtraction
         # for tokens that would continue a repeated n-gram suffix.
@@ -973,19 +1041,17 @@ class _GenerationMixin:
         return token_ids
 
     def _decode_tokens(
-        self, logits, past_kv, max_new_tokens, temperature, top_p, top_k,
-        repetition_penalty, stop_token_ids, generated_ids=None,
-        logits_processor=None, min_p: float = 0.0, min_k: float = 0.0,
-        context_ids: list[int] | None = None,
-        dry_multiplier: float = 0.0, dry_base: float = 1.75,
-        dry_allowed_length: int = 2, dry_penalty_last_n: int = 512,
-        hidden_observer=None,
+        self, logits, past_kv, params: SamplingParams,
+        stop_token_ids, generated_ids=None,
+        logits_processor=None, context_ids: list[int] | None = None,
+        hidden_observer=None, step_observer=None,
     ):
         generated_ids = generated_ids if generated_ids is not None else []
         dry_ctx = context_ids if context_ids is not None else []
         try:
-            for _ in range(max_new_tokens):
-                next_logits = logits[:, -1, :]
+            for _ in range(params.max_new_tokens):
+                raw_logits = logits[:, -1, :]
+                next_logits = raw_logits
 
                 # Constrained decoding: apply logits processor BEFORE sampling
                 if logits_processor is not None:
@@ -993,28 +1059,37 @@ class _GenerationMixin:
 
                 dry_pen = (
                     _dry_penalties(
-                        dry_ctx + generated_ids, dry_penalty_last_n,
-                        dry_allowed_length, dry_multiplier, dry_base)
-                    if dry_multiplier > 0.0 else None
+                        dry_ctx + generated_ids, params.dry_penalty_last_n,
+                        params.dry_allowed_length, params.dry_multiplier,
+                        params.dry_base)
+                    if params.dry_multiplier > 0.0 else None
                 )
                 next_token = self._sample_next_token(
-                    next_logits, temperature, top_k, top_p,
-                    repetition_penalty, generated_ids, min_p, min_k,
-                    dry_penalties=dry_pen)
+                    next_logits, params.temperature, params.top_k,
+                    params.top_p, params.repetition_penalty, generated_ids,
+                    params.min_p, params.min_k, dry_penalties=dry_pen)
                 token_id = next_token.item()
                 generated_ids.append(token_id)
+                if step_observer is not None:
+                    # Raw (pre-processor, pre-temperature) logits + the
+                    # actually-sampled id — logprobs capture needs both.
+                    step_observer(raw_logits, token_id)
                 should_stop = token_id in stop_token_ids
                 yield next_token, should_stop
                 if should_stop:
                     break
 
-                # Crash recovery: checkpoint generation + KV snapshot
+                # Crash recovery: checkpoint generation + KV snapshot.
+                # _safe_decode_ids is O(n) — only run it on the same
+                # %32 boundary checkpoint_generation writes at, otherwise
+                # detokenization alone is O(n^2) across the generation.
                 n_gen = len(generated_ids)
                 if hasattr(self, '_recovery') and self._recovery.enabled:
-                    partial = self._safe_decode_ids(
-                        generated_ids, skip_special_tokens=False)
-                    self._recovery.checkpoint_generation(
-                        "", partial, n_gen)  # prompt filled by caller
+                    if n_gen % _RECOVERY_CKPT_EVERY == 0:
+                        partial = self._safe_decode_ids(
+                            generated_ids, skip_special_tokens=False)
+                        self._recovery.checkpoint_generation(
+                            "", partial, n_gen)  # prompt filled by caller
                     self._recovery.snapshot_kv_cache(n_gen)
 
                 with torch.inference_mode():
@@ -1260,9 +1335,15 @@ class _GenerationMixin:
             Decoded string of generated tokens (not including prompt).
         """
         self._require_awake()
-        self._validate_generation_params(
-            prompt, max_new_tokens, temperature, top_p, top_k,
-            repetition_penalty, min_p, min_k, dry_multiplier)
+        params = SamplingParams(
+            max_new_tokens=max_new_tokens, temperature=temperature,
+            top_p=top_p, top_k=top_k,
+            repetition_penalty=repetition_penalty, min_p=min_p,
+            min_k=min_k, dry_multiplier=dry_multiplier, dry_base=dry_base,
+            dry_allowed_length=dry_allowed_length,
+            dry_penalty_last_n=dry_penalty_last_n,
+            skip_special_tokens=skip_special_tokens)
+        self._validate_generation_params(prompt, params)
         self._check_vram_and_offload_if_needed()
         self.hotswap.apply_pending()
 
@@ -1278,13 +1359,9 @@ class _GenerationMixin:
 
             logits, past_kv = self._prefill(ids)
             for _ in self._decode_tokens(
-                logits, past_kv, max_new_tokens, temperature, top_p, top_k,
-                repetition_penalty, eos_set, generated_ids, logits_processor,
-                min_p, min_k,
+                logits, past_kv, params, eos_set, generated_ids,
+                logits_processor,
                 context_ids=ids[0].tolist(),
-                dry_multiplier=dry_multiplier, dry_base=dry_base,
-                dry_allowed_length=dry_allowed_length,
-                dry_penalty_last_n=dry_penalty_last_n,
             ):
                 pass
 
@@ -1312,6 +1389,7 @@ class _GenerationMixin:
         dry_base: float = 1.75,
         dry_allowed_length: int = 2,
         dry_penalty_last_n: int = 512,
+        stop: list[str] | None = None,
         hidden_observer=None,
     ) -> Iterator[str]:
         """Token-by-token streaming generator.
@@ -1331,11 +1409,21 @@ class _GenerationMixin:
             min_p: Min-p sampling threshold (0 = disabled).
             min_k: Min-k semantic-cliff sampling (0 = disabled).
             dry_multiplier: DRY n-gram repetition penalty (0 = disabled).
+            stop: optional stop strings — output ends at the earliest
+                occurrence (OpenAI semantics, same as ``generate``).
+                Matching holds back up to ``max(len(s))`` decoded chars so
+                a stop string spanning chunks is still caught.
         """
         self._require_awake()
-        self._validate_generation_params(
-            prompt, max_new_tokens, temperature, top_p, top_k,
-            repetition_penalty, min_p, min_k, dry_multiplier)
+        params = SamplingParams(
+            max_new_tokens=max_new_tokens, temperature=temperature,
+            top_p=top_p, top_k=top_k,
+            repetition_penalty=repetition_penalty, min_p=min_p,
+            min_k=min_k, dry_multiplier=dry_multiplier, dry_base=dry_base,
+            dry_allowed_length=dry_allowed_length,
+            dry_penalty_last_n=dry_penalty_last_n, stop=stop,
+            skip_special_tokens=skip_special_tokens)
+        self._validate_generation_params(prompt, params)
         self._check_vram_and_offload_if_needed()
         self.hotswap.apply_pending()
 
@@ -1353,21 +1441,41 @@ class _GenerationMixin:
             eos_set = self._eos_token_ids(eos_token_ids)
             generated_ids: list[int] = []
 
+            # Stop-string holdback: never emit the last ``holdback``
+            # decoded chars until a stop check passes — a match may start
+            # inside that tail (stop strings can span token boundaries).
+            holdback = (max((len(s) for s in stop), default=0)
+                        if stop else 0)
+            buf = ""
+
             logits, past_kv = self._prefill(ids)
             for next_token, _ in self._decode_tokens(
-                logits, past_kv, max_new_tokens, temperature, top_p, top_k,
-                repetition_penalty, eos_set, generated_ids, logits_processor,
-                min_p, min_k,
+                logits, past_kv, params, eos_set, generated_ids,
+                logits_processor,
                 context_ids=ids[0].tolist(),
-                dry_multiplier=dry_multiplier, dry_base=dry_base,
-                dry_allowed_length=dry_allowed_length,
-                dry_penalty_last_n=dry_penalty_last_n,
                 hidden_observer=hidden_observer,
             ):
                 chunk = self._safe_decode_ids([next_token.item()],
                                               skip_special_tokens)
-                if chunk:
-                    yield chunk
+                if not chunk:
+                    continue
+                buf += chunk
+                if stop:
+                    cut = -1
+                    for s in stop:
+                        idx = buf.find(s)
+                        if idx != -1 and (cut == -1 or idx < cut):
+                            cut = idx
+                    if cut != -1:
+                        if cut > 0:
+                            yield buf[:cut]
+                        return
+                if len(buf) > holdback:
+                    emit = len(buf) - holdback
+                    yield buf[:emit]
+                    buf = buf[emit:]
+            if buf:
+                yield buf
 
             self._record_generation(len(generated_ids))
         except torch.cuda.OutOfMemoryError as e:
@@ -1387,45 +1495,42 @@ class _GenerationMixin:
         self.generation_count += 1
         self.total_tokens_generated += n_gen
 
-    def _validate_generation_params(self, prompt: str, max_new_tokens: int,
-                                    temperature: float, top_p: float,
-                                    top_k: int, repetition_penalty: float,
-                                    min_p: float = 0.0, min_k: float = 0.0,
-                                    dry_multiplier: float = 0.0):
+    def _validate_generation_params(self, prompt: str,
+                                    params: SamplingParams):
         """Validate generation parameters before starting.
 
         Raises ``ConfigurationError`` or ``GenerationError`` on invalid input.
         """
         if not isinstance(prompt, str) or not prompt:
             raise ConfigurationError("prompt must be a non-empty string")
-        if max_new_tokens <= 0:
+        if params.max_new_tokens <= 0:
             raise ConfigurationError(
-                f"max_new_tokens must be positive, got {max_new_tokens}")
-        if max_new_tokens > 100_000:
+                f"max_new_tokens must be positive, got {params.max_new_tokens}")
+        if params.max_new_tokens > 100_000:
             raise ConfigurationError(
-                f"max_new_tokens={max_new_tokens} is unreasonably large "
+                f"max_new_tokens={params.max_new_tokens} is unreasonably large "
                 f"(max 100000)", suggestion="Use a smaller value or add a timeout.")
-        if not (0 <= temperature <= 2.0):
+        if not (0 <= params.temperature <= 2.0):
             raise ConfigurationError(
-                f"temperature must be in [0, 2.0], got {temperature}")
-        if not (0 < top_p <= 1.0):
+                f"temperature must be in [0, 2.0], got {params.temperature}")
+        if not (0 < params.top_p <= 1.0):
             raise ConfigurationError(
-                f"top_p must be in (0, 1.0], got {top_p}")
-        if top_k <= 0:
+                f"top_p must be in (0, 1.0], got {params.top_p}")
+        if params.top_k <= 0:
             raise ConfigurationError(
-                f"top_k must be positive, got {top_k}")
-        if repetition_penalty <= 0:
+                f"top_k must be positive, got {params.top_k}")
+        if params.repetition_penalty <= 0:
             raise ConfigurationError(
-                f"repetition_penalty must be positive, got {repetition_penalty}")
-        if not (0 <= min_p <= 1.0):
+                f"repetition_penalty must be positive, got {params.repetition_penalty}")
+        if not (0 <= params.min_p <= 1.0):
             raise ConfigurationError(
-                f"min_p must be in [0, 1.0], got {min_p}")
-        if not (0 <= min_k <= 1.0):
+                f"min_p must be in [0, 1.0], got {params.min_p}")
+        if not (0 <= params.min_k <= 1.0):
             raise ConfigurationError(
-                f"min_k must be in [0, 1.0], got {min_k}")
-        if dry_multiplier < 0:
+                f"min_k must be in [0, 1.0], got {params.min_k}")
+        if params.dry_multiplier < 0:
             raise ConfigurationError(
-                f"dry_multiplier must be >= 0, got {dry_multiplier}")
+                f"dry_multiplier must be >= 0, got {params.dry_multiplier}")
 
         # Check prompt length vs model max_seq_len (warn, don't block —
         # tokenizer may handle truncation, and estimate is rough)
@@ -1551,7 +1656,8 @@ class _GenerationMixin:
         if seq_len <= chunk_size:
             # Short prompt — single pass
             with torch.inference_mode():
-                out = self.model(ids, past_key_values=past_kv, use_cache=True)
+                out = self.model(ids, past_key_values=past_kv,
+                                 use_cache=True, logits_last_only=True)
                 logits, past_kv = unpack_output_with_kv(out)
             return logits, past_kv
 
@@ -1563,19 +1669,15 @@ class _GenerationMixin:
             while offset < seq_len:
                 end = min(offset + chunk_size, seq_len)
                 chunk = ids[:, offset:end]
-                out = self.model(chunk, past_key_values=kv, use_cache=True)
+                out = self.model(chunk, past_key_values=kv,
+                                 use_cache=True, logits_last_only=True)
                 logits, kv = unpack_output_with_kv(out)
                 offset = end
         # Return logits from the last chunk (last position)
         return logits, kv
 
     def _decode_with_kv(self, ids, logits, past_kv,
-                        max_new_tokens, temperature, top_p,
-                        top_k: int = 80, repetition_penalty: float = 1.05,
-                        min_p: float = 0.0, min_k: float = 0.0,
-                        dry_multiplier: float = 0.0, dry_base: float = 1.75,
-                        dry_allowed_length: int = 2,
-                        dry_penalty_last_n: int = 512):
+                        params: SamplingParams):
         """Standard autoregressive decode from existing KV cache state.
 
         Used by prefix cache fast path: prefill already done, just decode.
@@ -1585,13 +1687,8 @@ class _GenerationMixin:
         generated_tokens = []
 
         for next_token, is_eos in self._decode_tokens(
-            logits, past_kv, max_new_tokens, temperature, top_p, top_k,
-            repetition_penalty, eos_set, generated_ids,
-            min_p=min_p, min_k=min_k,
+            logits, past_kv, params, eos_set, generated_ids,
             context_ids=ids[0].tolist(),
-            dry_multiplier=dry_multiplier, dry_base=dry_base,
-            dry_allowed_length=dry_allowed_length,
-            dry_penalty_last_n=dry_penalty_last_n,
         ):
             if not is_eos:
                 generated_tokens.append(next_token)
@@ -1619,8 +1716,16 @@ class _GenerationMixin:
     def _extract_logprobs(self, prompt_ids: torch.Tensor,
                           output_ids: torch.Tensor,
                           logprobs: int | None,
-                          prompt_logprobs: int | None) -> dict:
+                          prompt_logprobs: int | None,
+                          captured_steps: list[dict] | None = None) -> dict:
         """Extract token logprobs for OpenAI API compatibility.
+
+        ``captured_steps`` carries per-step records made during decode by
+        ``step_observer`` (raw logits + sampled id) — the normal path, so
+        extraction costs zero extra forwards.  Legacy callers passing
+        ``None`` fall back to re-running generation; on memory models the
+        re-run is wrapped in a journal mark + ``revert_since`` so the
+        model's live memory is restored afterwards (forward() learns).
 
         Returns dict with:
           - content: list of {token, logprob, bytes, top_logprobs} per
@@ -1634,73 +1739,111 @@ class _GenerationMixin:
         content_logprobs = []
         prompt_lp = []
 
-        with torch.inference_mode():
-            # Re-run forward to get logits for each position
-            # Prompt logprobs: one forward pass over the prompt
-            if prompt_logprobs is not None and prompt_logprobs > 0:
-                out = self.model(prompt_ids, use_cache=False)
-                logits = out[0] if isinstance(out, tuple) else out.logits
-                log_probs = F.log_softmax(logits[0].float(), dim=-1)
-                for i in range(min(prompt_len, len(log_probs))):
-                    token_id = prompt_ids[0, i].item()
-                    lp = log_probs[i, token_id].item()
-                    top_n = min(prompt_logprobs, log_probs.shape[-1])
-                    top_vals, top_ids = log_probs[i].topk(top_n)
-                    top_lp = [
-                        {"token": self.tokenizer.decode([tid.item()]),
-                         "logprob": lp_val.item(),
-                         "bytes": tid.item()}
-                        for tid, lp_val in zip(top_ids, top_vals)
-                    ]
-                    prompt_lp.append({
-                        "token": self.tokenizer.decode([token_id]),
-                        "logprob": lp,
-                        "bytes": token_id,
-                        "top_logprobs": top_lp,
-                    })
+        # Memory models learn on every forward — journaled writes are
+        # undone via revert_since; predict-only pushes leave no journal
+        # entries, so the stream scalars are snapshotted directly too
+        # (ring/H bytes are position-keyed and unreachable once _count
+        # is restored — documented harmless in _undo_entry).
+        mem = _is_memory_model(self.model)
+        saved = None
+        if mem and hasattr(self.model, "journal"):
+            saved = {"mark": len(self.model.journal.entries),
+                     "count": self.model._count,
+                     "c": self.model._c.clone(),
+                     "proto": self.model._proto.clone()}
+            if self.model._gpu:
+                saved["pos_g"] = self.model._pos_g.clone()
+        try:
+            with torch.inference_mode():
+                # Prompt logprobs: one forward pass over the prompt
+                if prompt_logprobs is not None and prompt_logprobs > 0:
+                    out = self.model(prompt_ids, use_cache=False)
+                    logits = out[0] if isinstance(out, tuple) else out.logits
+                    log_probs = F.log_softmax(logits[0].float(), dim=-1)
+                    for i in range(min(prompt_len, len(log_probs))):
+                        token_id = prompt_ids[0, i].item()
+                        lp = log_probs[i, token_id].item()
+                        top_n = min(prompt_logprobs, log_probs.shape[-1])
+                        top_vals, top_ids = log_probs[i].topk(top_n)
+                        top_lp = [
+                            {"token": self.tokenizer.decode([tid.item()]),
+                             "logprob": lp_val.item(),
+                             "bytes": tid.item()}
+                            for tid, lp_val in zip(top_ids, top_vals)
+                        ]
+                        prompt_lp.append({
+                            "token": self.tokenizer.decode([token_id]),
+                            "logprob": lp,
+                            "bytes": token_id,
+                            "top_logprobs": top_lp,
+                        })
 
-            # Generated token logprobs: need per-step logits
-            if logprobs is not None and logprobs > 0 and len(gen_ids) > 0:
-                # Re-run generation to capture per-step logits
-                ids = prompt_ids.clone()
-                past_kv = None
-                for step in range(min(len(gen_ids), output_ids.shape[1] - prompt_len)):
-                    with torch.inference_mode():
-                        if past_kv is not None:
-                            out = self.model(ids[:, -1:], past_key_values=past_kv, use_cache=True)
-                        else:
-                            out = self.model(ids, use_cache=True)
-                        logits = out[0] if isinstance(out, tuple) else out.logits
-                        past_kv = out[2] if isinstance(out, tuple) and len(out) > 2 else out.past_key_values
-                    log_probs = F.log_softmax(logits[0, -1].float(), dim=-1)
-                    token_id = gen_ids[step].item()
-                    lp = log_probs[token_id].item()
-                    top_n = min(logprobs, log_probs.shape[-1])
-                    top_vals, top_ids = log_probs.topk(top_n)
-                    top_lp = [
-                        {"token": self.tokenizer.decode([tid.item()]),
-                         "logprob": lp_val.item(),
-                         "bytes": tid.item()}
-                        for tid, lp_val in zip(top_ids, top_vals)
-                    ]
-                    content_logprobs.append({
-                        "token": self.tokenizer.decode([token_id]),
-                        "logprob": lp,
-                        "bytes": token_id,
-                        "top_logprobs": top_lp,
-                    })
-                    ids = torch.cat([ids, gen_ids[step:step+1].unsqueeze(0)], dim=1)
+                if logprobs is not None and logprobs > 0 and len(gen_ids) > 0:
+                    if captured_steps is not None:
+                        # Zero-cost path: logits were recorded at decode.
+                        for st in captured_steps[:len(gen_ids)]:
+                            top_lp = [
+                                {"token": self.tokenizer.decode([tid]),
+                                 "logprob": lv,
+                                 "bytes": tid}
+                                for tid, lv in zip(st["top_ids"],
+                                                   st["top_vals"])
+                            ]
+                            content_logprobs.append({
+                                "token": self.tokenizer.decode(
+                                    [st["token_id"]]),
+                                "logprob": st["token_lp"],
+                                "bytes": st["token_id"],
+                                "top_logprobs": top_lp,
+                            })
+                    else:
+                        # Legacy: re-run generation for per-step logits.
+                        ids = prompt_ids.clone()
+                        past_kv = None
+                        for step in range(min(len(gen_ids), output_ids.shape[1] - prompt_len)):
+                            with torch.inference_mode():
+                                if past_kv is not None:
+                                    out = self.model(ids[:, -1:], past_key_values=past_kv, use_cache=True, logits_last_only=True)
+                                else:
+                                    out = self.model(ids, use_cache=True, logits_last_only=True)
+                                logits = out[0] if isinstance(out, tuple) else out.logits
+                                past_kv = out[2] if isinstance(out, tuple) and len(out) > 2 else out.past_key_values
+                            log_probs = F.log_softmax(logits[0, -1].float(), dim=-1)
+                            token_id = gen_ids[step].item()
+                            lp = log_probs[token_id].item()
+                            top_n = min(logprobs, log_probs.shape[-1])
+                            top_vals, top_ids = log_probs.topk(top_n)
+                            top_lp = [
+                                {"token": self.tokenizer.decode([tid.item()]),
+                                 "logprob": lp_val.item(),
+                                 "bytes": tid.item()}
+                                for tid, lp_val in zip(top_ids, top_vals)
+                            ]
+                            content_logprobs.append({
+                                "token": self.tokenizer.decode([token_id]),
+                                "logprob": lp,
+                                "bytes": token_id,
+                                "top_logprobs": top_lp,
+                            })
+                            ids = torch.cat([ids, gen_ids[step:step+1].unsqueeze(0)], dim=1)
+        finally:
+            if saved is not None:
+                # Undo the scoring-pass writes — restore live memory to
+                # exactly its pre-extraction state.
+                n_new = len(self.model.journal.entries) - saved["mark"]
+                if n_new > 0:
+                    self.model.revert_since(n_new)
+                self.model._count = saved["count"]
+                self.model._c.copy_(saved["c"])
+                self.model._proto.copy_(saved["proto"])
+                if "pos_g" in saved:
+                    self.model._pos_g.copy_(saved["pos_g"])
 
         return {"content": content_logprobs, "prompt": prompt_lp}
 
     def _finish_to_stop(self, output_ids, prompt_len,
-                        temperature, top_p, extra_budget=32,
-                        past_kv=None, top_k: int = 80,
-                        repetition_penalty: float = 1.05,
-                        min_p: float = 0.0, min_k: float = 0.0,
-                        dry_multiplier: float = 0.0, dry_base: float = 1.75,
-                        dry_allowed_length: int = 2,
-                        dry_penalty_last_n: int = 512):
+                        params: SamplingParams, extra_budget=32,
+                        past_kv=None):
         """Continue generation until a natural stopping point or extra_budget.
 
         If past_kv is provided (captured from the decoding step), skips the
@@ -1715,19 +1858,24 @@ class _GenerationMixin:
             with torch.inference_mode():
                 out = self.model(last_token, past_key_values=past_kv, use_cache=True)
                 logits, past_kv = unpack_output_with_kv(out)
+        elif _is_memory_model(self.model) and \
+                hasattr(self.model, "_predict"):
+            # Memory models already learned every generated token during
+            # decode — a re-prefill would double-ingest the whole sequence
+            # into live memory.  The next-token distribution comes
+            # straight from the current sketch at zero cost.
+            with torch.inference_mode():
+                logits = self.model._predict()[None, None, :]
         else:
             logits, past_kv = self._prefill(output_ids)
 
+        budget_params = dataclasses.replace(
+            params, max_new_tokens=extra_budget)
         generated_tokens = [
             next_token
             for next_token, _ in self._decode_tokens(
-                logits, past_kv, extra_budget, temperature, top_p, top_k,
-                repetition_penalty, stop_tokens, generated_ids,
-                min_p=min_p, min_k=min_k,
+                logits, past_kv, budget_params, stop_tokens, generated_ids,
                 context_ids=output_ids[0, :prompt_len].tolist(),
-                dry_multiplier=dry_multiplier, dry_base=dry_base,
-                dry_allowed_length=dry_allowed_length,
-                dry_penalty_last_n=dry_penalty_last_n,
             )
         ]
         if not generated_tokens:

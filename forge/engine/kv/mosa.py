@@ -198,8 +198,9 @@ class MoSAWrapper:
                 q = self.q_norm(q)
                 k = self.k_norm(k)
 
-            q = self.rope(q, offset=0, position_ids=position_ids)
-            k = self.rope(k, offset=0, position_ids=position_ids)
+            if self.rope is not None:  # use_rope=False (Jamba V2): skip
+                q = self.rope(q, offset=0, position_ids=position_ids)
+                k = self.rope(k, offset=0, position_ids=position_ids)
 
             if preallocated_cache is not None:
                 preallocated_cache.append(layer_idx, k, v)

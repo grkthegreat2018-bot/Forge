@@ -5,6 +5,7 @@ CPU-only: no torch, no real checkpoint. Engine internals are stubbed.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import threading
 import time
@@ -426,5 +427,155 @@ def test_agent_workspace_projects_dir(tmp_path, monkeypatch):
     body2 = chat_routes.AgentStartRequest(
         task="x", workspace=str(tmp_path), project="named")
     assert chat_routes._agent_workspace(body2) == (str(tmp_path), "named")
+
+
+# ── Self-play live bridge (events.jsonl → hub → /ws) ────────────────
+
+def _watch_fixture(tmp_path):
+    """Services stand-in wired to a tmp-dir EventsReader + real hub."""
+    from types import SimpleNamespace
+    from forge_gui.api.events_reader import EventsReader
+    from forge_gui_server.deps import Services
+    sp = tmp_path / "self_play"
+    sp.mkdir()
+    return (sp, SimpleNamespace(
+        events=EventsReader(search_dirs=[tmp_path], rescan_interval=0),
+        hub=EventHub()), Services._selfplay_watch)
+
+
+def _drain(q, timeout=4.0):
+    """Collect queued events until `timeout` elapses with none new."""
+    out = []
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            out.append(q.get_nowait())
+        except asyncio.QueueEmpty:
+            time.sleep(0.05)
+    return out
+
+
+def test_selfplay_watch_publishes_events(tmp_path):
+    """Appended events.jsonl lines are republished once each, in order."""
+    sp, svc, watch = _watch_fixture(tmp_path)
+    q = svc.hub.subscribe(replay=False)
+
+    async def run():
+        t = asyncio.create_task(watch(svc))
+        await asyncio.sleep(0.6)  # let the watcher discover the file
+        ev_file = sp / "events.jsonl"
+        with open(ev_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": 1, "kind": "task_done",
+                                "success": True}) + "\n")
+            f.write(json.dumps({"ts": 2, "kind": "phase",
+                                "phase": "gen"}) + "\n")
+        for _ in range(40):
+            if q.qsize() >= 2:
+                break
+            await asyncio.sleep(0.05)
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run())
+    got = [e for e in _drain(q, timeout=0.3) if e["type"] == "selfplay_event"]
+    kinds = [e["payload"]["kind"] for e in got]
+    assert kinds == ["task_done", "phase"]
+
+
+def test_selfplay_watch_status_push(tmp_path):
+    """status.json changes publish selfplay_status with heartbeat fields."""
+    sp, svc, watch = _watch_fixture(tmp_path)
+    (sp / "heartbeat.json").write_text(json.dumps({"ts": time.time()}))
+    (sp / "status.json").write_text(json.dumps(
+        {"status": "running", "phase": "gen"}))
+    q = svc.hub.subscribe(replay=False)
+
+    async def run():
+        t = asyncio.create_task(watch(svc))
+        for _ in range(40):
+            if not q.empty():
+                break
+            await asyncio.sleep(0.05)
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run())
+    got = [e for e in _drain(q, timeout=0.3)
+           if e["type"] == "selfplay_status"]
+    assert got
+    p = got[-1]["payload"]
+    assert p["status"]["phase"] == "gen"
+    assert "heartbeat_age_s" in p and "heartbeat_stalled" in p
+
+
+def test_selfplay_watch_survives_truncation(tmp_path):
+    """New-run truncation must not wedge the watcher or re-emit stale
+    events at garbage offsets."""
+    sp, svc, watch = _watch_fixture(tmp_path)
+    ev_file = sp / "events.jsonl"
+    ev_file.write_text(json.dumps({"ts": 0, "kind": "old"}) + "\n" * 3)
+    q = svc.hub.subscribe(replay=False)
+
+    async def run():
+        t = asyncio.create_task(watch(svc))
+        await asyncio.sleep(0.6)
+        # simulate run start: file wiped, then fresh events — each write
+        # gets its own watcher tick (0.4s poll) so Windows stat caching
+        # can't merge them into one read window
+        ev_file.write_text(json.dumps({"ts": 5, "kind": "phase",
+                                       "phase": "startup"}) + "\n")
+        for _ in range(40):
+            if q.qsize() >= 2:  # backfill "old" + post-truncation "phase"
+                break
+            await asyncio.sleep(0.05)
+        with open(ev_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": 6, "kind": "task_start",
+                                "idx": 0}) + "\n")
+        for _ in range(40):
+            if q.qsize() >= 3:
+                break
+            await asyncio.sleep(0.05)
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run())
+    kinds = [e["payload"]["kind"] for e in _drain(q, timeout=0.3)
+             if e["type"] == "selfplay_event"]
+    # backfill "old" + the two fresh records — no crash, no stalls
+    assert "task_start" in kinds and "phase" in kinds
+
+
+def test_pipe_reset_filter_swallows_10054():
+    """Windows subprocess pipe teardown logs a cosmetic
+    ConnectionResetError via the loop's default exception handler —
+    the filter must swallow it and pass real errors through."""
+    from forge_gui_server.deps import Services
+    loop = asyncio.new_event_loop()
+    seen = []
+    loop.set_exception_handler(lambda l, ctx: seen.append(ctx))
+    Services._install_pipe_reset_filter(loop)
+    handler = loop.get_exception_handler()
+    if sys.platform == "win32":
+        # pipe-reset noise: swallowed (debug-logged, not forwarded)
+        handler(loop, {"exception": ConnectionResetError(10054),
+                       "message": "pipe lost"})
+        assert seen == []
+        # real errors still reach the previous handler
+        handler(loop, {"exception": RuntimeError("boom")})
+        assert len(seen) == 1
+    else:
+        # non-Windows: filter is a no-op, handler unchanged
+        handler(loop, {"exception": ConnectionResetError(10054)})
+        assert len(seen) == 1
+    loop.close()
 
 

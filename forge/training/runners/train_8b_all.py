@@ -42,7 +42,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+if os.name != "nt":  # expandable_segments unsupported on Windows
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")

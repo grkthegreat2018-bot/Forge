@@ -23,7 +23,8 @@ import random
 import sys
 from pathlib import Path
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+if os.name != "nt":  # expandable_segments unsupported on Windows
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # Fix Windows console encoding
 if sys.platform == "win32":

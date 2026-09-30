@@ -12,6 +12,7 @@ import type {
   GpuSnapshot,
   LoraStatus,
   RunSnapshot,
+  SelfPlayStatusPayload,
   StatusResponse,
   TaskInfo,
   WsEvent,
@@ -37,6 +38,7 @@ interface ForgeState {
   engineProgress: string | null
   taskLines: Record<string, string[]>
   selfplayEvents: Record<string, unknown>[]
+  selfplayStatus: SelfPlayStatusPayload | null
   timerFired: { timer_id: string; label: string; message: string }[]
   boot: { running: boolean; status: string; output: string }
 
@@ -74,6 +76,7 @@ export const useForge = create<ForgeState>((set) => ({
   engineProgress: null,
   taskLines: {},
   selfplayEvents: [],
+  selfplayStatus: null,
   timerFired: [],
   boot: { running: false, status: '', output: '' },
 
@@ -201,6 +204,15 @@ function handleEvent(evt: WsEvent) {
           timerFired: [...s.timerFired, evt.payload as never].slice(-20),
         }))
       }
+      break
+    case 'selfplay_event': {
+      useForge.setState((s) => ({
+        selfplayEvents: [...s.selfplayEvents, p].slice(-2000),
+      }))
+      break
+    }
+    case 'selfplay_status':
+      useForge.setState({ selfplayStatus: p as unknown as SelfPlayStatusPayload })
       break
     case 'boot': {
       const b = p as { kind: string; message?: string; data?: { output?: string } }

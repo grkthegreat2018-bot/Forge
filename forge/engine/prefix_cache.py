@@ -268,11 +268,11 @@ def cache_prompt_prefix(engine, ids: torch.Tensor,
 
 
 def generate_from_prefix_cache(
-    engine, ids, max_new_tokens, temperature, top_p, top_k,
-    repetition_penalty,
+    engine, ids, params,
 ):
     """Fast path: if the prefix is cached, reuse its KV and skip prefill.
 
+    ``params`` is an ``engine_common.SamplingParams`` bundle.
     Returns the full ``output_ids`` tensor on hit, or ``None`` on miss
     (caller falls back to normal decoding).
     """
@@ -290,8 +290,7 @@ def generate_from_prefix_cache(
                 suffix_ids, past_key_values=cached_past_kv, use_cache=True)
             logits, past_kv = unpack_output_with_kv(out)
         output_ids = engine._decode_with_kv(
-            ids, logits, past_kv, max_new_tokens, temperature, top_p,
-            top_k=top_k, repetition_penalty=repetition_penalty)
+            ids, logits, past_kv, params)
         logger.info(f"  [PrefixCache] HIT + REUSE (prefix len={cached_len}, "
               f"saved prefill)")
         return output_ids
@@ -666,7 +665,7 @@ class RadixPrefixCache:
 
         def __init__(self):
             self.token_ids: list[int] = []
-            self.kv_state = object()  # None until computed
+            self.kv_state = None  # None until computed
             self.ref_count = 0
             self.children: dict[int, RadixPrefixCache._Node] = {}
             self.last_used = 0.0
@@ -678,14 +677,19 @@ class RadixPrefixCache:
         self._hits = 0
         self._misses = 0
 
-    def _match(self, node: _Node, token_ids: list[int], start: int) -> tuple[int, _Node]:
+    def _match(self, node: _Node, token_ids: list[int],
+               start: int) -> tuple[int, _Node, int, _Node | None]:
         """Walk the tree from `node` matching `token_ids[start:]`.
 
-        Returns (matched_count, last_node) — the deepest node reached
-        and how many tokens were matched along the way.
+        Returns (matched_count, last_node, edge_pos, parent) — the deepest
+        node reached, how many tokens were consumed globally, how far into
+        ``last_node``'s own edge the match got, and ``last_node``'s parent
+        (None for root). ``edge_pos`` lets callers detect mid-edge stops,
+        which require an edge split on insert.
         """
         matched = 0
         cur = node
+        parent = None
         i = start
         while i < len(token_ids):
             # Try to extend within current edge
@@ -700,14 +704,31 @@ class RadixPrefixCache:
             child = cur.children.get(token_ids[i])
             if child is None:
                 break
-            cur = child
+            parent, cur = cur, child
             matched = 0
             # Continue matching within this child's edge
             if matched < len(cur.token_ids) and cur.token_ids[matched] == token_ids[i]:
                 matched += 1
                 i += 1
-        # If we stopped mid-edge, return the partial match count
-        return i - start, cur
+        # If we stopped mid-edge, edge_pos < len(cur.token_ids) reports it
+        return i - start, cur, matched, parent
+
+    def _split_edge(self, node: _Node, parent: _Node | None,
+                    pos: int) -> _Node:
+        """Split ``node``'s edge at ``pos``: parent → mid[E[:pos]] → node[E[pos:]].
+
+        ``node`` keeps its children, kv_state and ref_count; ``mid`` takes
+        the shared prefix. Returns ``mid`` (the new boundary node).
+        """
+        import time
+        mid = self._Node()
+        mid.token_ids = node.token_ids[:pos]
+        mid.children[node.token_ids[pos]] = node
+        mid.last_used = time.time()
+        node.token_ids = node.token_ids[pos:]
+        if parent is not None:
+            parent.children[mid.token_ids[0]] = mid
+        return mid
 
     def lookup_longest_prefix(self, ids: torch.Tensor) -> tuple[int, object] | None:
         """Find the longest cached prefix for `ids`.
@@ -718,13 +739,15 @@ class RadixPrefixCache:
         token_ids = ids[0].cpu().tolist()
         if len(token_ids) <= 16:
             return None
-        matched, node = self._match(self.root, token_ids, 0)
+        matched, node, _edge_pos, _parent = self._match(
+            self.root, token_ids, 0)
         if matched <= 0:
             self._misses += 1
             return None
         # Find the deepest node with a kv_state
         best_len = 0
         best_kv = None
+        best_node = None
         # Walk from root again, accumulating lengths
         cur = self.root
         acc = 0
@@ -737,6 +760,7 @@ class RadixPrefixCache:
                 if cur.kv_state is not None and acc > best_len:
                     best_len = acc
                     best_kv = cur.kv_state
+                    best_node = cur
                 if i >= matched:
                     break
             # Descend
@@ -749,7 +773,7 @@ class RadixPrefixCache:
                 break
         if best_kv is not None:
             self._hits += 1
-            node.last_used = time.time()
+            best_node.last_used = time.time()
             return best_len, best_kv
         self._misses += 1
         return None
@@ -759,26 +783,25 @@ class RadixPrefixCache:
         import time
         if not token_ids:
             return
-        # Find existing match
-        matched, node = self._match(self.root, token_ids, 0)
-        # If full match, just update kv_state
-        if matched == len(token_ids) and len(node.token_ids) == 0:
-            node.kv_state = kv_state
-            node.last_used = time.time()
-            return
-        # Need to split or extend
-        # For simplicity: create a new child edge for the remaining tokens
+        matched, node, edge_pos, parent = self._match(
+            self.root, token_ids, 0)
+        # Match stopped mid-edge (divergence OR the inserted sequence ends
+        # inside an edge): split the edge so the insert lands on a real
+        # node boundary. Without this, the new child's implied prefix
+        # would include edge tokens it never matched — and assigning
+        # children[remaining[0]] could silently clobber an existing subtree.
+        if 0 < edge_pos < len(node.token_ids):
+            node = self._split_edge(node, parent, edge_pos)
         remaining = token_ids[matched:]
         if not remaining:
+            # Requested sequence ends exactly at this boundary
             node.kv_state = kv_state
             node.last_used = time.time()
             return
-        # Create new node for remaining tokens
         new_node = self._Node()
         new_node.token_ids = remaining[:]
         new_node.kv_state = kv_state
         new_node.last_used = time.time()
-        new_node.ref_count = 1
         node.children[remaining[0]] = new_node
         self._n_entries += 1
         # Evict if over capacity

@@ -4,8 +4,11 @@ Kept import-light (stdlib + torch only). forge_engine.py re-exports these
 names so ``from forge.engine.forge_engine import _min_k_filter`` etc. keep
 working.
 """
+from __future__ import annotations
+
 import logging
 import threading
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING
 
 import torch
@@ -33,6 +36,53 @@ def _fast_load_vram_required(ckpt_size: int) -> int:
 #   LFM2.5: 7 (<|im_end|>), 151643/151645 (Qwen-style)
 #   Jamba Reasoning 3B: 2 (<|endoftext|>), 519 (<|im_end|>)
 _DEFAULT_EOS_TOKEN_IDS = frozenset({2, 7, 519, 151643, 151645})
+
+
+def _is_memory_model(model) -> bool:
+    """True for models whose state IS the memory (FluxLM) — no KV-cache
+    forward semantics.  Replaces scattered
+    ``model.__class__.__name__ == "FluxLM"`` sniffing: models declare the
+    contract via ``supports_kv_cache = False`` and engine code checks the
+    capability, so future memory-model architectures route correctly
+    without another name check."""
+    return not getattr(model, "supports_kv_cache", True)
+
+
+@dataclass
+class SamplingParams:
+    """Bundle of per-request sampling/decoding settings.
+
+    Collapses the ~15-argument parameter lists duplicated across
+    ``generate``/``generate_stream``/``generate_raw``/``generate_batch``/
+    ``_decode_tokens``/``_decode_with_kv``/``_finish_to_stop``.  Public
+    methods keep accepting individual kwargs (call-site compat) and build
+    one of these; internals pass the object so new sampling options touch
+    one class instead of six signatures.
+    """
+    max_new_tokens: int = 100
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = 80
+    repetition_penalty: float = 1.05
+    min_p: float = 0.0
+    min_k: float = 0.0
+    dry_multiplier: float = 0.0
+    dry_base: float = 1.75
+    dry_allowed_length: int = 2
+    dry_penalty_last_n: int = 512
+    stop: list[str] | None = None
+    skip_special_tokens: bool = True
+    learn: bool | None = None
+    # recall<->generation dial (memory models only): scales the gcell/
+    # gsyn channel lift weights.  None = model default (1.0); <1 leans
+    # on verbatim recall, >1 leans on generalized generation.
+    mem_bias: float | None = None
+
+    @classmethod
+    def from_kwargs(cls, **kw) -> "SamplingParams":
+        """Build from a kwargs dict, ignoring keys that aren't fields."""
+        names = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in kw.items() if k in names})
 
 
 def _min_k_filter(logits: torch.Tensor, sensitivity: float) -> torch.Tensor:

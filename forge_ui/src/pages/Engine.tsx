@@ -4,7 +4,7 @@
 import { clsx } from 'clsx'
 import {
   BookOpen, ChevronDown, ChevronRight, FileText, Moon,
-  Play, RefreshCw, ScrollText, Search, Square, Sun,
+  Play, RefreshCw, ScrollText, Square, Sun,
   Wrench, X, Zap,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
@@ -16,7 +16,7 @@ import type {
 } from '../lib/types'
 import {
   Btn, Card, Check, IconBtn, Input, KvRow, NumInput,
-  Select, Spinner, StatusDot, Tag, Textarea,
+  SearchInput, Select, Spinner, StatusDot, Tag, Textarea,
 } from '../components/ui'
 
 type TabId = 'status' | 'activation' | 'maint' | 'log' | 'sessions' | 'library'
@@ -821,14 +821,12 @@ function LibraryPanel({ engine, setErr }: {
 
       <Card title="Search">
         <div className="flex items-center gap-2 mb-2">
-          <div className="relative flex-1">
-            <Search size={13}
-              className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-faint" />
-            <Input value={query} onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') void doSearch() }}
-              placeholder="search the library…"
-              className="w-full pl-7 !py-1.5" />
-          </div>
+          <SearchInput
+            value={query}
+            onChange={setQuery}
+            placeholder="Search prompt library…"
+            className="flex-1"
+          />
           <Btn variant="subtle" disabled={!ready || !!busy} onClick={doSearch}>
             {busy === 'search' ? <Spinner /> : null} Search
           </Btn>

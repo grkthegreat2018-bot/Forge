@@ -123,19 +123,30 @@ def _sample_from_logits(
     dry_penalties: dict[int, float] | None,
     top_p_fn,
 ) -> torch.Tensor:
-    """Shared sampling chain: temp → rep-penalty → DRY → min-p →
+    """Shared sampling chain: rep-penalty → temp → DRY → min-p →
     min-k → top-k → top-p → multinomial (argmax at temperature==0).
+
+    Repetition penalty precedes temperature (HF processor ordering) and
+    also applies to greedy decode — penalized logits can change argmax.
 
     Bit-identical to the inline chain previously duplicated across
     StandardDecoding; ``top_p_fn`` is the strategy's nucleus filter
     (StandardDecoding._top_p → research.sampling_utils.top_p_filter_logits).
     """
+    if repetition_penalty != 1.0 and generated_ids:
+        # raw logits may be an inference tensor (model ran under
+        # inference_mode) — clone so the in-place index_copy is legal
+        # outside that context.
+        next_logits = next_logits.clone()
+        toks = torch.tensor(
+            sorted(set(generated_ids[-64:])), device=next_logits.device,
+            dtype=torch.long)
+        next_logits.index_copy_(
+            -1, toks,
+            next_logits.index_select(-1, toks) / repetition_penalty)
     next_logits = next_logits / max(temperature, 1e-5)
     if temperature == 0:
         return next_logits.argmax(-1, keepdim=True)
-    if generated_ids:
-        for tid in set(generated_ids[-64:]):
-            next_logits[:, tid] /= repetition_penalty
     if dry_penalties:
         next_logits = _apply_dry(next_logits, dry_penalties)
     if min_p > 0.0:

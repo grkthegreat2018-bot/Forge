@@ -3,13 +3,15 @@
 // Live lines arrive over the hub WS as taskLines[taskId].
 
 import { clsx } from 'clsx'
-import { Play, RefreshCw, Square, Terminal, Trash2, X } from 'lucide-react'
+import {
+  Check as CheckIcon, Copy, Play, RefreshCw, Square, Terminal, Trash2, X,
+} from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../lib/api'
 import { useForge } from '../lib/store'
 import type { TaskInfo } from '../lib/types'
 import {
-  Btn, Check, EmptyState, IconBtn, Input, KvRow, StatusDot, Tag,
+  Btn, Check, EmptyState, IconBtn, Input, KvRow, SearchInput, StatusDot, Tag,
 } from '../components/ui'
 
 type TaskDetail = TaskInfo & { error?: string }
@@ -68,7 +70,20 @@ export default function Tasks() {
   const [now, setNow] = useState(() => Date.now())
   const outRef = useRef<HTMLDivElement>(null)
 
+  const [taskSearch, setTaskSearch] = useState('')
+  const [copied, setCopied] = useState(false)
+
   const ordered = useMemo(() => [...tasks].reverse(), [tasks])
+  const filteredTasks = useMemo(() => {
+    const q = taskSearch.trim().toLowerCase()
+    if (!q) return ordered
+    return ordered.filter((t) =>
+      t.name.toLowerCase().includes(q) ||
+      t.id.toLowerCase().includes(q) ||
+      t.command.join(' ').toLowerCase().includes(q)
+    )
+  }, [ordered, taskSearch])
+
   const selTask = tasks.find((t) => t.id === sel) ?? null
   const anyLive = tasks.some((t) => t.is_live)
 
@@ -179,14 +194,22 @@ export default function Tasks() {
       <div className="flex flex-1 min-h-0">
         {/* left: task list */}
         <div className="w-[300px] shrink-0 border-r border-border flex flex-col">
+          <div className="p-2 border-b border-border/70">
+            <SearchInput
+              value={taskSearch}
+              onChange={setTaskSearch}
+              placeholder="Search processes…"
+              className="w-full"
+            />
+          </div>
           <div className="flex-1 overflow-y-auto p-2">
-            {ordered.map((t) => (
+            {filteredTasks.map((t) => (
               <TaskRow key={t.id} task={t} sel={t.id === sel} now={now}
                 onSelect={() => setSel(t.id)} onKill={() => void kill(t.id)} />
             ))}
-            {!ordered.length && (
+            {!filteredTasks.length && (
               <div className="text-[11.5px] text-text-faint text-center py-8">
-                no processes
+                {taskSearch ? 'no matching processes' : 'no processes'}
               </div>
             )}
           </div>
@@ -206,16 +229,30 @@ export default function Tasks() {
                   {selTask.status}
                 </Tag>
                 <div className="ml-auto flex items-center gap-1.5">
+                  {merged.length > 0 && (
+                    <button
+                      onClick={() => {
+                        void navigator.clipboard.writeText(merged.join('\n')).then(() => {
+                          setCopied(true)
+                          setTimeout(() => setCopied(false), 1200)
+                        })
+                      }}
+                      title="Copy task output"
+                      className="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] bg-panel-alt hover:bg-panel-hover border border-border text-text-dim hover:text-text cursor-pointer transition-colors">
+                      {copied ? <CheckIcon size={11} className="text-ok" /> : <Copy size={11} />}
+                      {copied ? 'Copied' : 'Copy log'}
+                    </button>
+                  )}
                   <IconBtn title="Reload output"
                     onClick={() => sel && loadDetail(sel)}>
                     <RefreshCw size={12} />
                   </IconBtn>
                   {selTask.is_live ? (
-                    <Btn variant="danger" onClick={() => void kill(selTask.id)}>
+                    <Btn variant="danger" size="xs" onClick={() => void kill(selTask.id)}>
                       <Square size={11} /> Kill
                     </Btn>
                   ) : (
-                    <Btn variant="subtle" onClick={() => void remove(selTask.id)}>
+                    <Btn variant="subtle" size="xs" onClick={() => void remove(selTask.id)}>
                       <Trash2 size={11} /> Remove
                     </Btn>
                   )}

@@ -52,6 +52,12 @@ class _CheckpointLoadingMixin:
         """
         from forge.config import get_config
         from research.tokenizer_cache import get_tokenizer
+        from forge.runtime.configure import configure
+
+        # Env-side runtime config (CUDA alloc conf etc.) — must run before
+        # the first CUDA allocation below, else expandable_segments is a
+        # no-op (previously set in __init__, which runs after weight load).
+        configure()
 
         cfg = get_config(config_name, device=device,
                          **(config_overrides or {}))

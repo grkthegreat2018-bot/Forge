@@ -46,10 +46,14 @@ class BatchedEvaluator:
         self._seed = 42
 
     def can_batch(self) -> bool:
-        return self.domain_name in self.BATCHABLE
+        # Domains that implement their own vectorized eval path (e.g. the
+        # math_prog register-machine VM) take precedence over the table below.
+        return self.domain_name in self.BATCHABLE or hasattr(self.domain, "batch_evaluate")
 
     def batch_evaluate(self, configs: list[dict]) -> list[dict]:
         """Evaluate N configs in batched GPU operations."""
+        if hasattr(self.domain, "batch_evaluate"):
+            return self.domain.batch_evaluate(configs)
         if not self.can_batch() or len(configs) < 4:
             return [self.domain.evaluate(c) for c in configs]
 

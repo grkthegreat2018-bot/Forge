@@ -40,6 +40,20 @@ def configure() -> None:
     if _CONFIGURED:
         return
 
+    # --- CUDA allocator ------------------------------------------------------
+    # expandable_segments cuts VRAM fragmentation — critical on the 12GB
+    # card where long-running engines fragment the heap across many
+    # generate/sleep cycles.  Must be set before CUDA context init, which is
+    # why it lives here (entrypoint startup) rather than in ForgeEngine
+    # (constructed after weights are already on GPU — too late to matter).
+    # cuMemMap-backed expandable segments are unsupported on Windows
+    # (torch warns "not supported on this platform" on every alloc) — the
+    # native Windows allocator already handles fragmentation adequately.
+    import sys
+    if sys.platform != "win32":
+        os.environ.setdefault(
+            "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
     # --- safetensors fast CUDA loading -------------------------------------
     # Pinned host memory + async CPU->GPU copies instead of synchronous
     # per-tensor copies.  Dramatically speeds up weight loading on CUDA.

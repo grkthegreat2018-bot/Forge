@@ -1,5 +1,9 @@
 """Session manager + request batching queue for concurrent multi-task generation.
 
+Layer map: this file = server-side conversation history + BatchQueue.
+Per-session KV reuse lives in session_cache.py + the engine_sessions.py
+mixin (different layer despite the similar name).
+
 Provides:
   - SessionManager: per-task conversation history + KV cache, LRU eviction
   - BatchQueue: collects concurrent requests for a configurable window
@@ -89,22 +93,25 @@ class TaskBootConfig:
 
     def apply_to(self, engine):
         """Apply this config to a ForgeEngine via activate()."""
-        engine.activate(
-            kv_cache=self.kv_cache,
-            decoding=self.decoding,
-            quantize=self.quantize,
-            acceleration=self.acceleration,
-            kv_cache_tokens=self.kv_cache_tokens,
-            kv_bits=self.kv_bits,
-            mrl_keep_ratio=self.mrl_keep_ratio,
-            use_v0_warm=self.use_v0_warm,
-            use_progressive_kv=self.use_progressive_kv,
-            use_compile=self.use_compile,
-            use_triton_conv=self.use_triton_conv,
-            use_prefix_cache=self.use_prefix_cache,
-            use_spec_attn=self.use_spec_attn,
-            warmup=self.warmup,
-        )
+        # Serialise against in-flight generation: activate() swaps
+        # decoding/kv/quant strategies mid-request otherwise.
+        with engine._gen_lock:
+            engine.activate(
+                kv_cache=self.kv_cache,
+                decoding=self.decoding,
+                quantize=self.quantize,
+                acceleration=self.acceleration,
+                kv_cache_tokens=self.kv_cache_tokens,
+                kv_bits=self.kv_bits,
+                mrl_keep_ratio=self.mrl_keep_ratio,
+                use_v0_warm=self.use_v0_warm,
+                use_progressive_kv=self.use_progressive_kv,
+                use_compile=self.use_compile,
+                use_triton_conv=self.use_triton_conv,
+                use_prefix_cache=self.use_prefix_cache,
+                use_spec_attn=self.use_spec_attn,
+                warmup=self.warmup,
+            )
 
     def to_dict(self) -> dict:
         return {
@@ -679,11 +686,12 @@ class BatchQueue:
             seeds_list.append(eff_seed)
             stop_list.append(req.stop)
 
-        # FluxLM: BatchedDecoding assumes KV-cache forward semantics and
-        # would interleave unrelated prompts into one memory stream —
-        # route through the engine's flux stream-pool instead (shared
+        # Memory models (FluxLM): BatchedDecoding assumes KV-cache forward
+        # semantics and would interleave unrelated prompts into one memory
+        # stream — route through the engine's stream-pool instead (shared
         # read-only memory, per-sequence context, zero mutation).
-        if model.__class__.__name__ == "FluxLM":
+        from forge.engine.engine_common import _is_memory_model
+        if _is_memory_model(model):
             outs = engine.generate_batch(
                 [r.prompt for r in requests],
                 max_new_tokens=max(max_tokens_list),
@@ -714,7 +722,10 @@ class BatchQueue:
         # directly and would otherwise interleave with in-flight requests
         # on the shared conv/recurrent state.  Route through the engine's
         # OOM recovery so one OOM doesn't fail the whole batch.
-        decoder = BatchedDecoding(eos_token_id=tokenizer.eos_token_id or 7)
+        decoder = BatchedDecoding(
+            eos_token_id=tokenizer.eos_token_id or 7,
+            eos_token_ids=engine._eos_token_ids(),
+        )
 
         def _decode():
             with engine._gen_lock:
@@ -770,6 +781,7 @@ class BatchQueue:
             max_new_tokens=req.max_tokens,
             temperature=req.temperature,
             top_p=req.top_p,
+            stop=req.stop,
         ):
             accumulated += chunk
             if req.stream_queue is not None:

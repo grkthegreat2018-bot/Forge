@@ -253,8 +253,15 @@ def _iter_hf(args):
 
 def _learn_docs(model, tok, docs, tag, args, t_start, state):
     """Ingest (label, text) docs; soft_reset between them (independent
-    episodes); periodic snapshots for crash safety."""
-    for label, text in docs:
+    episodes); periodic snapshots for crash safety.  With --pack-docs,
+    consecutive short docs are joined into one chunk_chars blob before
+    ingest - amortizes the per-ingest block snapshot over thousands of
+    tiny records (QA/dictionary rows) instead of paying it per row."""
+    pack = getattr(args, "pack_docs", 0)
+    pending, last_label = "", ""
+
+    def emit(text, label):
+        """One episode: chunked ingest + soft_reset."""
         for i in range(0, len(text), args.chunk_chars):
             ids = tok.encode(text[i:i + args.chunk_chars],
                              add_special_tokens=False)
@@ -265,16 +272,33 @@ def _learn_docs(model, tok, docs, tag, args, t_start, state):
                 state["last_ckpt"] = state["tokens"]
                 print(f"    [ckpt] {state['tokens']:,} tok -> {args.out}")
         model.soft_reset()
-        state["docs"] += 1
         if state["docs"] % 500 == 0:
             el = time.perf_counter() - t_start
             print(f"    {state['docs']:,} docs | {state['tokens']:,} tok "
                   f"({state['tokens'] / max(el, 1e-9):,.0f} tok/s) "
                   f"last: {label[:60]}")
-        if args.max_tokens and state["tokens"] >= args.max_tokens:
+        return (args.max_tokens and state["tokens"] >= args.max_tokens) \
+            or (args.max_docs and state["docs"] >= args.max_docs)
+
+    for label, text in docs:
+        buffered = False
+        if pack and len(text) < args.chunk_chars:
+            pending += text + "\n\n"
+            last_label = label
+            buffered = True
+            if len(pending) < pack:
+                state["docs"] += 1
+                continue
+            text, pending = pending, ""
+            label = last_label
+        if emit(text, label):
             return True
+        if not buffered:
+            state["docs"] += 1
         if args.max_docs and state["docs"] >= args.max_docs:
             return True
+    if pending:
+        emit(pending, last_label)
     return False
 
 
@@ -307,6 +331,12 @@ def main() -> int:
     ap.add_argument("--graft-method", default="randproj",
                     choices=["pca", "randproj"])
     ap.add_argument("--chunk-chars", type=int, default=1 << 18)
+    ap.add_argument("--pack-docs", type=int, default=0, metavar="CHARS",
+                    help="pack consecutive short docs into CHARS-sized "
+                         "blobs before ingest (e.g. 262144) — amortizes "
+                         "per-ingest block overhead for corpora of tiny "
+                         "records; docs share stream context within a "
+                         "pack, soft_reset happens per pack")
     # streaming / corpus-scale options
     ap.add_argument("--hf", help="HF dataset, streamed "
                                "(e.g. wikimedia/wikipedia)")
@@ -324,19 +354,27 @@ def main() -> int:
     ap.add_argument("--max-docs", type=int, default=0)
     ap.add_argument("--ckpt-every", type=int, default=0,
                     help="snapshot every N tokens (crash-safe long runs)")
+    ap.add_argument("--gcell", action="store_true",
+                    help="enable the learned-key gcell channel (SimHash "
+                         "SDM, fuzzy read) — ignored when --resume "
+                         "(config comes from the snapshot)")
+    ap.add_argument("--gsyn", action="store_true",
+                    help="enable the dense delta-rule gsyn channel — "
+                         "ignored when --resume")
     args = ap.parse_args()
 
     if not args.corpus and not args.hf:
         ap.error("need corpus files or --hf")
 
     cfg = FluxConfig(vocab_size=args.vocab, device=args.device,
-                     cuda_primary=args.cuda_primary)
+                     cuda_primary=args.cuda_primary,
+                     gcell=args.gcell, gsyn=args.gsyn)
     model = (FluxLM.load(args.resume, device=args.device,
                          cuda_primary=args.cuda_primary or None)
              if args.resume else FluxLM(cfg))
     if args.graft:
         info = model.graft_teacher(args.graft, method=args.graft_method)
-        print(f"graft: {info['method']} {info['teacher_dim']}→"
+        print(f"graft: {info['method']} {info['teacher_dim']}->"
               f"{info['topic_dim']} from {info['src']}")
     tok = get_tokenizer(args.tokenizer
                         or _tokenizer_for_vocab(model.vocab_size))
@@ -371,9 +409,11 @@ def main() -> int:
 
     out = model.snapshot(args.out)
     rep = model.memory_report()
+    cells = rep.get("tables_cells", rep.get("gpu_rows_used", 0))
     print(f"saved {out}")
     print(f"memory: {rep['total_MB_est']:.0f} MB est | "
-          f"cells={rep['tables_cells']:,} | epi={rep['epi_positions']:,}")
+          f"cells={cells:,} | epi={rep['epi_positions']:,} | "
+          f"gcell={rep.get('gcell_cells', 0):,}")
     return 0
 
 

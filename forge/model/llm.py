@@ -392,6 +392,10 @@ class ConfigurableResearchLLM(nn.Module):
         cond: torch.Tensor | None = None,
         # SIGReg: return per-layer hidden states for spectral regularization.
         return_hidden_states: bool = False,
+        # Generation fast path: compute lm_head only on the last position.
+        # Prefill otherwise materializes [B, T, vocab] logits (~500MB /
+        # ~1.3 TFLOP at 4k tokens on V2) when callers only read [:, -1].
+        logits_last_only: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, list[KVCache | None]]:
         # Mark a new step for CUDAGraph tree manager. Conv layers clone state
         # buffers in forward (e.g. _conv_state = ...clone()), which triggers
@@ -409,12 +413,12 @@ class ConfigurableResearchLLM(nn.Module):
                     idx, targets, past_key_values, use_cache, return_hidden,
                     preallocated_cache, attention_mask, layer_indices,
                     noisy_embeds, modulation, cu_seqlens, cond,
-                    return_hidden_states)
+                    return_hidden_states, logits_last_only)
         return self._forward_impl(
             idx, targets, past_key_values, use_cache, return_hidden,
             preallocated_cache, attention_mask, layer_indices,
             noisy_embeds, modulation, cu_seqlens, cond,
-            return_hidden_states)
+            return_hidden_states, logits_last_only)
 
     def _forward_impl(
         self,
@@ -431,6 +435,7 @@ class ConfigurableResearchLLM(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
         cond: torch.Tensor | None = None,
         return_hidden_states: bool = False,
+        logits_last_only: bool = False,
     ):
         position_ids = None
         attention_bias = None  # additive mask for SDPA: (B, 1, T, total_len)
@@ -659,7 +664,9 @@ class ConfigurableResearchLLM(nn.Module):
             )
             logits = None
         else:
-            logits = self.head(hidden)
+            logits = self.head(
+                hidden[:, -1:] if logits_last_only and targets is None
+                else hidden)
             loss = None
             if targets is not None:
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))

@@ -117,7 +117,8 @@ class BatchedDecoding(DecodingStrategy):
 
         # Prefill
         with torch.inference_mode():
-            out = model(padded_ids, attention_mask=attn_mask, use_cache=True)
+            out = model(padded_ids, attention_mask=attn_mask, use_cache=True,
+                        logits_last_only=True)
             logits, past_kv = unpack_output_with_kv(out)
 
         # Decode-time mask: grows by one (all-ones) column per step so pad
@@ -150,17 +151,23 @@ class BatchedDecoding(DecodingStrategy):
             # Sample all B tokens at once from batched logits [B, 1, vocab]
             next_logits_all = logits[:, -1, :]  # [B, vocab]
 
+            # Repetition penalty BEFORE temperature (HF ordering; also
+            # applies to the all-greedy path). One index_copy per sequence
+            # instead of a kernel per unique generated token.
+            if any(rp != 1.0 for rp in repetition_penalty_list):
+                # raw logits may be an inference tensor — clone for in-place
+                next_logits_all = next_logits_all.clone()
+            for i in range(B):
+                if repetition_penalty_list[i] != 1.0 and active_cpu[i]:
+                    uniq = generated[i][0].unique()
+                    next_logits_all[i].index_copy_(
+                        0, uniq,
+                        next_logits_all[i].index_select(0, uniq)
+                        / repetition_penalty_list[i])
+
             # Temperature scaling [B, vocab]
             temp_t = torch.tensor(temps_cpu, device=device, dtype=next_logits_all.dtype)
             next_logits_all = next_logits_all / temp_t.unsqueeze(1)
-
-            # Repetition penalty (per-sequence)
-            for i in range(B):
-                if repetition_penalty_list[i] != 1.0 and active_cpu[i]:
-                    # Penalize tokens already in generated[i]
-                    gen_ids = generated[i][0]
-                    for tid in gen_ids.unique():
-                        next_logits_all[i, tid] /= repetition_penalty_list[i]
 
             # Top-k filtering (per-sequence)
             for i in range(B):

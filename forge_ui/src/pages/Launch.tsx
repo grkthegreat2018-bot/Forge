@@ -3,11 +3,11 @@
 // preset's arg_defaults as editable rows collected into `overrides`.
 
 import { ArrowRight, ChevronDown, ChevronRight, Play, Rocket } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../lib/api'
 import type { ProcessPreset } from '../lib/types'
-import { Btn, Card, EmptyState, Input, Spinner, Tag } from '../components/ui'
+import { Btn, Card, EmptyState, Input, SearchInput, Spinner, Tag } from '../components/ui'
 
 interface LaunchResult {
   ok: boolean
@@ -18,6 +18,7 @@ interface LaunchResult {
 
 export default function Launch() {
   const [presets, setPresets] = useState<ProcessPreset[]>([])
+  const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const navigate = useNavigate()
@@ -29,8 +30,30 @@ export default function Launch() {
       .finally(() => setLoading(false))
   }, [])
 
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    if (!q) return presets
+    return presets.filter((p) =>
+      p.name.toLowerCase().includes(q) ||
+      (p.description && p.description.toLowerCase().includes(q)) ||
+      p.script.toLowerCase().includes(q)
+    )
+  }, [presets, search])
+
   return (
     <div className="h-full overflow-y-auto p-5 space-y-4">
+      <div className="flex items-center justify-between gap-3">
+        <SearchInput
+          value={search}
+          onChange={setSearch}
+          placeholder="Filter process launch presets…"
+          className="w-full max-w-md"
+        />
+        <Btn variant="subtle" size="sm" onClick={() => navigate('/tasks')}>
+          Manage Running Tasks <ArrowRight size={12} />
+        </Btn>
+      </div>
+
       {loading && (
         <div className="flex items-center justify-center gap-2 py-10 text-[12.5px] text-text-dim">
           <Spinner /> loading presets…
@@ -41,14 +64,14 @@ export default function Launch() {
           {error}
         </div>
       )}
-      {!loading && !error && !presets.length && (
+      {!loading && !error && !filtered.length && (
         <EmptyState
           icon={<Rocket size={40} strokeWidth={1.2} />}
-          title="No launch presets"
-          desc="No launchable process presets are defined on the server." />
+          title={search ? 'No matching presets' : 'No launch presets'}
+          desc={search ? 'Try adjusting your search filter.' : 'No launchable process presets are defined on the server.'} />
       )}
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-        {presets.map((p) => (
+        {filtered.map((p) => (
           <PresetCard key={p.name} preset={p}
             onOpenTasks={() => navigate('/tasks')} />
         ))}

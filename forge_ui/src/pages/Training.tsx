@@ -2,14 +2,14 @@
 // Primary feed is the hub store (WS); a 3s REST poll is the fallback.
 
 import { clsx } from 'clsx'
-import { RefreshCw, Square, TrendingUp, X } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { Check as CheckIcon, Copy, RefreshCw, Square, TrendingUp, X } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../lib/api'
 import { useForge } from '../lib/store'
 import type { RunSnapshot } from '../lib/types'
 import { LineChart } from '../components/charts'
 import {
-  Btn, Card, EmptyState, IconBtn, KvRow, Progress, StatusDot, Tag,
+  Btn, Card, EmptyState, IconBtn, KvRow, Progress, SearchInput, StatusDot, Tag,
 } from '../components/ui'
 
 type TagKind = 'ok' | 'warn' | 'err' | 'idle' | 'accent' | 'think'
@@ -47,6 +47,8 @@ export default function Training() {
   const storeRuns = useForge((s) => s.runs)
   const refreshStatus = useForge((s) => s.refreshStatus)
   const [runs, setRuns] = useState<RunSnapshot[]>(storeRuns)
+  const [runSearch, setRunSearch] = useState('')
+  const [copiedLog, setCopiedLog] = useState(false)
   const [selected, setSelected] = useState<string | null>(null)
   const [logLines, setLogLines] = useState<string[]>([])
   const [logErr, setLogErr] = useState('')
@@ -128,6 +130,16 @@ export default function Training() {
     } catch (e) { setError(String(e)) }
   }
 
+  const filteredRuns = useMemo(() => {
+    const q = runSearch.trim().toLowerCase()
+    if (!q) return runs
+    return runs.filter((r) =>
+      r.name.toLowerCase().includes(q) ||
+      r.status.toLowerCase().includes(q) ||
+      (r.method && r.method.toLowerCase().includes(q))
+    )
+  }, [runs, runSearch])
+
   const sel = runs.find((r) => r.status_file === selected) ?? null
   const extras = sel
     ? Object.entries(sel.extra ?? {}).filter(([, v]) =>
@@ -137,14 +149,22 @@ export default function Training() {
 
   return (
     <div className="h-full overflow-y-auto p-4 space-y-4">
-      <Card title="Training runs" actions={
-        <IconBtn title="Refresh"
-          onClick={() => refreshStatus().catch(() => undefined)}>
-          <RefreshCw size={12} />
-        </IconBtn>
+      <Card title={`Training runs (${filteredRuns.length}${runs.length !== filteredRuns.length ? ` / ${runs.length}` : ''})`} actions={
+        <div className="flex items-center gap-2">
+          <SearchInput
+            value={runSearch}
+            onChange={setRunSearch}
+            placeholder="Filter runs…"
+            className="w-48 !text-[11.5px]"
+          />
+          <IconBtn title="Refresh"
+            onClick={() => refreshStatus().catch(() => undefined)}>
+            <RefreshCw size={12} />
+          </IconBtn>
+        </div>
       }>
         {error && <div className="text-[11.5px] text-err mb-1">{error}</div>}
-        {runs.length ? (
+        {filteredRuns.length ? (
           <div>
             <div className={clsx(GRID,
               'px-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-text-faint')}>
@@ -156,7 +176,7 @@ export default function Training() {
               <span className="text-right">hb</span>
               <span />
             </div>
-            {runs.map((r) => (
+            {filteredRuns.map((r) => (
               <div
                 key={r.status_file}
                 onClick={() => setSelected(
@@ -263,14 +283,30 @@ export default function Training() {
             </div>
           </div>
           <div className="mt-3">
-            <div className="flex items-center justify-between mb-1">
+            <div className="flex items-center justify-between mb-1.5">
               <span className="text-[10.5px] font-semibold uppercase tracking-wider text-text-faint">
-                log tail
+                Run Log Tail
               </span>
-              <IconBtn title="Refresh log"
-                onClick={() => fetchLog(sel.status_file)}>
-                <RefreshCw size={12} />
-              </IconBtn>
+              <div className="flex items-center gap-1">
+                {logLines.length > 0 && (
+                  <button
+                    onClick={() => {
+                      void navigator.clipboard.writeText(logLines.join('\n')).then(() => {
+                        setCopiedLog(true)
+                        setTimeout(() => setCopiedLog(false), 1200)
+                      })
+                    }}
+                    title="Copy log lines"
+                    className="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] bg-panel-alt hover:bg-panel-hover border border-border text-text-dim hover:text-text cursor-pointer transition-colors">
+                    {copiedLog ? <CheckIcon size={11} className="text-ok" /> : <Copy size={11} />}
+                    {copiedLog ? 'Copied' : 'Copy'}
+                  </button>
+                )}
+                <IconBtn title="Refresh log"
+                  onClick={() => fetchLog(sel.status_file)}>
+                  <RefreshCw size={12} />
+                </IconBtn>
+              </div>
             </div>
             <div ref={logRef}
               className="h-52 overflow-y-auto bg-deep border border-border rounded-lg p-3">

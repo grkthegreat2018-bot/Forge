@@ -6,8 +6,8 @@
 
 import { clsx } from 'clsx'
 import {
-  Bot, Check, ChevronDown, ChevronRight, FolderOpen,
-  Search, Square, Trash2, Wrench, X,
+  Bot, Check, FolderOpen,
+  Square, Trash2, Wrench, X,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import {
@@ -18,7 +18,7 @@ import { Markdown } from '../components/chat/Markdown'
 import { ScrollFeed } from '../components/chat/ScrollFeed'
 import {
   Btn, Card, Check as CheckBox, Chip, EmptyState, Field, IconBtn,
-  Input, Select, Spinner, Tag,
+  Input, Modal, SearchInput, Select, Spinner, Tag,
 } from '../components/ui'
 import { api } from '../lib/api'
 import { groupTools, type ToolDef } from '../lib/agentTools'
@@ -68,9 +68,10 @@ function loadCfg(): AgentCfg {
 }
 
 const STARTERS = [
-  'Research the Mamba-3 architecture and write a summary.md',
-  'Create a Python script that benchmarks JSON vs CSV parsing',
-  'Explore this workspace and explain its structure',
+  { title: 'Mamba-3 Research', desc: 'Web search & document generation', task: 'Research the Mamba-3 architecture and write a summary.md in the workspace.' },
+  { title: 'Benchmark Script', desc: 'Python performance tests with output', task: 'Create a Python script that benchmarks JSON vs CSV parsing performance with charts.' },
+  { title: 'Codebase Tour', desc: 'Scan workspace & summarize layout', task: 'Explore this workspace and explain its architecture and key modules.' },
+  { title: 'Refactoring Audit', desc: 'Find dead code or missing types', task: 'Scan the codebase for unused imports or duplicate helper functions and propose a cleanup plan.' },
 ]
 
 export default function Agent() {
@@ -221,56 +222,19 @@ export default function Agent() {
               </Field>
             </div>
 
-            {/* tool picker */}
-            <div className="border border-border rounded-lg overflow-hidden">
-              <button
-                onClick={() => setToolsOpen(!toolsOpen)}
-                className="w-full flex items-center justify-between px-2.5 py-2 text-[12px] text-text-dim hover:text-text cursor-pointer transition-colors">
-                <span className="flex items-center gap-1.5">
-                  <Wrench size={12} />
-                  {tools.size ? `${tools.size} tools enabled` : `all ${toolDefs.length} tools`}
-                </span>
-                {toolsOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-              </button>
-              {toolsOpen && (
-                <div className="border-t border-border p-2">
-                  <div className="relative mb-1.5">
-                    <Search size={11}
-                      className="absolute left-2 top-1/2 -translate-y-1/2 text-text-faint" />
-                    <input
-                      value={toolQuery}
-                      onChange={(e) => setToolQuery(e.target.value)}
-                      placeholder="Filter tools…"
-                      className="w-full bg-input border border-border rounded-md pl-6 pr-2 py-1 text-[11.5px] text-text placeholder:text-text-faint focus:outline-none focus:border-accent/60" />
-                  </div>
-                  <div className="flex gap-2 mb-1.5">
-                    <button onClick={() => setTools(new Set(toolDefs.map((t) => t.name)))}
-                      className="text-[10.5px] text-accent-hi hover:underline cursor-pointer">all</button>
-                    <button onClick={() => setTools(new Set())}
-                      className="text-[10.5px] text-text-faint hover:underline cursor-pointer">reset</button>
-                    <span className="text-[10.5px] text-text-faint ml-auto">
-                      empty = all enabled
-                    </span>
-                  </div>
-                  <div className="space-y-1.5 max-h-64 overflow-y-auto">
-                    {toolGroups.map((g) => (
-                      <div key={g.label}>
-                        <div className="text-[9.5px] font-semibold uppercase tracking-[0.14em] text-text-faint pt-1">
-                          {g.label}
-                        </div>
-                        {g.tools.map((t) => (
-                          <CheckBox key={t.name}
-                            label={<span className="font-mono text-[11px]">{t.name}</span>}
-                            checked={tools.size === 0 || tools.has(t.name)}
-                            onChange={() => toggleTool(t.name)}
-                            className="py-0.5"
-                            title={t.description} />
-                        ))}
-                      </div>
-                    ))}
-                  </div>
+            {/* tool harness trigger */}
+            <div className="flex items-center justify-between p-2.5 rounded-xl border border-border bg-panel-alt/50">
+              <div className="min-w-0">
+                <div className="text-[12px] font-semibold text-text flex items-center gap-1.5">
+                  <Wrench size={13} className="text-accent" /> Tool Harness
                 </div>
-              )}
+                <div className="text-[11px] text-text-faint mt-0.5">
+                  {tools.size ? `${tools.size} of ${toolDefs.length} enabled` : `all ${toolDefs.length} enabled`}
+                </div>
+              </div>
+              <Btn variant="outline" size="xs" onClick={() => setToolsOpen(true)}>
+                Configure
+              </Btn>
             </div>
           </div>
         </Card>
@@ -350,17 +314,25 @@ export default function Agent() {
           <div className="max-w-[820px] mx-auto space-y-3">
             {!run && (
               <EmptyState
-                icon={<Bot size={44} strokeWidth={1.2} />}
-                title={ready ? 'Agent idle' : 'Engine not loaded'}
+                icon={<Bot size={38} strokeWidth={1.5} />}
+                title={ready ? 'Agent Workspace Idle' : 'Engine not loaded'}
                 desc={ready
-                  ? 'Send a task below. The agent plans, calls tools (files, shell, web, tests) and reports back — the whole thread streams here live. Projects land in ForgeAI_Projects/<name>.'
-                  : 'Load a checkpoint on the Models page to run the agent.'}
+                  ? 'Describe an objective below. The agent decomposes goals, invokes file/shell/web tools, and streams every step live.'
+                  : 'Load a checkpoint on the Models page to initialize the agent harness.'}
                 action={ready ? (
-                  <div className="flex flex-wrap justify-center gap-2 max-w-lg">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 max-w-xl text-left mt-3">
                     {STARTERS.map((s) => (
-                      <button key={s} onClick={() => setInput(s)}
-                        className="px-3 py-1.5 rounded-full border border-border text-[12px] text-text-dim hover:text-text hover:border-accent/50 hover:bg-panel-alt transition-colors cursor-pointer">
-                        {s}
+                      <button
+                        key={s.title}
+                        onClick={() => setInput(s.task)}
+                        className="p-3 rounded-xl border border-border/80 bg-panel/60 hover:bg-panel-alt hover:border-accent/50 transition-all text-left group cursor-pointer shadow-sm">
+                        <div className="text-[12.5px] font-semibold text-text group-hover:text-accent-hi transition-colors flex items-center justify-between">
+                          {s.title}
+                          <Bot size={12} className="text-text-faint group-hover:text-accent transition-colors" />
+                        </div>
+                        <div className="text-[11px] text-text-dim mt-0.5 leading-snug">
+                          {s.desc}
+                        </div>
                       </button>
                     ))}
                   </div>
@@ -410,6 +382,79 @@ export default function Agent() {
           </div>
         </div>
       </div>
+
+      {/* ---- Tool Harness Configuration Modal ---- */}
+      <Modal
+        open={toolsOpen}
+        onClose={() => setToolsOpen(false)}
+        title="Agent Tool Harness Catalog"
+        maxWidth="max-w-2xl">
+        <div className="space-y-3.5">
+          <div className="flex items-center gap-3">
+            <SearchInput
+              value={toolQuery}
+              onChange={setToolQuery}
+              placeholder="Search available tools…"
+              className="flex-1"
+            />
+            <div className="flex items-center gap-2">
+              <Btn variant="subtle" size="xs" onClick={() => setTools(new Set(toolDefs.map((t) => t.name)))}>
+                Enable all ({toolDefs.length})
+              </Btn>
+              <Btn variant="ghost" size="xs" onClick={() => setTools(new Set())}>
+                Reset to default
+              </Btn>
+            </div>
+          </div>
+
+          <div className="space-y-3 max-h-[55vh] overflow-y-auto pr-1">
+            {toolGroups.map((g) => (
+              <div key={g.label} className="p-3 rounded-xl border border-border/80 bg-panel/40">
+                <div className="flex items-center justify-between pb-2 border-b border-border/40 mb-2">
+                  <div className="text-[11px] font-bold uppercase tracking-wider text-text-faint">
+                    {g.label}
+                  </div>
+                  <span className="text-[10px] text-text-faint font-mono">
+                    {g.tools.length} tools
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {g.tools.map((t) => (
+                    <CheckBox
+                      key={t.name}
+                      label={
+                        <div className="min-w-0">
+                          <span className="font-mono text-[11.5px] font-medium text-text block truncate">
+                            {t.name}
+                          </span>
+                          {t.description && (
+                            <span className="text-[10.5px] text-text-faint block truncate">
+                              {t.description}
+                            </span>
+                          )}
+                        </div>
+                      }
+                      checked={tools.size === 0 || tools.has(t.name)}
+                      onChange={() => toggleTool(t.name)}
+                      className="p-1 rounded-lg hover:bg-panel-alt/60 transition-colors"
+                      title={t.description}
+                    />
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="flex items-center justify-between pt-2 border-t border-border/50">
+            <span className="text-[11.5px] text-text-faint">
+              {tools.size ? `${tools.size} custom tools enabled` : 'All tools available to the model'}
+            </span>
+            <Btn variant="primary" size="sm" onClick={() => setToolsOpen(false)}>
+              Apply Tools
+            </Btn>
+          </div>
+        </div>
+      </Modal>
     </div>
   )
 }

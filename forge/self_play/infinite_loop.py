@@ -43,6 +43,8 @@ from forge.training.training_utils import oom_guard
 logger = logging.getLogger(__name__)
 
 from forge.self_play.infinite_curriculum import GenTracer, InfiniteCurriculum
+from forge.self_play.flux_goals import TOOL_HEADER as _FLUX_TOOL_HEADER
+from forge.self_play.flux_goals import parse_tool_call as _parse_tool_call
 
 
 @dataclass
@@ -181,6 +183,50 @@ class LoopConfig:
     flux_temp: float = 0.3         # attempt temperature center
     flux_temp_spread: float = 0.5  # ± uniform range, clipped to [0, 1]
     flux_unique: bool = True       # cross-epoch prompt dedup (no repeats)
+    # pluggable reward: callable(response:str, pair:dict) -> float in
+    # [0,1].  None = binary _flux_check_any (1.0/0.0).  The reward
+    # scales reinforce() gain per attempt — graded/partial credit.
+    flux_verifier: object = None
+    flux_ok_threshold: float = 0.5  # reward >= this counts as success
+    flux_partial_gain: float = 0.5  # reward scale for tool-call-only
+                                    # success (parsed call, wrong answer)
+    # exploration: eps fraction of samples decode at explore temp
+    # instead of the exploit center — widens discovered trajectories
+    flux_explore_eps: float = 0.0
+    flux_explore_temp: float = 1.3
+    # counterfactual credit (R59): log each generated token's top-k
+    # alternative propensities in FluxPacket.alts; reinforce_alts then
+    # writes propensity-weighted credit to the untried tokens.  On
+    # failure (flux_cf_fail) the sampled trajectory is applied, the
+    # alternatives boosted, then the sampled writes reverted — "the
+    # untried action keeps credit for what the tried one lost".
+    flux_cf_topk: int = 8        # 0 disables propensity logging
+    flux_cf_scale: float = 0.5   # alt-credit weight vs sampled credit
+    flux_cf_fail: bool = True    # counterfactual learning on failures
+
+    # ── R53: source-grounded goals + tool use ──
+    # Goals are drawn from Wikipedia summaries, dictionary entries and
+    # arXiv papers (verified extractive answers), mixed with the
+    # procedural stream.  Web goals run in three modes: "qa" (bare
+    # recall), "rag" (source snippet in-prompt — teaches extraction),
+    # and "tool" (model emits `T: <tool> <query>`, loop injects `O:`,
+    # model answers) — FLUX learns the tool-call pattern via teach-on-
+    # fail demonstrations of the full trajectory.
+    flux_web: bool = True          # web-sourced goals (offline -> procedural)
+    flux_goal_sources: str = "wiki,dict,arxiv"  # enabled web sources
+    flux_web_frac: float = 0.5     # fraction of epoch goals from sources
+    flux_tool_frac: float = 0.35   # of web goals: two-phase tool tasks
+    flux_rag_frac: float = 0.35    # of remaining web goals: inline context
+    flux_web_fetch_budget: int = 8 # new source fetches per epoch
+    flux_eval_web_n: int = 16      # frozen web eval size (0 disables)
+    flux_dict_file: str = ""       # optional kaikki.org wiktionary jsonl
+    flux_obs_chars: int = 240      # tool observation truncation
+    flux_context_chars: int = 700  # source text ingested on teach-fail
+    # teacher-embedding graft for a FRESH flux model (snapshots restore
+    # their own _R).  "auto" = ForgeLM V2 checkpoint if present — the
+    # single biggest lever toward V2-quality recall (semantic features
+    # feed topic/csem/knn channels). "" disables.
+    flux_teacher_embed: str = "auto"
 
     # ── GRPO config (only used when training_mode="grpo") ──
     grpo_max_steps: int = 50         # GRPO steps per epoch
@@ -365,8 +411,57 @@ def _concise_qa_pairs(n: int, epoch: int) -> list[dict]:
         q_fmt = rng.choice((f"What is {q}?", f"Name {q}.", f"{q.capitalize()} — what is it?"))
         return _hinted(q_fmt), a
 
+    # ── R53 additions: wider procedural coverage (all computed — every
+    # answer is derived, never authored) ──
+    def gcd():
+        import math
+        a, b = rng.randint(6, 240), rng.randint(6, 240)
+        return _hinted(
+            f"What is the greatest common divisor of {a} and {b}?"), \
+            str(math.gcd(a, b))
+
+    def mean():
+        k = rng.randint(3, 5)
+        base = rng.randint(2, 40)
+        xs = [base + rng.randint(0, 8) * k for _ in range(k)]
+        xs = [x - (sum(xs) % k) if i == 0 else x
+              for i, x in enumerate(xs)]     # force integer mean
+        return _hinted(f"What is the mean of {xs}?"), str(sum(xs) // k)
+
+    def median():
+        xs = sorted(rng.sample(range(1, 99), rng.choice((3, 5))))
+        return _hinted(f"What is the median of {xs}?"), str(xs[len(xs) // 2])
+
+    def modulo():
+        a, b = rng.randint(10, 500), rng.randint(3, 12)
+        return _hinted(f"What is {a} mod {b}?"), str(a % b)
+
+    def letter_idx():
+        w = rng.choice(("python", "curriculum", "tensor", "jamba",
+                        "kernel", "gradient", "memory", "neuron"))
+        i = rng.randint(1, len(w))
+        suf = {1: "st", 2: "nd", 3: "rd"}.get(i, "th")
+        return _hinted(f"What is the {i}{suf} letter of '{w}'?"), w[i - 1]
+
+    def sort_rank():
+        xs = rng.sample(range(10, 99), 4)
+        kind = rng.choice(("smallest", "largest"))
+        ans = min(xs) if kind == "smallest" else max(xs)
+        return _hinted(
+            f"Sort {xs} and give the {kind} value."), str(ans)
+
+    def word_count():
+        ws = rng.choice(
+            ("the quick brown fox jumps", "a neural network learns",
+             "self play improves models", "memory cells store facts",
+             "the model reads context")).split()
+        return _hinted(
+            f"How many words are in '{' '.join(ws)}'?"), str(len(ws))
+
     builders = (arith, compound, percent, square, string_op, list_op, parity,
-                prime, base_conv, compare, unit_conv, seq_next, digit_op, fact)
+                prime, base_conv, compare, unit_conv, seq_next, digit_op,
+                fact, gcd, mean, median, modulo, letter_idx, sort_rank,
+                word_count)
 
     pairs: list[dict] = []
     seen: set[str] = set()
@@ -583,61 +678,216 @@ class InfiniteSelfPlayLoop:
         cfg = self.config
         fc = FluxConfig(vocab_size=65536, device=cfg.device,
                         cuda_primary=cfg.device == "cuda")
+        # R53: teacher-embedding graft — "auto" grafts the V2 embed
+        # table when it exists (semantic _R feeds every channel); a
+        # resumed .flux snapshot restores its own _R and ignores this.
+        te = cfg.flux_teacher_embed
+        if te == "auto":
+            cand = os.path.join(cfg.checkpoint_dir,
+                                "ForgeLM_V2.safetensors")
+            te = cand if os.path.exists(cand) else ""
+        if te and not str(self.best_checkpoint).endswith(".flux"):
+            fc.teacher_embed = te
         ckpt = (self.best_checkpoint
                 if str(self.best_checkpoint).endswith(".flux") else None)
         self._engine = ForgeEngine.from_flux(fc, checkpoint=ckpt,
                                              device=cfg.device)
         return self._engine
 
-    def _flux_eval_acc(self) -> float:
-        """Held-out accuracy on the FIXED eval set (same questions every
-        epoch via flux_eval_seed).  Predict-only batched streams —
-        measurement never teaches, so no learn+revert cycle is needed."""
+    # ── R53: source-grounded goals + tools ──
+
+    def _flux_tools(self):
+        """Shared web-tools executor (cached, budgeted, offline-safe)."""
+        t = getattr(self, "_flux_tools_obj", None)
+        if t is None:
+            from forge.self_play.flux_goals import FluxTools
+            cfg = self.config
+            t = FluxTools(dict_file=cfg.flux_dict_file,
+                          obs_chars=cfg.flux_obs_chars,
+                          fetch_budget=cfg.flux_web_fetch_budget)
+            self._flux_tools_obj = t
+        return t
+
+    def _flux_sampler(self):
+        """Lazy goal sampler over the shared tools + persistent KB."""
+        s = getattr(self, "_flux_sampler_obj", None)
+        if s is None:
+            from forge.self_play.flux_goals import FluxGoalSampler, FluxKB
+            cfg = self.config
+            kb = FluxKB(os.path.join(cfg.status_dir, "flux_kb.jsonl"))
+            srcs = tuple(s.strip() for s in
+                         cfg.flux_goal_sources.split(",") if s.strip())
+            s = FluxGoalSampler(self._flux_tools(), kb=kb,
+                                sources=srcs, seed=cfg.flux_eval_seed)
+            self._flux_sampler_obj = s
+        return s
+
+    def _flux_eval_pairs(self) -> list[dict]:
+        """Combined held-out eval: fixed procedural set + frozen web set.
+
+        The procedural half is deterministic across runs (flux_eval_seed).
+        The web half is built once at first use and persisted to
+        ``status_dir/flux_eval_web.json`` — restarts re-score the SAME
+        questions, so the accuracy trend stays meaningful.
+        """
         cfg = self.config
-        pairs = _concise_qa_pairs(cfg.flux_eval_n, cfg.flux_eval_seed)
+        pairs = [dict(p, kind="qa", source="procedural") for p in
+                 _concise_qa_pairs(cfg.flux_eval_n, cfg.flux_eval_seed)]
+        if cfg.flux_web and cfg.flux_eval_web_n > 0:
+            try:
+                web = self._flux_sampler().build_eval(
+                    cfg.flux_eval_web_n,
+                    os.path.join(cfg.status_dir, "flux_eval_web.json"),
+                    {p["prompt"] for p in pairs})
+                pairs += [dict(r, kind="qa") for r in web]
+            except Exception:
+                pass                    # offline/broken -> procedural only
+        return pairs
+
+    def _flux_eval_acc(self) -> float:
+        """Held-out accuracy on the FIXED eval sets (procedural + frozen
+        web).  Predict-only batched streams — measurement never teaches,
+        so no learn+revert cycle is needed.  Breakdown is stashed in
+        ``_flux_eval_detail`` for telemetry."""
+        cfg = self.config
+        pairs = self._flux_eval_pairs()
         outs = self._engine.generate_batch(
             [f"Q: {p['prompt']}\nA:" for p in pairs],
             max_new_tokens=cfg.flux_gen_tokens,
             temperatures=[0.0] * len(pairs))
-        hit = sum(self._flux_check(o, p["response"])
-                  for o, p in zip(outs, pairs))
-        return hit / max(len(pairs), 1)
+        hit = hit_w = n_w = 0
+        for o, p in zip(outs, pairs):
+            ok = self._flux_check_any(o, p)
+            hit += ok
+            if p.get("source") and p["source"] != "procedural":
+                n_w += 1
+                hit_w += ok
+        n_p = len(pairs) - n_w
+        self._flux_eval_detail = {
+            "acc": hit / max(len(pairs), 1),
+            "proc": (hit - hit_w) / max(n_p, 1),
+            "web": hit_w / max(n_w, 1) if n_w else None,
+            "n_web": n_w}
+        return self._flux_eval_detail["acc"]
+
+    @classmethod
+    def _flux_check_any(cls, output: str, pair: dict) -> bool:
+        """Grade against the canonical answer plus any accepted
+        alternates (synonym/antonym sets, co-author names)."""
+        if cls._flux_check(output, pair.get("response", "")):
+            return True
+        return any(cls._flux_check(output, a)
+                   for a in pair.get("accepts") or [])
+
+    def _flux_score(self, output: str, pair: dict) -> float:
+        """Reward in [0,1] for a sample — pluggable verifier
+        (``flux_verifier`` callable) or the binary grader."""
+        v = self.config.flux_verifier
+        if v is not None:
+            try:
+                return min(1.0, max(0.0, float(v(output, pair))))
+            except Exception:
+                return 0.0
+        return 1.0 if self._flux_check_any(output, pair) else 0.0
 
     def _flux_fresh_pairs(self, n: int) -> list[dict]:
         """Draw n verified task pairs, deduped against every prompt this
-        run has already attempted (and against the fixed eval set).
-        Overfitting guard: goals stay novel across epochs — the model
-        can't plateau by re-reciting one static set."""
+        run has already attempted (and against the fixed eval sets).
+
+        R53: ``flux_web_frac`` of the batch comes from the source
+        sampler (Wikipedia/dictionary/arXiv — extractive verified
+        answers); the rest is the procedural stream.  Each web goal is
+        assigned a mode — "qa" (bare recall), "rag" (source snippet
+        inline) or "tool" (two-phase tool call) — by flux_tool_frac /
+        flux_rag_frac.  Offline or exhausted sources fall back to
+        procedural fill so the batch size is always met."""
         cfg = self.config
         if not hasattr(self, "_flux_eval_prompts"):
             self._flux_eval_prompts = {
-                p["prompt"] for p in
-                _concise_qa_pairs(cfg.flux_eval_n, cfg.flux_eval_seed)}
+                p["prompt"] for p in self._flux_eval_pairs()}
+        seen, eval_prompts = self._flux_seen, self._flux_eval_prompts
+
+        web: list[dict] = []
+        if cfg.flux_web and cfg.flux_web_frac > 0:
+            n_web = int(round(n * cfg.flux_web_frac))
+            try:
+                self._flux_tools().begin_epoch(cfg.flux_web_fetch_budget)
+                web = self._flux_sampler().sample_web(
+                    n_web, seen, eval_prompts, epoch=self.epoch)
+            except Exception:
+                web = []
+        web_pairs: list[dict] = []
+        for g in web:
+            if g["prompt"] in seen:        # within-batch dedupe
+                continue
+            seen.add(g["prompt"])
+            # assign the attempt mode — tool needs a canonical tool+query,
+            # rag needs a source context; the rest recall directly
+            r = self._flux_rng.random()
+            if g.get("tool") and r < cfg.flux_tool_frac:
+                g["kind"] = "tool"
+            elif g.get("context") and \
+                    r < cfg.flux_tool_frac + cfg.flux_rag_frac:
+                g["kind"] = "rag"
+            else:
+                g["kind"] = "qa"
+            web_pairs.append(g)
+
+        need = n - len(web_pairs)
         if not cfg.flux_unique:
-            return _concise_qa_pairs(n, self.epoch)
-        pairs: list[dict] = []
+            proc = [dict(p, kind="qa", source="procedural") for p in
+                    _concise_qa_pairs(need, self.epoch)]
+            return web_pairs + proc
+        pairs = list(web_pairs)
         j = 0
         while len(pairs) < n and j < 12:
-            for p in _concise_qa_pairs(n * 2, self.epoch * 977 + j):
+            for p in _concise_qa_pairs(need * 2 + 8,
+                                       self.epoch * 977 + j):
                 q = p["prompt"]
-                if q in self._flux_seen or q in self._flux_eval_prompts:
+                if q in seen or q in eval_prompts:
                     continue
-                self._flux_seen.add(q)
-                pairs.append(p)
+                seen.add(q)
+                pairs.append(dict(p, kind="qa", source="procedural"))
                 if len(pairs) >= n:
                     break
             j += 1
         return pairs
 
+    @staticmethod
+    def _flux_prompt(p: dict) -> str:
+        """Canonical attempt prompt for a goal's assigned mode."""
+        kind = p.get("kind", "qa")
+        if kind == "rag" and p.get("context"):
+            ctx = " ".join(str(p["context"]).split())[:400]
+            return f"C: {ctx}\nQ: {p['prompt']}\nA:"
+        if kind == "tool":
+            return f"{_FLUX_TOOL_HEADER}\nQ: {p['prompt']}\nT:"
+        return f"Q: {p['prompt']}\nA:"
+
+    def _flux_tool_turn(self, engine, prompts_t: list[str],
+                        seeds: list[int], temps: list[float],
+                        ) -> tuple[list[str], list]:
+        """Phase A of a tool task: emit the `T:` line (one tool call)."""
+        outs = engine.generate_batch(
+            prompts_t, max_new_tokens=14,
+            temperatures=temps, seeds=seeds,
+            stops=[["\n"]] * len(prompts_t),
+            cf_topk=self.config.flux_cf_topk)
+        return outs, getattr(engine, "last_flux_packets", None) or []
+
     def _flux_self_play(self) -> dict:
         """Phase 1 (flux): eval-pre → grouped concurrent attempts.
 
-        Each task gets ``flux_group_size`` samples with per-gen
-        seed/temperature via ``engine.generate_batch`` — for FluxLM that
-        runs predict-only streams over shared memory, so exploration
-        never touches the canonical model; each stream emits an update
-        packet.  Outcomes (packet apply+reinforce / teach) are applied
-        in Phase 2 (_flux_finish) against verified answers.
+        Three batched passes so modes stay cheap:
+          1. qa + rag tasks — one ``generate_batch`` (G samples each);
+             rag prompts carry the source context inline.
+          2. tool tasks phase A — model emits ``T: <tool> <query>``,
+             loop executes it through FluxTools (cached per epoch).
+          3. tool tasks phase B — ``Q:.. T:<call> O:<obs> A:`` answer.
+
+        Streams are predict-only: the canonical model is never mutated;
+        each stream emits an update packet applied in ``_flux_finish``
+        against verified answers.
         """
         engine = self._flux_engine()
         model = engine.model
@@ -652,52 +902,232 @@ class InfiniteSelfPlayLoop:
 
         pairs = self._flux_fresh_pairs(cfg.tasks_per_epoch)
         G = max(1, cfg.flux_group_size)
-        prompts = [f"Q: {p['prompt']}\nA:" for p in pairs for _ in range(G)]
-        temps = [min(1.0, max(0.0, cfg.flux_temp +
-                 self._flux_rng.uniform(-cfg.flux_temp_spread,
-                                        cfg.flux_temp_spread)))
-                 for _ in prompts]
-        seeds = [self._flux_rng.randrange(1 << 31) for _ in prompts]
         engine.flux_batch_workers = cfg.flux_workers
         engine.flux_workers_device = cfg.flux_workers_device
+
+        def _temps(k):
+            # epsilon-exploration: a fraction of samples decodes at the
+            # explore temp instead of the exploit center — widens the
+            # trajectory distribution beyond what near-greedy reaches
+            return [min(1.5, max(0.0,
+                    (cfg.flux_explore_temp
+                     if self._flux_rng.random() < cfg.flux_explore_eps
+                     else cfg.flux_temp)
+                    + self._flux_rng.uniform(-cfg.flux_temp_spread,
+                                             cfg.flux_temp_spread)))
+                    for _ in range(k)]
+
+        def _seeds(k):
+            return [self._flux_rng.randrange(1 << 31)
+                    for _ in range(k)]
+
+        # split: tool tasks get the two-phase path, qa/rag one pass
+        tool_idx = [i for i, p in enumerate(pairs)
+                    if p.get("kind") == "tool"]
+        plain_idx = [i for i in range(len(pairs))
+                     if i not in set(tool_idx)]
 
         if sw:
             sw.set_phase(
                 "flux_attempts",
                 detail=f"{len(pairs)} tasks x{G} samples "
-                       f"({cfg.flux_workers} workers)")
+                       f"({len(tool_idx)} tool, {cfg.flux_workers} wk)")
             for i, p in enumerate(pairs):
-                sw.task_started(p["prompt"], i, len(pairs))
-        outs = engine.generate_batch(
-            prompts, max_new_tokens=cfg.flux_gen_tokens,
-            temperatures=temps, seeds=seeds)
-        attempts: list[dict] = []
-        for i, p in enumerate(pairs):
-            group = outs[i * G:(i + 1) * G]
-            good = [(j, o) for j, o in enumerate(group)
-                    if self._flux_check(o, p["response"])]
-            attempts.append({"prompt": p["prompt"],
-                             "response": p["response"],
-                             "ok": bool(good),
-                             "best": good[0][1] if good else None,
-                             # packet index of the first verified attempt —
-                             # its learned update is applied in _flux_finish
-                             "pkt": (i * G + good[0][0])
-                             if good else None})
-            if sw:
-                sw.task_done(i, p["prompt"], success=bool(good),
-                             rounds_used=G)
+                sw.task_started(p["prompt"], i, len(pairs),
+                                kind=p.get("kind", "qa"),
+                                source=p.get("source", ""))
+
+        attempts: list[dict] = [{
+            "prompt": p["prompt"], "response": p["response"],
+            "accepts": p.get("accepts"), "kind": p.get("kind", "qa"),
+            "source": p.get("source", "procedural"),
+            "context": p.get("context", ""),
+            "tool": p.get("tool"), "query": p.get("query"),
+            "ok": False, "best": None, "pkt": None, "pkt_extra": [],
+            "tool_ok": False} for p in pairs]
+
+        # ── pass 1: qa + rag (single batch) ──
+        if plain_idx:
+            prompts = [self._flux_prompt(pairs[i])
+                       for i in plain_idx for _ in range(G)]
+            outs = engine.generate_batch(
+                prompts, max_new_tokens=cfg.flux_gen_tokens,
+                temperatures=_temps(len(prompts)),
+                seeds=_seeds(len(prompts)),
+                cf_topk=cfg.flux_cf_topk)
+            packets = getattr(engine, "last_flux_packets", None) or []
+            for row, i in enumerate(plain_idx):
+                group = outs[row * G:(row + 1) * G]
+                good = [(j, o, self._flux_score(o, pairs[i]))
+                        for j, o in enumerate(group)]
+                good = [g for g in good if g[2] > 0]
+                good.sort(key=lambda g: -g[2])
+                a = attempts[i]
+                a["reward"] = good[0][2] if good else 0.0
+                a["ok"] = a["reward"] >= cfg.flux_ok_threshold
+                if good:
+                    a["best"] = good[0][1]
+                    a["pkt"] = row * G + good[0][0]
+                    a["pkt_extra"] = [row * G + j for j, _, _ in good[1:]]
+                a["_pkts"] = packets
+                if sw:
+                    sw.task_done(i, pairs[i]["prompt"],
+                                 success=a["ok"], rounds_used=G,
+                                 preview=(a["best"] or
+                                          (group[0] if group else "")),
+                                 expected=pairs[i]["response"])
+
+        # ── passes 2+3: tool tasks (call → observe → answer) ──
+        if tool_idx:
+            tools = self._flux_tools()
+            pa_prompts = [self._flux_prompt(pairs[i])
+                          for i in tool_idx for _ in range(G)]
+            outs_a, pkts_a = self._flux_tool_turn(
+                engine, pa_prompts, _seeds(len(pa_prompts)),
+                _temps(len(pa_prompts)))
+            calls = [_parse_tool_call(o) for o in outs_a]
+            # resolve observations — canonical query substituted when the
+            # model's call didn't parse (task stays solvable; the demo
+            # teach on failure corrects the tool-call step itself)
+            obs: list[str] = []
+            pb_prompts: list[str] = []
+            for row, i in enumerate(tool_idx):
+                for j in range(G):
+                    k = row * G + j
+                    call = calls[k]
+                    if call is None:
+                        call = (pairs[i].get("tool") or "wiki",
+                                pairs[i].get("query")
+                                or pairs[i]["prompt"])
+                        obs_ok = False
+                    else:
+                        obs_ok = True
+                    o = tools.call(call[0], call[1])
+                    obs.append(o)
+                    pb_prompts.append(
+                        f"{_FLUX_TOOL_HEADER}\nQ: {pairs[i]['prompt']}\n"
+                        f"T: {call[0]} {call[1]}\nO: {o}\nA:")
+            outs_b = engine.generate_batch(
+                pb_prompts, max_new_tokens=cfg.flux_gen_tokens,
+                temperatures=_temps(len(pb_prompts)),
+                seeds=_seeds(len(pb_prompts)),
+                cf_topk=cfg.flux_cf_topk)
+            pkts_b = getattr(engine, "last_flux_packets", None) or []
+            for row, i in enumerate(tool_idx):
+                group = outs_b[row * G:(row + 1) * G]
+                good = [(j, o, self._flux_score(o, pairs[i]))
+                        for j, o in enumerate(group)]
+                good = [g for g in good if g[2] > 0]
+                good.sort(key=lambda g: -g[2])
+                a = attempts[i]
+                a["reward"] = good[0][2] if good else 0.0
+                a["ok"] = a["reward"] >= cfg.flux_ok_threshold
+                if good:
+                    j0 = good[0][0]
+                    a["best"] = good[0][1]
+                    a["pkt"] = row * G + j0          # phase-B packet idx
+                    a["pkt_extra"] = [row * G + j
+                                      for j, _, _ in good[1:]]
+                    # phase-A packet only counts when the model's own
+                    # call parsed — reinforcing a garbage call would
+                    # teach bad syntax
+                    a["tool_ok"] = bool(calls[row * G + j0])
+                    a["pkt_a"] = (row * G + j0) if a["tool_ok"] else None
+                else:
+                    # partial credit: track a parsed phase-A call even
+                    # when the answer failed — valid tool syntax gets a
+                    # reduced-gain reinforce in _flux_finish
+                    a["tool_ok"] = any(
+                        calls[row * G + j] for j in range(G))
+                    a["pkt_a"] = next(
+                        (row * G + j for j in range(G)
+                         if calls[row * G + j]), None)
+                a["obs"] = obs[row * G:(row + 1) * G]
+                a["_pkts"] = pkts_b
+                a["_pkts_a"] = pkts_a
+                if sw:
+                    sw.task_done(i, pairs[i]["prompt"],
+                                 success=a["ok"], rounds_used=G,
+                                 preview=(a["best"] or
+                                          (group[0] if group else "")),
+                                 expected=pairs[i]["response"])
+
         self._flux_attempts = attempts
         n_ok = sum(a["ok"] for a in attempts)
+        n_tool_ok = sum(a.get("tool_ok") for a in attempts
+                        if a["kind"] == "tool")
         if sw:
             sw.event("flux_attempts_done", epoch=self.epoch,
                      correct=n_ok, total=len(attempts),
+                     tool_tasks=len(tool_idx), tool_calls_ok=n_tool_ok,
                      acc_pre=round(acc_pre, 3))
         print(f"  [flux] eval-pre acc={acc_pre:.3f} | "
-              f"attempts {n_ok}/{len(attempts)} correct")
+              f"attempts {n_ok}/{len(attempts)} correct"
+              + (f" | tool calls {n_tool_ok}/{len(tool_idx)} parsed"
+                 if tool_idx else ""))
         return {"success_rate": n_ok / max(len(attempts), 1),
                 "acc_pre": acc_pre, "attempts": len(attempts),
-                "domain": "concise_qa"}
+                "tool_tasks": len(tool_idx), "tool_ok": n_tool_ok,
+                "web_goals": sum(a["source"] != "procedural"
+                                 for a in attempts),
+                "domain": "mixed_qa"}
+
+    @staticmethod
+    def _flux_ids(tok, text: str) -> list[int]:
+        ids = tok.encode(text, add_special_tokens=False)
+        return list(getattr(ids, "input_ids", getattr(ids, "ids", ids)))
+
+    def _flux_ingest(self, model, tok, text: str, tag: str) -> int:
+        """Journaled ingest of raw text under ``tag`` (ws/we-wrapped so
+        revert_tag/reinforce see the block)."""
+        if not text:
+            return 0
+        model.journal.append(("ws", tag))
+        n = model.ingest(self._flux_ids(tok, text), tag=tag)
+        model.journal.append(("we", tag))
+        return n
+
+    def _flux_teach_fail(self, a: dict, model, tok, tag: str) -> None:
+        """Failure path: internalize the SOURCE first (episodic/knn/
+        csem channels get the real context), then hot-teach the verified
+        binding.  Tool tasks additionally demonstrate the canonical
+        tool-call step, so ``Q:.. -> T: <tool> <query>`` gets learned."""
+        cfg = self.config
+        ctx = (a.get("context") or "")[: cfg.flux_context_chars]
+        if ctx:
+            self._flux_ingest(model, tok, ctx, tag)
+
+        if a["kind"] == "tool":
+            tool = a.get("tool") or "wiki"
+            query = a.get("query") or a["prompt"]
+            # canonical observation for the demo trajectory — cached,
+            # so this is free when the model already called it
+            obs = self._flux_tools().call(tool, query)
+            if obs in ("", "offline", "no results"):
+                obs = (a.get("obs") or [""])[0] or "no results"
+            # step 1: emit the right tool call for this question
+            model.teach_text(
+                f"{_FLUX_TOOL_HEADER}\nQ: {a['prompt']}\nT:",
+                f" {tool} {query}\n", tok, tag=tag)
+            # step 2: answer given the observation
+            model.teach_text(
+                f"{_FLUX_TOOL_HEADER}\nQ: {a['prompt']}\n"
+                f"T: {tool} {query}\nO: {obs}\nA:",
+                f" {a['response']}\n", tok, tag=tag)
+            # full trajectory into episodic memory
+            self._flux_ingest(
+                model, tok,
+                f"{_FLUX_TOOL_HEADER}\nQ: {a['prompt']}\n"
+                f"T: {tool} {query}\nO: {obs}\nA: {a['response']}\n",
+                tag)
+            return
+
+        prompt = self._flux_prompt(dict(a, kind="rag" if ctx else "qa"))
+        model.teach_text(prompt, f" {a['response']}\n", tok, tag=tag)
+        if a["kind"] == "rag" and ctx:
+            self._flux_ingest(
+                model, tok,
+                f"{prompt} {a['response']}\n", tag)
 
     def _flux_finish(self, phases: dict) -> None:
         """Phases 2-4 (flux): reinforce/revert+teach → consolidate →
@@ -711,34 +1141,97 @@ class InfiniteSelfPlayLoop:
         # the single learning process applies each verified attempt's
         # update packet (what the stream actually produced), amplified by
         # reinforce(); failed attempts' packets are discarded and the
-        # correct answer is hot-taught instead.
-        packets = getattr(engine, "last_flux_packets", None) or []
+        # correct answer is hot-taught instead (plus its source context
+        # and, for tool tasks, the demonstrated tool call).
         n_reinf = n_taught = 0
         for i, a in enumerate(self._flux_attempts):
             tag = f"e{self.epoch}:t{i}"
             model.tag = tag
             if a["ok"]:
-                if a.get("pkt") is not None \
-                        and a["pkt"] < len(packets):
-                    pkt = packets[a["pkt"]]
-                    pkt.tag = tag
-                    model.apply_packets([pkt])
+                applied = False
+                pkts = []
+                main = a.get("_pkts") or []
+                for k in ([a["pkt"]] + a.get("pkt_extra", [])):
+                    if k is not None and k < len(main):
+                        main[k].tag = tag
+                        pkts.append(main[k])
+                # tool success: also learn the model's OWN tool call
+                # (only when it parsed — garbage syntax is not taught)
+                if a["kind"] == "tool" and a.get("pkt_a") is not None:
+                    pa = a.get("_pkts_a") or []
+                    if a["pkt_a"] < len(pa):
+                        pa[a["pkt_a"]].tag = tag
+                        pkts.insert(0, pa[a["pkt_a"]])
+                if pkts:
+                    model.apply_packets(pkts)
+                    applied = True
                 else:
                     # fallback: no packet recorded (stale engine) —
                     # ingest the verified Q/A pair directly
-                    ids = tok.encode(f"Q: {a['prompt']}\nA: "
-                                     f"{a['response']}\n",
-                                     add_special_tokens=False)
-                    ids = getattr(ids, "input_ids",
-                                  getattr(ids, "ids", ids))
-                    model.journal.append(("ws", tag))
-                    model.ingest(list(ids), tag=tag)
-                    model.journal.append(("we", tag))
-                model.reinforce(tag, gain=cfg.flux_gain)
-                n_reinf += 1
+                    self._flux_ingest(
+                        model, tok,
+                        f"{self._flux_prompt(a)} {a['response']}\n", tag)
+                    applied = True
+                # graded reward scales the gain — a 0.7-reward attempt
+                # reinforces weaker than a clean 1.0
+                model.reinforce(tag,
+                                gain=cfg.flux_gain * a.get("reward", 1.0))
+                # counterfactual credit: the runner-up tokens the
+                # sampler logged share a little of the win
+                if cfg.flux_cf_topk:
+                    for bi, pk in enumerate(pkts):
+                        if getattr(pk, "alts", None):
+                            model.reinforce_alts(
+                                tag, pk,
+                                gain=cfg.flux_gain
+                                * a.get("reward", 1.0),
+                                scale=cfg.flux_cf_scale,
+                                block_idx=bi)
+                n_reinf += applied
             else:
-                model.teach_text(f"Q: {a['prompt']}\nA:",
-                                 f" {a['response']}\n", tok)
+                # partial credit: below-threshold but nonzero reward
+                # (or a parsed tool call under a wrong answer) still
+                # reinforces what it got right, at scaled gain — the
+                # teach then supplies what it missed
+                r = a.get("reward", 0.0)
+                pkts = []
+                if r > 0 and a.get("pkt") is not None:
+                    main = a.get("_pkts") or []
+                    if a["pkt"] < len(main):
+                        main[a["pkt"]].tag = tag
+                        pkts.append(main[a["pkt"]])
+                if a["kind"] == "tool" and a.get("pkt_a") is not None:
+                    pa = a.get("_pkts_a") or []
+                    if a["pkt_a"] < len(pa):
+                        pa[a["pkt_a"]].tag = tag
+                        pkts.insert(0, pa[a["pkt_a"]])
+                if pkts:
+                    model.apply_packets(pkts)
+                    pg = cfg.flux_gain * max(r, cfg.flux_partial_gain)
+                    model.reinforce(tag, gain=pg)
+                    if cfg.flux_cf_topk:
+                        for bi, pk in enumerate(pkts):
+                            if getattr(pk, "alts", None):
+                                model.reinforce_alts(
+                                    tag, pk, gain=pg,
+                                    scale=cfg.flux_cf_scale,
+                                    block_idx=bi)
+                elif cfg.flux_cf_topk and cfg.flux_cf_fail:
+                    # counterfactual failure path: apply the failed
+                    # trajectory, boost the untried alternatives it
+                    # recorded, then revert the sampled writes — the
+                    # alts keep credit for what the tried token lost
+                    main = a.get("_pkts") or []
+                    if a.get("pkt") is not None and a["pkt"] < len(main):
+                        pk = main[a["pkt"]]
+                        pk.tag = tag
+                        model.apply_packets([pk])
+                        if getattr(pk, "alts", None):
+                            model.reinforce_alts(
+                                tag, pk, gain=cfg.flux_gain,
+                                scale=cfg.flux_cf_scale)
+                        model.revert_writes(tag)
+                self._flux_teach_fail(a, model, tok, tag)
                 n_taught += 1
             model.soft_reset()
         cons = model.consolidate(min_entries=cfg.flux_consolidate_min)
@@ -763,10 +1256,31 @@ class InfiniteSelfPlayLoop:
         }
         phases["evaluate"] = eval_result
         if self._status_writer:
+            det = getattr(self, "_flux_eval_detail", {}) or {}
             self._status_writer.event(
                 "flux_eval_done", epoch=self.epoch,
                 acc_pre=round(acc_pre, 3), acc_post=round(acc_post, 3),
+                acc_proc=round(det.get("proc", 0.0), 3),
+                acc_web=(round(det["web"], 3)
+                         if det.get("web") is not None else None),
                 reinforced=n_reinf, taught=n_taught)
+            # live memory telemetry for the spectation card: which
+            # channels the hedge mixture favors + how full the banks are
+            try:
+                rep = model.memory_report()
+                chans = model.channel_weights()
+                self._status_writer.update(
+                    flux_cells=int(rep.get(
+                        "tables_cells", rep.get("gpu_rows_used", 0))),
+                    flux_journal=int(rep.get("journal_entries", 0)),
+                    flux_knn=int(rep.get("knn_rows", 0)),
+                    flux_knn_cap=int(rep.get("knn_cap", 0)),
+                    flux_epi=int(rep.get("epi_positions", 0)),
+                    flux_mb=round(float(rep.get("total_MB_est", 0.0)), 1),
+                    flux_channels={k: round(float(v), 3)
+                                   for k, v in chans.items()})
+            except Exception:
+                pass
         print(f"  [flux] eval acc {acc_pre:.3f} -> {acc_post:.3f}")
 
         # Phase 4: promote the snapshot; on demote roll the live memory
@@ -939,10 +1453,15 @@ class InfiniteSelfPlayLoop:
                         quality=1.0 if att.get("success") else 0.0,
                         gen_ms=per_attempt_ms, exec_ms=0.0,
                         error=att.get("error", ""))
+                best_code = next(
+                    (a.get("code", "") for a in attempts
+                     if a.get("success")),
+                    attempts[0].get("code", "") if attempts else "")
                 sw.task_done(i, task.description, success,
                              rounds_used=result.get("rounds_used", len(attempts)),
                              best_quality=result.get("best_quality",
-                                                     1.0 if success else 0.0))
+                                                     1.0 if success else 0.0),
+                             preview=best_code)
             self._record_step_metrics({
                 "mean_reward": 1.0 if success else 0.0,
                 "diversity_score": curriculum.stats.diversity_score,
@@ -2035,6 +2554,35 @@ def main():
                              "at ~0GB extra VRAM")
     parser.add_argument("--flux-eval-n", type=int, default=40,
                         help="flux mode: fixed held-out eval size")
+    parser.add_argument("--flux-web", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="flux mode: source goals from Wikipedia / "
+                             "dictionary / arXiv (offline -> procedural)")
+    parser.add_argument("--flux-goal-sources", type=str,
+                        default="wiki,dict,arxiv",
+                        help="flux mode: comma-separated web goal sources")
+    parser.add_argument("--flux-web-frac", type=float, default=0.5,
+                        help="flux mode: fraction of epoch goals drawn "
+                             "from web sources (rest procedural)")
+    parser.add_argument("--flux-tool-frac", type=float, default=0.35,
+                        help="flux mode: fraction of web goals run as "
+                             "two-phase tool-call tasks")
+    parser.add_argument("--flux-rag-frac", type=float, default=0.35,
+                        help="flux mode: fraction of non-tool web goals "
+                             "with the source snippet inline (RAG)")
+    parser.add_argument("--flux-web-fetch-budget", type=int, default=8,
+                        help="flux mode: max new source fetches per epoch")
+    parser.add_argument("--flux-eval-web-n", type=int, default=16,
+                        help="flux mode: frozen web eval set size "
+                             "(0 disables)")
+    parser.add_argument("--flux-dict-file", type=str, default="",
+                        help="flux mode: local kaikki.org wiktionary "
+                             "jsonl for offline dictionary goals")
+    parser.add_argument("--flux-teacher-embed", type=str, default="auto",
+                        help="flux mode: teacher checkpoint whose "
+                             "embedding grafts onto a FRESH flux model "
+                             "('auto' = ForgeLM_V2.safetensors when "
+                             "present, '' disables)")
     parser.add_argument("--grpo-algorithm", type=str, default="grpo",
                         choices=["grpo", "gtpo", "cispo", "sppo", "psppo",
                                  "evpo", "grpo_or"],
@@ -2184,6 +2732,15 @@ def main():
         flux_workers=args.flux_workers,
         flux_workers_device=args.flux_workers_device,
         flux_eval_n=args.flux_eval_n,
+        flux_web=args.flux_web,
+        flux_goal_sources=args.flux_goal_sources,
+        flux_web_frac=args.flux_web_frac,
+        flux_tool_frac=args.flux_tool_frac,
+        flux_rag_frac=args.flux_rag_frac,
+        flux_web_fetch_budget=args.flux_web_fetch_budget,
+        flux_eval_web_n=args.flux_eval_web_n,
+        flux_dict_file=args.flux_dict_file,
+        flux_teacher_embed=args.flux_teacher_embed,
         grpo_max_steps=args.grpo_steps,
         grpo_lr=args.grpo_lr,
         grpo_group_size=args.grpo_group_size,

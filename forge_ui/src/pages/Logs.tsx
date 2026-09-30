@@ -3,11 +3,13 @@
 // auto-scrolls unless the user scrolls up (follow is re-armed via button).
 
 import { clsx } from 'clsx'
-import { ArrowDownToLine, RefreshCw, ScrollText, Trash2 } from 'lucide-react'
+import {
+  ArrowDownToLine, Check as CheckIcon, Copy, Download, RefreshCw, ScrollText, Trash2,
+} from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../lib/api'
 import {
-  Btn, Check, EmptyState, IconBtn, Input, Select, Tag,
+  Btn, Check, EmptyState, IconBtn, SearchInput, Select, Tag,
 } from '../components/ui'
 
 const LEVELS = ['ERROR', 'WARN', 'INFO', 'DEBUG'] as const
@@ -135,6 +137,26 @@ export default function Logs() {
     } catch (e) { setErr(String(e)) }
   }
 
+  const [copied, setCopied] = useState(false)
+  const copyLogs = () => {
+    if (!lines.length) return
+    void navigator.clipboard.writeText(lines.join('\n')).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1200)
+    })
+  }
+
+  const downloadLogs = () => {
+    if (!lines.length) return
+    const blob = new Blob([lines.join('\n')], { type: 'text/plain' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `forge_logs_${Date.now()}.txt`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
   const filtered = query.trim() !== '' || levels.size < LEVELS.length
     || srcSel.size > 0
 
@@ -142,12 +164,12 @@ export default function Logs() {
     <div className="flex flex-col h-full min-h-0">
       {/* toolbar */}
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 px-3 py-2 border-b border-border">
-        <Input
+        <SearchInput
           value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter') void load() }}
+          onChange={setQuery}
           placeholder="Search logs…"
-          className="w-56 !py-1 !text-[12px]" />
+          className="w-60"
+        />
 
         <div className="flex items-center gap-1">
           {LEVELS.map((lv) => (
@@ -206,10 +228,27 @@ export default function Logs() {
           <Tag kind="err">err {counts.errors}</Tag>
           <Tag kind="warn">warn {counts.warnings}</Tag>
           <Tag kind="idle">{lines.length}/{counts.total}</Tag>
+          {lines.length > 0 && (
+            <div className="flex items-center gap-1 border-r border-border/60 pr-2">
+              <button
+                onClick={copyLogs}
+                title="Copy all filtered logs"
+                className="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] bg-panel-alt hover:bg-panel-hover border border-border text-text-dim hover:text-text cursor-pointer transition-colors">
+                {copied ? <CheckIcon size={11} className="text-ok" /> : <Copy size={11} />}
+                {copied ? 'Copied' : 'Copy'}
+              </button>
+              <button
+                onClick={downloadLogs}
+                title="Download logs as text file"
+                className="p-1 rounded text-text-faint hover:text-text hover:bg-panel-alt transition-colors cursor-pointer">
+                <Download size={12} />
+              </button>
+            </div>
+          )}
           <IconBtn title="Refresh" onClick={() => void load()}>
             <RefreshCw size={13} />
           </IconBtn>
-          <Btn variant="danger" onClick={clear}>
+          <Btn variant="danger" size="xs" onClick={clear}>
             <Trash2 size={11} /> Clear
           </Btn>
           <Check label="auto" checked={auto} onChange={setAuto} />

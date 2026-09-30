@@ -1167,8 +1167,10 @@ def main():
     random.seed(args.seed)
     patch_triton_cache_for_windows()
 
-    # Reduce CUDA memory fragmentation (critical for 12GB VRAM)
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    # Reduce CUDA memory fragmentation (critical for 12GB VRAM);
+    # expandable_segments unsupported on Windows — torch warns per-alloc
+    if os.name != "nt":
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bf16" and "cuda" in device else torch.float32

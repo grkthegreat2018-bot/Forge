@@ -242,3 +242,9 @@ export interface SelfPlayEvent {
   kind?: string
   [key: string]: unknown
 }
+
+export interface SelfPlayStatusPayload {
+  status: Record<string, unknown>
+  heartbeat_age_s: number | null
+  heartbeat_stalled: boolean | null
+}

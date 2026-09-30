@@ -2,14 +2,14 @@
 
 import { clsx } from 'clsx'
 import {
-  Database, Download, Play, RefreshCw, SquareTerminal,
+  Check as CheckIcon, Copy, Database, Download, Play, RefreshCw, SquareTerminal,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../lib/api'
 import type { Dataset } from '../lib/types'
 import {
-  Btn, Card, Check, EmptyState, IconBtn, Input, NumInput, Select, Spinner,
+  Btn, Card, Check, EmptyState, IconBtn, Input, NumInput, SearchInput, Select, Spinner,
 } from '../components/ui'
 
 interface FinetuneForm {
@@ -78,6 +78,8 @@ export default function Finetune() {
     { optimizers: [], losses: [], curricula: [] })
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [form, setForm] = useState<FinetuneForm>(DEFAULT_FORM)
+  const [datasetSearch, setDatasetSearch] = useState('')
+  const [copiedCmd, setCopiedCmd] = useState(false)
   const [preview, setPreview] = useState('')
   const [previewing, setPreviewing] = useState(false)
   const [launching, setLaunching] = useState(false)
@@ -104,6 +106,15 @@ export default function Finetune() {
       if (n.has(path)) n.delete(path); else n.add(path)
       return n
     })
+
+  const filteredDatasets = useMemo(() => {
+    const q = datasetSearch.trim().toLowerCase()
+    if (!q) return datasets
+    return datasets.filter((d) =>
+      d.name.toLowerCase().includes(q) ||
+      d.path.toLowerCase().includes(q)
+    )
+  }, [datasets, datasetSearch])
 
   const totalExamples = useMemo(
     () => datasets.filter((d) => selected.has(d.path))
@@ -159,7 +170,7 @@ export default function Finetune() {
           <div className="flex items-center justify-between px-4 pt-3 pb-2">
             <div className="flex items-center gap-3">
               <span className="text-[11px] font-semibold uppercase tracking-wider text-text-faint">
-                Datasets
+                Datasets ({selected.size} / {datasets.length})
               </span>
               <button onClick={() => setSelected(new Set(datasets.map((d) => d.path)))}
                 className="text-[10.5px] text-accent-hi hover:underline cursor-pointer">all</button>
@@ -170,8 +181,16 @@ export default function Finetune() {
               <RefreshCw size={12} />
             </IconBtn>
           </div>
+          <div className="px-3 pb-2">
+            <SearchInput
+              value={datasetSearch}
+              onChange={setDatasetSearch}
+              placeholder="Search datasets…"
+              className="w-full"
+            />
+          </div>
           <div className="flex-1 overflow-y-auto px-2 pb-2">
-            {datasets.map((d) => (
+            {filteredDatasets.map((d) => (
               <label
                 key={d.path}
                 className={clsx(
@@ -343,9 +362,23 @@ export default function Finetune() {
       {/* bottom bar: preview + launch */}
       <div className="border-t border-border px-4 py-2.5 space-y-2">
         {preview && (
-          <pre className="font-mono text-[11.5px] text-text-dim bg-deep border border-border rounded-lg p-3 whitespace-pre-wrap break-all max-h-28 overflow-y-auto">
-            {preview}
-          </pre>
+          <div className="relative">
+            <pre className="font-mono text-[11.5px] text-text-dim bg-deep border border-border rounded-lg p-3 pr-20 whitespace-pre-wrap break-all max-h-28 overflow-y-auto">
+              {preview}
+            </pre>
+            <button
+              onClick={() => {
+                void navigator.clipboard.writeText(preview).then(() => {
+                  setCopiedCmd(true)
+                  setTimeout(() => setCopiedCmd(false), 1200)
+                })
+              }}
+              title="Copy command"
+              className="absolute right-2.5 top-2.5 flex items-center gap-1 px-2 py-0.5 rounded text-[11px] bg-panel-alt hover:bg-panel-hover border border-border text-text-dim hover:text-text cursor-pointer transition-colors">
+              {copiedCmd ? <CheckIcon size={11} className="text-ok" /> : <Copy size={11} />}
+              {copiedCmd ? 'Copied' : 'Copy'}
+            </button>
+          </div>
         )}
         <div className="flex items-center gap-2">
           <Btn variant="subtle" onClick={doPreview} disabled={previewing}>

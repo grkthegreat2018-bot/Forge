@@ -878,11 +878,11 @@ class KVzipCacheStrategy(KVCacheStrategy):
         self.device = device
         self.dtype = dtype
 
-        # Full KV cache (pre-allocated, like StandardKVCache)
-        self.k_cache = torch.zeros(
-            n_kv_heads, max_seq_len, head_dim, device=device, dtype=dtype)
-        self.v_cache = torch.zeros(
-            n_kv_heads, max_seq_len, head_dim, device=device, dtype=dtype)
+        # Full KV cache — lazily allocated on first append so activation
+        # doesn't burn ~seq*hd*2 bytes for a cache the decode loop may
+        # never write to (mirrors StandardKVCache._ensure_allocated).
+        self.k_cache = None
+        self.v_cache = None
 
         # Compression state
         self.seq_len = 0
@@ -894,7 +894,15 @@ class KVzipCacheStrategy(KVCacheStrategy):
         self.budget_ratio = 0.1  # keep top 10% (10x compression)
         self._attention_scores = []
 
+    def _ensure_allocated(self):
+        if self.k_cache is None:
+            self.k_cache = torch.zeros(
+                self.n_kv_heads, self.max_seq_len, self.head_dim,
+                device=self.device, dtype=self.dtype)
+            self.v_cache = torch.zeros_like(self.k_cache)
+
     def append(self, k, v, position, attention_weights=None):
+        self._ensure_allocated()
         if position < self.max_seq_len:
             self.k_cache[:, position:position+1, :] = k[0].squeeze(0).to(self.dtype)
             self.v_cache[:, position:position+1, :] = v[0].squeeze(0).to(self.dtype)
@@ -946,6 +954,11 @@ class KVzipCacheStrategy(KVCacheStrategy):
         self._attention_scores = []
 
     def get(self, positions):
+        if self.k_cache is None:
+            empty = torch.zeros(
+                self.n_kv_heads, 0, self.head_dim,
+                device=self.device, dtype=self.dtype)
+            return empty.unsqueeze(0), empty.unsqueeze(0)
         k = self.k_cache[:, :self.seq_len, :].unsqueeze(0)
         v = self.v_cache[:, :self.seq_len, :].unsqueeze(0)
         return k, v

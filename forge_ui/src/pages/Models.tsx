@@ -3,7 +3,7 @@
 import { clsx } from 'clsx'
 import {
   Box, ChevronDown, ChevronRight, Dna, GitMerge, Play,
-  RefreshCw, Search, Square, Trash2, Upload,
+  RefreshCw, Square, Trash2, Upload,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../lib/api'
@@ -11,7 +11,7 @@ import { useForge } from '../lib/store'
 import type { ModelEntry } from '../lib/types'
 import {
   Btn, Card, Check, EmptyState, Input, KvRow, NumInput,
-  Select, Spinner, StatusDot, Tag,
+  SearchInput, Select, Spinner, StatusDot, Tag,
 } from '../components/ui'
 
 type ConfigRec = Record<string, unknown>
@@ -294,12 +294,12 @@ export default function Models() {
         </div>
 
         <div className="px-4 pt-3 pb-2">
-          <div className="relative">
-            <Search size={13}
-              className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-faint" />
-            <Input value={search} onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search checkpoints…" className="w-full pl-7 !py-1.5" />
-          </div>
+          <SearchInput
+            value={search}
+            onChange={setSearch}
+            placeholder="Search checkpoints by name or path…"
+            className="w-full"
+          />
         </div>
 
         <div className="flex-1 overflow-y-auto px-4 pb-4">

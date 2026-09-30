@@ -142,7 +142,7 @@ class TestFluxModeBranch:
         a later epoch, and eval prompts are always excluded."""
         from forge.self_play.infinite_loop import _concise_qa_pairs
         cfg = LoopConfig(training_mode="flux", tasks_per_epoch=10,
-                         flux_eval_n=8)
+                         flux_eval_n=8, flux_web=False)
         loop = InfiniteSelfPlayLoop("fake.flux", cfg)
         eval_qs = {p["prompt"] for p in
                    _concise_qa_pairs(8, cfg.flux_eval_seed)}
@@ -159,7 +159,8 @@ class TestFluxModeBranch:
         """Attempts must go through engine.generate_batch with per-gen
         temps+seeds (concurrency contract), one group per task."""
         cfg = LoopConfig(training_mode="flux", tasks_per_epoch=6,
-                         flux_group_size=3, flux_workers=2)
+                         flux_group_size=3, flux_workers=2,
+                         flux_web=False)
         loop = InfiniteSelfPlayLoop("fake.flux", cfg)
         model = MagicMock()
         model._count = 123

@@ -68,6 +68,10 @@ class FluxPacket:
     prompt_ids: list[int]
     gen_ids: list[int]
     meta: dict = field(default_factory=dict)
+    # counterfactual propensities: per generated token, the top-k
+    # (token_id, prob) alternatives under the actual sampling
+    # distribution - lets reinforce_alts credit untried actions
+    alts: list | None = None
 
     @property
     def ids(self) -> list[int]:
@@ -80,7 +84,10 @@ class FluxPacket:
 class _NullJournal:
     """Sink for journaled writes inside predict-only streams."""
 
-    entries: list = []
+    def __init__(self):
+        # instance attr — a class-level list would share state across
+        # every stream that ever touches .entries
+        self.entries: list = []
 
     def append(self, e) -> None:
         return None
@@ -115,6 +122,9 @@ class _StreamCtx:
             "_proto": model._proto.clone(),
             "_w": model._w.copy(),
             "_hedge_mix": float(model._hedge_mix),
+            "_wR": model._wR.copy(),
+            "_hmxR": model._hmxR.copy(),
+            "_regime": int(model._regime),
             "_uni": model._uni.copy(),
             "_total": float(model._total),
             "_log_uni_num": model._log_uni_num.clone(),
@@ -197,6 +207,13 @@ class FluxStreamPool:
         self.sproto = m._proto.unsqueeze(0).expand(n, -1).contiguous()
         self.sw = m._wg.unsqueeze(0).expand(n, -1).clone()  # [N,C] f64
         self.shmg = m._hmg.reshape(1).expand(n).clone()
+        # per-regime weight sets (cond_hedge): sw stays the active-row
+        # mirror for parity with the canonical model's _w
+        self.swR = m._wgR.unsqueeze(0).expand(n, -1, -1).clone()
+        self.shmgR = m._hmxRg.reshape(1, -1).expand(n, -1).clone()
+        self.sreg = torch.zeros(n, dtype=torch.int64, device=dev)
+        # sparse-tap abstain mask (host tables - no device reward)
+        self._pmask_dev = torch.from_numpy(m._pmask).to(dev)
         self.spos = torch.full((n,), self.C, dtype=torch.int64,
                                device=dev)
         self.sep = torch.full((n,), self.C, dtype=torch.int64,
@@ -385,7 +402,15 @@ class FluxStreamPool:
         rows_t = gt.ttoks.view(-1, gt.M)[frow]                  # [N,O,M]
         rows_c = gt.tcnt.view(-1, gt.M)[frow]
         tots = gt.ttot.view(-1)[frow]                           # [N,O]
-        wo = self.sw[:, :O].float()[:, :, None]                 # [N,O,1]
+        if c.cond_hedge:
+            # per-stream evidence regime; swR is canonical, sw the
+            # active-row mirror (same convention as _w/_wR)
+            self.sreg = (hit & (tots > 0)).any(dim=1).long()
+            sw = self.swR[self._ar, self.sreg]                  # [N,C]
+            self.sw = sw
+        else:
+            sw = self.sw
+        wo = sw[:, :O].float()[:, :, None]                      # [N,O,1]
         if c.evidence_lift:
             wo = wo + (tots / (tots + c.backoff_kappa))[:, :, None]
         tok_l = rows_t.long().clamp(0, V - 1)                   # [N,O,M]
@@ -420,7 +445,7 @@ class FluxStreamPool:
             p_b = conf[:, None] * (rc_k + c.alpha
                                    * uni_pv.gather(1, tl)) \
                 / (tot_k[:, None] + c.alpha)
-            wb = self.sw[:, m._chix["backoff"]].float()
+            wb = sw[:, m._chix["backoff"]].float()
             if c.evidence_lift:
                 wb = wb + conf
             logits.view(-1).index_add_(
@@ -433,7 +458,7 @@ class FluxStreamPool:
 
         # deep episodic channel (votes computed by caller's probe)
         vt = votes.sum(dim=1)                                   # [N]
-        wd = self.sw[:, m._chix["deep"]].float()
+        wd = sw[:, m._chix["deep"]].float()
         if c.evidence_lift:
             wd = wd + vt / (vt + c.backoff_kappa)
         p_d = (votes + c.alpha * uni_pv) / (vt[:, None] + c.alpha)
@@ -445,7 +470,7 @@ class FluxStreamPool:
 
         # topic channel: cosine readout on top candidates per stream
         cn = self.sc.norm(dim=1)                                # [N]
-        wt = self.sw[:, m._chix["topic"]].float()
+        wt = sw[:, m._chix["topic"]].float()
         cand = torch.topk(logits, min(256, V), dim=1).indices   # [N,T]
         a = m._A[cand]                                          # [N,T,D]
         an = m._An.index_select(0, cand.reshape(-1)) \
@@ -463,7 +488,7 @@ class FluxStreamPool:
         pvn = pv.norm(dim=1)                                    # [N]
         sims = (pv @ m._Ac.T) / (m._Acn[None, :]
                                  * pvn[:, None] + 1e-8)         # [N,V]
-        ws = self.sw[:, m._chix["sem"]].float() * float(c.use_sem)
+        ws = sw[:, m._chix["sem"]].float() * float(c.use_sem)
         logits += torch.where(
             (pvn > 1e-8)[:, None],
             (ws * c.sem_beta)[:, None] * sims,
@@ -475,7 +500,7 @@ class FluxStreamPool:
         rn = row.norm(dim=1)
         csims = (row @ m._Ac.T) / (m._Acn[None, :]
                                    * rn[:, None] + 1e-8)
-        wc = self.sw[:, m._chix["csem"]].float() \
+        wc = sw[:, m._chix["csem"]].float() \
             * float(c.use_csem)
         logits += torch.where(
             (cf & cok & (rn > 1e-8))[:, None],
@@ -486,7 +511,7 @@ class FluxStreamPool:
         if c.use_knn:
             p_k = (kv + c.alpha * uni_pv) / (kvt[:, None]
                                              + c.alpha)
-            wk = self.sw[:, m._chix["knn"]].float()
+            wk = sw[:, m._chix["knn"]].float()
             if c.evidence_lift:
                 wk = wk + kvt / (kvt + c.backoff_kappa)
             logits += torch.where(
@@ -505,10 +530,14 @@ class FluxStreamPool:
             (ages < c.fatigue_span) & (self.sseen >= 0),
             c.fatigue_decay ** ages.float(),
             torch.zeros((), device=dev))
-        logits += self.sw[:, m._chix["recency"]].float()[:, None] \
+        logits += sw[:, m._chix["recency"]].float()[:, None] \
             * rec \
-            - (self.sw[:, m._chix["fatigue"]].float()
+            - (sw[:, m._chix["fatigue"]].float()
                * c.fatigue_strength)[:, None] * fat
+        if c.uni_escape > 0:
+            logits = torch.log(
+                (1.0 - c.uni_escape) * torch.softmax(logits, -1)
+                + c.uni_escape * uni_pv)
         return logits
 
     # ── batched reward (port of _step_dev's hedge section) ───────────
@@ -558,13 +587,40 @@ class FluxStreamPool:
         cn = self.sc.norm(dim=1)
         cos_t = (a_x * self.sc).sum(1) \
             / (a_x.norm(dim=1) * cn + 1e-8)
-        rw[:, m._chix["topic"]] = torch.sigmoid(
-            c.topic_beta * cos_t).double()
+        if c.calib_rewards:
+            # normalized implied dist p(v) ∝ p_uni(v)·exp(β·cos_v):
+            # reward = p_uni(x)·exp(β·cos_x)/Z per stream.  Z needs the
+            # [N,V] sims - one matvec per channel (A @ vec.T).
+            uni_pv = (self.sunig + c.uni_alpha) \
+                / (self.stot + c.uni_alpha * V)[:, None]        # [N,V]
+            chat = self.sc / cn.clamp(min=1e-8)[:, None]
+            sims_t = (m._A @ chat.T) \
+                / m._An.clamp(min=1e-8)[:, None]                # [V,N]
+            z_t = (uni_pv * torch.exp(
+                c.topic_beta * sims_t.T)).sum(1)                # [N]
+            rw[:, m._chix["topic"]] = torch.where(
+                (cn > 1e-8) & (a_x.norm(dim=1) > 1e-8),
+                (uni_x * torch.exp(c.topic_beta * cos_t)
+                 / z_t.clamp(min=1e-12)), uni_x)
+        else:
+            rw[:, m._chix["topic"]] = torch.sigmoid(
+                c.topic_beta * cos_t).double()
         pn = self.sproto.norm(dim=1)
         cos_s = (a_x * self.sproto).sum(1) \
             / (a_x.norm(dim=1) * pn + 1e-8)
-        rw[:, m._chix["sem"]] = torch.sigmoid(
-            c.sem_beta * cos_s).double()
+        if c.calib_rewards:
+            phat = self.sproto / pn.clamp(min=1e-8)[:, None]
+            sims_s = (m._A @ phat.T) \
+                / m._An.clamp(min=1e-8)[:, None]
+            z_s = (uni_pv * torch.exp(
+                c.sem_beta * sims_s.T)).sum(1)
+            rw[:, m._chix["sem"]] = torch.where(
+                (pn > 1e-8) & (a_x.norm(dim=1) > 1e-8),
+                (uni_x * torch.exp(c.sem_beta * cos_s)
+                 / z_s.clamp(min=1e-12)), uni_x)
+        else:
+            rw[:, m._chix["sem"]] = torch.sigmoid(
+                c.sem_beta * cos_s).double()
 
         cs = slot[:, gt.row_csem]
         cf = found[:, gt.row_csem]
@@ -573,9 +629,20 @@ class FluxStreamPool:
         rn = row.norm(dim=1)
         cos_c = (ax_c * row).sum(1) \
             / (ax_c.norm(dim=1) * rn + 1e-8)
-        rw[:, m._chix["csem"]] = torch.where(
-            cf & cok & (rn > 1e-8),
-            torch.sigmoid(c.csem_beta * cos_c).double(), uni_x)
+        if c.calib_rewards:
+            rhat = (row / rn.clamp(min=1e-8)[:, None]).float()
+            csims = (m._Ac @ rhat.T) \
+                / m._Acn.clamp(min=1e-8)[:, None]               # [V,N]
+            z_c = (uni_pv * torch.exp(
+                c.csem_beta * csims.T)).sum(1)
+            rw[:, m._chix["csem"]] = torch.where(
+                cf & cok & (rn > 1e-8),
+                (uni_x * torch.exp(c.csem_beta * cos_c)
+                 / z_c.clamp(min=1e-12)).double(), uni_x)
+        else:
+            rw[:, m._chix["csem"]] = torch.where(
+                cf & cok & (rn > 1e-8),
+                torch.sigmoid(c.csem_beta * cos_c).double(), uni_x)
 
         if c.use_knn:
             kvd = kv.double()
@@ -589,15 +656,47 @@ class FluxStreamPool:
 
         age = (end - self.sseen.gather(
             1, x[:, None]).squeeze(1)).double()                 # [N]
-        inrec = (age >= 0) & (age < c.recency_span)
-        rw[:, m._chix["recency"]] = torch.where(
-            inrec, c.recency_decay ** age.clamp(min=0),
-            torch.full((), 1e-3, dtype=torch.float64,
-                       device=dev))
-        infat = (age >= 0) & (age < c.fatigue_span)
-        rw[:, m._chix["fatigue"]] = torch.where(
-            infat, 1.0 - c.fatigue_decay ** age.clamp(min=0),
-            torch.ones((), dtype=torch.float64, device=dev))
+        if c.calib_rewards:
+            # same implied-dist reward as _hedge_dev: p_uni·e^f / Z,
+            # Z = 1 + Σ_v p_uni·(e^f - 1) over each stream's window
+            ages_v = end[:, None] - self.sseen                  # [N,V]
+            rec_v = torch.where(
+                (ages_v >= 0) & (ages_v < c.recency_span)
+                & (self.sseen >= 0),
+                c.recency_decay ** ages_v.float().clamp(min=0),
+                torch.zeros((), device=dev)).double()
+            z_r = 1.0 + (uni_pv * (torch.exp(rec_v) - 1.0)
+                         ).sum(dim=1)                           # [N]
+            inrec = (age >= 0) & (age < c.recency_span)
+            rec_x = torch.where(
+                inrec, c.recency_decay ** age.clamp(min=0),
+                torch.zeros((), dtype=torch.float64, device=dev))
+            rw[:, m._chix["recency"]] = uni_x * torch.exp(rec_x) \
+                / z_r.clamp(min=1e-12)
+            fat_v = torch.where(
+                (ages_v >= 0) & (ages_v < c.fatigue_span)
+                & (self.sseen >= 0),
+                c.fatigue_decay ** ages_v.float().clamp(min=0),
+                torch.zeros((), device=dev)).double()
+            z_f = 1.0 + (uni_pv * (torch.exp(
+                -c.fatigue_strength * fat_v) - 1.0)).sum(dim=1)
+            infat = (age >= 0) & (age < c.fatigue_span)
+            fat_x = torch.where(
+                infat, c.fatigue_decay ** age.clamp(min=0),
+                torch.zeros((), dtype=torch.float64, device=dev))
+            rw[:, m._chix["fatigue"]] = uni_x * torch.exp(
+                -c.fatigue_strength * fat_x) \
+                / z_f.clamp(min=1e-12)
+        else:
+            inrec = (age >= 0) & (age < c.recency_span)
+            rw[:, m._chix["recency"]] = torch.where(
+                inrec, c.recency_decay ** age.clamp(min=0),
+                torch.full((), 1e-3, dtype=torch.float64,
+                           device=dev))
+            infat = (age >= 0) & (age < c.fatigue_span)
+            rw[:, m._chix["fatigue"]] = torch.where(
+                infat, 1.0 - c.fatigue_decay ** age.clamp(min=0),
+                torch.ones((), dtype=torch.float64, device=dev))
         rw[:, m._chix["uni"]] = uni_x
 
         if c.use_backoff:
@@ -617,25 +716,83 @@ class FluxStreamPool:
                 conf * (cnt_k + c.alpha * uni_x)
                 / (tot_k + c.alpha), uni_x)
         else:
+            ok_bo = None
             rw[:, m._chix["backoff"]] = uni_x
-        return rw
+
+        # sleeping-experts awake mask (abstention): a channel with no
+        # evidence this step was scored on the unigram fallback - mark
+        # it asleep so observe_gpu can give it the neutral p_mix reward
+        awake = None
+        if c.sleeping_experts:
+            awake = torch.ones(n, Cch, dtype=torch.bool, device=dev)
+            awake[:, :O] = hit & (tots > 0)
+            awake[:, m._chix["deep"]] = vt > 0
+            awake[:, m._chix["topic"]] = (cn > 1e-8) & (
+                a_x.norm(dim=1) > 1e-8)
+            awake[:, m._chix["sem"]] = (pn > 1e-8) & (
+                a_x.norm(dim=1) > 1e-8)
+            awake[:, m._chix["csem"]] = cf & cok & (rn > 1e-8)
+            awake[:, m._chix["knn"]] = (
+                kvt > 0 if c.use_knn
+                else torch.zeros(n, dtype=torch.bool, device=dev))
+            awake[:, m._chix["backoff"]] = (
+                ok_bo.any(dim=1) if ok_bo is not None
+                else torch.zeros(n, dtype=torch.bool, device=dev))
+        for i in m._pidx:
+            # host-resident tables (sparse p<j>, class g<k>) - pool
+            # streams take the unigram fallback (matches _step_dev)
+            rw[:, i] = uni_x
+            if awake is not None:
+                awake[:, i] = False
+        return rw, awake
 
     # ── stream steps ─────────────────────────────────────────────────
 
     def observe_gpu(self, x: torch.Tensor, mask: torch.Tensor,
-                    rewards: torch.Tensor | None) -> None:
+                    rewards: torch.Tensor | None,
+                    awake: torch.Tensor | None = None) -> None:
         """Push x [N] into each stream's context.  ``rewards`` = the
         [N,Cch] channel probs gathered at the pre-x context (None =
-        skip hedge update, cheap prompt feed).  Dead lanes write their
-        own slot back unchanged."""
+        skip hedge update, cheap prompt feed).  ``awake`` = [N,Cch]
+        sleeping-experts mask - asleep channels take the mixture's own
+        p_mix as a neutral reward instead of their unigram fallback.
+        Dead lanes write their own slot back unchanged."""
         m, c = self.model, self.model.config
         dev = self.dev
         end = self.spos - 1                                     # [N]
 
         if rewards is not None:
-            pmix = (self.sw * rewards).sum(dim=1)               # [N]
+            if c.cond_hedge:
+                # sreg was set by the predicting _logits_b - rewards
+                # update that regime's own weight set, written back
+                # into swR under the learn mask
+                sw = self.swR[self._ar, self.sreg]              # [N,C]
+                shmg = self.shmgR[self._ar, self.sreg]          # [N]
+            else:
+                sw, shmg = self.sw, self.shmg
+            if awake is not None and c.sleeping_experts == 2:
+                aw = awake.double()
+                wsum = (sw * aw).sum(dim=1).clamp(min=1e-12)
+                pmix = (sw * rewards * aw).sum(dim=1) / wsum
+                rewards = torch.where(awake, rewards,
+                                      pmix[:, None].expand_as(rewards))
+            elif awake is not None and c.sleeping_experts == 1:
+                pmix = (sw * rewards).sum(dim=1)
+                rewards = torch.where(awake, rewards,
+                                      pmix[:, None].expand_as(rewards))
+            elif m._pidx:
+                # host-resident arms abstain on GPU: neutral
+                # pmix reward over the other arms (closed form)
+                aw = ~self._pmask_dev
+                wsum = (sw * aw).sum(dim=1).clamp(min=1e-12)
+                pmix = (sw * rewards * aw).sum(dim=1) / wsum
+                rewards = torch.where(
+                    self._pmask_dev[None, :].expand_as(rewards),
+                    pmix[:, None].expand_as(rewards), rewards)
+            else:
+                pmix = (sw * rewards).sum(dim=1)           # [N]
             if c.adahedge:
-                self.shmg += torch.where(
+                shmg = shmg + torch.where(
                     mask, rewards.max(dim=1).values - pmix,
                     torch.zeros((), dtype=torch.float64,
                               device=dev))
@@ -643,20 +800,23 @@ class FluxStreamPool:
                     torch.full((), c.hedge_eta_max,
                                dtype=torch.float64, device=dev),
                     math.log(len(m.channels))
-                    / self.shmg.clamp(min=1e-9))
+                    / shmg.clamp(min=1e-9))
             else:
                 eta = torch.full((), c.hedge_lr,
                                  dtype=torch.float64,
                                  device=dev)
             factors = torch.exp(
                 eta[:, None] * (rewards - pmix[:, None]))
-            self.sw = torch.where(
-                mask[:, None], self.sw * factors, self.sw)
-            self.sw = self.sw.clamp(c.hedge_min, c.hedge_max)
-            self.sw = torch.where(
+            sw = torch.where(mask[:, None], sw * factors, sw)
+            sw = sw.clamp(c.hedge_min, c.hedge_max)
+            sw = torch.where(
                 mask[:, None],
-                self.sw / self.sw.sum(dim=1, keepdim=True),
-                self.sw)
+                sw / sw.sum(dim=1, keepdim=True), sw)
+            if c.cond_hedge:
+                self.swR[self._ar, self.sreg] = sw
+                self.shmgR[self._ar, self.sreg] = shmg
+            self.sw = sw
+            self.shmg = shmg
 
         # context push into the per-stream tail ring — the tail is
         # indexed by stream-relative position ((pos - C) % cap_s), the
@@ -726,6 +886,7 @@ class FluxStreamPool:
                  eos_ids: set[int] | None = None,
                  tag_fn=None,
                  prompt_rewards: bool = True,
+                 cf_topk: int = 0,
                  ) -> tuple[list[list[int]], list[FluxPacket]]:
         """Batched predict-only generation -> (gen_ids, packets).
 
@@ -757,30 +918,34 @@ class FluxStreamPool:
                 gens.append(g)
 
         if not self._gpu:
-            outs = self._generate_cpu(
+            outs, alts_out = self._generate_cpu(
                 prompt_ids, max_new_tokens, temperatures, top_ps,
                 top_ks, repetition_penalties, gens, stops,
-                logits_processors, tokenizer, eos_ids)
+                logits_processors, tokenizer, eos_ids, cf_topk)
         else:
-            outs = self._generate_gpu(
+            outs, alts_out = self._generate_gpu(
                 prompt_ids, max_new_tokens, temperatures, top_ps,
                 top_ks, repetition_penalties, gens, stops,
                 logits_processors, tokenizer, eos_ids,
-                prompt_rewards)
+                prompt_rewards, cf_topk)
 
         packets = [FluxPacket(
             tag=(tag_fn(i) if tag_fn else "stream"),
             prompt_ids=list(prompt_ids[i]), gen_ids=outs[i],
-            meta={"stream": i}) for i in range(n)]
+            meta={"stream": i},
+            alts=alts_out[i] if alts_out else None)
+            for i in range(n)]
         return outs, packets
 
     def _generate_gpu(self, prompt_ids, max_new, temps, top_ps,
                       top_ks, rep_pens, gens, stops, processors,
-                      tokenizer, eos_ids, prompt_rewards):
+                      tokenizer, eos_ids, prompt_rewards,
+                      cf_topk: int = 0):
         n = len(prompt_ids)
         dev = self.dev
         V = self.model.vocab_size
         outs: list[list[int]] = [[] for _ in range(n)]
+        alts_out: list[list] = [[] for _ in range(n)]
         active = torch.ones(n, dtype=torch.bool, device=dev)
         plens = torch.tensor([len(p) for p in prompt_ids],
                              dtype=torch.int64, device=dev)
@@ -810,9 +975,11 @@ class FluxStreamPool:
                     end, floor, slot[:, self.model._gt.row_epi],
                     found[:, self.model._gt.row_epi], dk)
                 kv, kvt = self._knn_votes_b()
-                rw = self._rewards_b(xt, slot, found, live_k,
-                                     cok, votes, kv, kvt, end)
-            self.observe_gpu(xt, fed, rw)
+                rw, awake = self._rewards_b(xt, slot, found, live_k,
+                                            cok, votes, kv, kvt, end)
+            else:
+                awake = None
+            self.observe_gpu(xt, fed, rw, awake)
 
         # generation loop — one batched pass per step for all streams
         pen_mask = torch.zeros(n, V, dtype=torch.bool, device=dev)
@@ -859,8 +1026,33 @@ class FluxStreamPool:
                     srt[cut] = float("-inf")
                     lg[i] = torch.empty_like(lg[i]).scatter_(
                         0, si, srt)
-            lg = torch.where(active[:, None], lg,
+                # support-restricted sampling: keep only tokens some
+                # channel voted for (p_mix > thresh * p_uni) - stops
+                # temperature sampling falling onto the unigram
+                # escape floor in thin contexts
+                st = self.model.config.support_thresh
+                if st > 0 and temps[i] > 0:
+                    ua = self.model.config.uni_alpha
+                    denom = self.stot[i] + ua * V
+                    pu = (self.sunig[i] + ua) / denom
+                    supp = torch.softmax(logits[i].float(), -1) \
+                        > st * pu
+                    if bool(supp.any()):
+                        lg[i] = torch.where(
+                            supp, lg[i],
+                            torch.full_like(lg[i], float("-inf")))
+                lg = torch.where(active[:, None], lg,
                              torch.full_like(lg, float("-inf")))
+            # counterfactual propensity capture: top-k of each active
+            # stream's final sampling distribution (post temp/masks)
+            if cf_topk > 0:
+                for i in range(n):
+                    if not bool(active[i]):
+                        continue
+                    tv, ti = torch.softmax(lg[i].float(), -1).topk(
+                        cf_topk)
+                    alts_out[i].append(list(zip(
+                        ti.tolist(), tv.tolist())))
 
             if all(t == 0 for t in temps):
                 nxt = lg.argmax(-1)
@@ -894,20 +1086,21 @@ class FluxStreamPool:
             pen_mask[self._ar[active], nxt[active]] = True
             obs_mask = active.clone()
             active = active & ~neweos
-            rw = self._rewards_b(nxt, slot, found, live_k, cok,
-                                 votes, kv, kvt, end)
-            self.observe_gpu(nxt, obs_mask, rw)
-        return outs
+            rw, awake = self._rewards_b(nxt, slot, found, live_k, cok,
+                                        votes, kv, kvt, end)
+            self.observe_gpu(nxt, obs_mask, rw, awake)
+        return outs, alts_out
 
     # ── CPU facade path ──────────────────────────────────────────────
 
     def _generate_cpu(self, prompt_ids, max_new, temps, top_ps,
                       top_ks, rep_pens, gens, stops, processors,
-                      tokenizer, eos_ids):
+                      tokenizer, eos_ids, cf_topk: int = 0):
         from forge.model.flux import FluxLM
         m = self.model
         n = len(prompt_ids)
         outs: list[list[int]] = [[] for _ in range(n)]
+        alts_out: list[list] = [[] for _ in range(n)]
         for i, ids in enumerate(prompt_ids):
             ctx = self._ctxs[i]
             for x in ids:
@@ -951,6 +1144,14 @@ class FluxStreamPool:
                         probs, nan=1.0 / probs.numel())
                     x = int(torch.multinomial(
                         probs, 1, generator=gens[i])[0])
+                if cf_topk > 0:
+                    # greedy streams never defined lg - record raw
+                    # softmax (degenerate pi_s ~ 1; skipped at credit)
+                    src = logits if temps[i] == 0 else lg
+                    pr = torch.softmax(src.float(), -1)
+                    tv, ti = pr.topk(cf_topk)
+                    alts_out[i].append(list(zip(
+                        ti.tolist(), tv.tolist())))
                 outs[i].append(x)
                 if x in eos_ids:
                     active[i] = False
@@ -960,4 +1161,4 @@ class FluxStreamPool:
                     if any(s in tail for s in stops[i]):
                         active[i] = False
                 FluxLM._learn_token(ctx, x)
-        return outs
+        return outs, alts_out

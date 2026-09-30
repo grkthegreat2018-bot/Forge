@@ -35,7 +35,7 @@ class _EOSModel:
     """Fake model whose logits always argmax to <|im_end|> (519)."""
 
     def __call__(self, ids, attention_mask=None, past_key_values=None,
-                 use_cache=False):
+                 use_cache=False, **_kw):
         B, L = ids.shape
         logits = torch.zeros(B, L, 600)
         logits[..., 519] = 10.0

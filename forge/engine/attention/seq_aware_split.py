@@ -246,8 +246,9 @@ class SequenceAwareSplitWrapper:
                 q = self.q_norm(q)
                 k = self.k_norm(k)
 
-            q = self.rope(q, offset=past_len, position_ids=position_ids)
-            k = self.rope(k, offset=past_len, position_ids=position_ids)
+            if self.rope is not None:  # use_rope=False (Jamba V2): skip
+                q = self.rope(q, offset=past_len, position_ids=position_ids)
+                k = self.rope(k, offset=past_len, position_ids=position_ids)
 
             preallocated_cache.append(layer_idx, k, v)
             k_cache = preallocated_cache.k_caches[layer_idx][:, :, :past_len + T]

@@ -207,15 +207,17 @@ class WavelengthPrunedAttention:
 
             if preallocated_cache is not None:
                 past_len = preallocated_cache.position
-                q = self.rope(q, offset=past_len, position_ids=position_ids)
-                k = self.rope(k, offset=past_len, position_ids=position_ids)
+                if self.rope is not None:  # use_rope=False (Jamba V2): skip
+                    q = self.rope(q, offset=past_len, position_ids=position_ids)
+                    k = self.rope(k, offset=past_len, position_ids=position_ids)
                 preallocated_cache.append(layer_idx, k, v)
                 k = preallocated_cache.k_caches[layer_idx][:, :, :past_len + T]
                 v = preallocated_cache.v_caches[layer_idx][:, :, :past_len + T]
             else:
                 past_len = past_key_value[0].shape[-2] if past_key_value is not None else 0
-                q = self.rope(q, offset=past_len, position_ids=position_ids)
-                k = self.rope(k, offset=past_len, position_ids=position_ids)
+                if self.rope is not None:
+                    q = self.rope(q, offset=past_len, position_ids=position_ids)
+                    k = self.rope(k, offset=past_len, position_ids=position_ids)
                 if past_key_value is not None:
                     k = torch.cat([past_key_value[0], k], dim=-2)
                     v = torch.cat([past_key_value[1], v], dim=-2)

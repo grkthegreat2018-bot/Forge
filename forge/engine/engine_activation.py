@@ -27,6 +27,7 @@ from .engine_common import (  # noqa: F401
     _checkpoint_metadata_cache,
     _checkpoint_size_cache,
     _ckpt_cache_lock,
+    _is_memory_model,
     _map_gguf_to_forge,
     _min_k_filter,
     _ScalingModelAdapter,
@@ -870,8 +871,8 @@ class _ActivationMixin:
         """
         if self.device.type != "cuda":
             return
-        # FluxLM has no KV cache — sparse memory, nothing to offload
-        if self.model.__class__.__name__ == "FluxLM":
+        # Memory models (FluxLM) have no KV cache — nothing to offload
+        if _is_memory_model(self.model):
             return
         try:
             free, _ = torch.cuda.mem_get_info(self.device)

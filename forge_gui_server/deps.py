@@ -128,6 +128,7 @@ class Services:
     # ── lifecycle ─────────────────────────────────────────────────────
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
+        self._install_pipe_reset_filter(loop)
         self.hub.bind_loop(loop)
         self.procs.bind_loop(loop)
         self.engine.bind_loop(loop)
@@ -135,7 +136,70 @@ class Services:
         self.gpu.start(self.hub)
         self.agent.set_harness_factory(
             lambda workspace=None: self.make_harness(workspace))
+        self._selfplay_task = asyncio.create_task(self._selfplay_watch())
         self._preload_engine()
+
+    async def _selfplay_watch(self) -> None:
+        """Tail self-play telemetry files -> push onto the event hub.
+
+        The self-play loop runs as a subprocess writing status.json /
+        events.jsonl (EventsReader already does offset-tracked tailing).
+        Republishing onto /ws gives the SelfPlay page sub-second updates
+        instead of 3s REST polling; the REST endpoint stays for initial
+        hydration.  Runs cheap: ~400ms cadence, stat+read of appended
+        bytes only; publishes nothing while a run is idle."""
+        loop = asyncio.get_running_loop()
+        last_status: dict | None = None
+        while True:
+            try:
+                new_events = await loop.run_in_executor(
+                    None, self.events.poll)
+                for ev in new_events:
+                    self.hub.publish("selfplay_event", ev)
+                status = await loop.run_in_executor(
+                    None, self.events.latest_status)
+                if status is not None and status != last_status:
+                    last_status = status
+                    self.hub.publish("selfplay_status", {
+                        "status": status,
+                        "heartbeat_age_s": self.events.heartbeat_age(),
+                        "heartbeat_stalled": self.events.heartbeat_stalled(),
+                    })
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("selfplay watch iteration failed",
+                             exc_info=True)
+            await asyncio.sleep(0.4)
+
+    @staticmethod
+    def _install_pipe_reset_filter(loop: asyncio.AbstractEventLoop) -> None:
+        """Suppress WinError 10054 noise from subprocess pipe teardown.
+
+        On Windows, when a ProcessService child exits (or is killed) the
+        remote end of the stdout pipe is already gone; the proactor's
+        ``_call_connection_lost`` then calls ``sock.shutdown`` on a dead
+        socket and the loop's default handler logs a ConnectionResetError
+        that looks like a crash but is harmless.  Swallow just that class
+        of callback error; everything else goes to the previous/default
+        handler unchanged."""
+        if os.name != "nt":
+            return
+        prev = loop.get_exception_handler()
+
+        def _handler(l: asyncio.AbstractEventLoop, context: dict) -> None:
+            exc = context.get("exception")
+            if isinstance(exc, (ConnectionResetError,
+                                ConnectionAbortedError, BrokenPipeError)):
+                logger.debug("subprocess pipe reset on child exit "
+                             "(harmless): %s", exc)
+                return
+            if prev is not None:
+                prev(l, context)
+            else:
+                l.default_exception_handler(context)
+
+        loop.set_exception_handler(_handler)
 
     def _preload_engine(self) -> None:
         """Kick off the resident model load in the background at startup.
@@ -163,6 +227,13 @@ class Services:
         self.engine.load(checkpoint=ckpt, config_name=cfg)
 
     async def stop(self) -> None:
+        t = getattr(self, "_selfplay_task", None)
+        if t is not None:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
         self.backups.stop()
         self.timers.shutdown()
         self.sub_agents.shutdown()

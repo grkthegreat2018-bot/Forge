@@ -5,9 +5,12 @@ Tails events.jsonl files under research/checkpoints/** and provides:
   - all_events(): bounded rolling buffer (deque maxlen ~2000)
   - latest_status(): cheap status.json read with mtime cache
 
-Robust to truncation/rotation (resets offset when file shrinks) and partial
-last lines (keeps trailing partial bytes until a newline arrives). Designed
-to be called every ~500ms from the UI thread without blocking.
+Robust to truncation/rotation: offset reset on shrink, ctime change
+(delete+recreate), and torn-read recovery for same-inode O_TRUNC rewrites
+that grow the file past the old offset (rewinds to the containing line
+rather than dropping the record). Partial last lines are held until a
+newline arrives. Designed to be called every ~500ms from the UI thread
+without blocking.
 """
 from __future__ import annotations
 
@@ -22,14 +25,23 @@ from .status_reader import project_root
 logger = logging.getLogger(__name__)
 
 
+def _is_json(raw: bytes) -> bool:
+    try:
+        json.loads(raw)
+        return True
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return False
+
+
 class _EventSource:
-    __slots__ = ("mtime", "offset", "partial", "path")
+    __slots__ = ("mtime", "offset", "partial", "path", "ctime")
 
     def __init__(self, path: Path):
         self.path = path
         self.offset = 0
         self.partial = b""
         self.mtime = 0.0
+        self.ctime = 0.0
 
 
 class EventsReader:
@@ -68,6 +80,7 @@ class EventsReader:
                         backfill = min(st.st_size, 50_000)
                         src.offset = st.st_size - backfill
                         src.mtime = st.st_mtime
+                        src.ctime = st.st_ctime
                         self._sources[key] = src
                     except OSError:
                         pass
@@ -86,35 +99,87 @@ class EventsReader:
             except OSError:
                 continue
             size = st.st_size
-            if size < src.offset:
-                # Truncated / rotated — restart from 0
+            if size < src.offset or (src.ctime and
+                                     st.st_ctime != src.ctime):
+                # Truncated, rotated, or delete+recreated — restart from 0
                 src.offset = 0
                 src.partial = b""
+                src.ctime = st.st_ctime
             if size == src.offset:
                 continue
-            try:
-                with open(src.path, "rb") as f:
-                    f.seek(src.offset)
-                    chunk = f.read(size - src.offset)
-                src.offset = size
-            except OSError as e:
-                logger.debug("events read failed %s: %s", src.path, e)
-                continue
 
-            data = src.partial + chunk
-            lines = data.split(b"\n")
-            src.partial = lines.pop()  # last element may be partial (no trailing \n)
-            for raw in lines:
-                if not raw.strip():
-                    continue
+            for _attempt in (0, 1):
+                read_from = src.offset
                 try:
-                    ev = json.loads(raw)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-                self._buffer.append(ev)
-                new_events.append(ev)
+                    with open(src.path, "rb") as f:
+                        f.seek(read_from)
+                        chunk = f.read(size - read_from)
+                    src.offset = size
+                except OSError as e:
+                    logger.debug("events read failed %s: %s", src.path, e)
+                    break
+
+                had_partial = bool(src.partial)
+                data = src.partial + chunk
+                lines = data.split(b"\n")
+                # last element may be partial (no trailing \n)
+                src.partial = lines.pop()
+
+                # Torn-read detection: a same-inode rewrite (O_TRUNC then
+                # write *larger* than the old offset) leaves offset parked
+                # mid-line — the first line is a JSON fragment. If read_from
+                # wasn't at a line boundary and the first line won't parse,
+                # rewind to the containing line's start and re-read once.
+                if (not _attempt and not had_partial and read_from > 0):
+                    first = next((l for l in lines if l.strip()), b"")
+                    if first and not _is_json(first) and \
+                            self._rewind_to_line_start(src, read_from):
+                        continue
+                for raw in lines:
+                    if not raw.strip():
+                        continue
+                    try:
+                        ev = json.loads(raw)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    self._buffer.append(ev)
+                    new_events.append(ev)
+                break
 
         return new_events
+
+    @staticmethod
+    def _rewind_to_line_start(src: _EventSource, read_from: int) -> bool:
+        """Rewind src.offset to the start of the line containing
+        ``read_from`` — only when read_from is provably mid-line.
+
+        The byte before a true line boundary is always ``\\n``; if it
+        isn't, the previous read started inside a record (same-inode
+        O_TRUNC rewrite larger than the old offset). Returns False when
+        read_from is already at a boundary (genuinely corrupt line —
+        skip it, don't rewind) or no boundary exists within the window.
+        """
+        try:
+            window = min(read_from, 8192)
+            with open(src.path, "rb") as f:
+                f.seek(read_from - window)
+                blob = f.read(window)
+        except OSError:
+            return False
+        if not blob or blob.endswith(b"\n"):
+            return False
+        idx = blob.rfind(b"\n")
+        if idx < 0:
+            # no boundary in the window — only safe to rewind to 0 when
+            # the window reached the file start (containing line begins
+            # at offset 0); a >8KB line mid-file is unrecoverable
+            if read_from - window > 0:
+                return False
+            src.offset = 0
+        else:
+            src.offset = read_from - window + idx + 1
+        src.partial = b""
+        return True
 
     def all_events(self) -> list[dict]:
         """Return the bounded rolling buffer (oldest-first, up to maxlen)."""

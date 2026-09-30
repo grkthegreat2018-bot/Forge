@@ -13,6 +13,7 @@ from .engine_common import (  # noqa: F401
     _checkpoint_metadata_cache,
     _checkpoint_size_cache,
     _ckpt_cache_lock,
+    _is_memory_model,
     _map_gguf_to_forge,
     _min_k_filter,
     _ScalingModelAdapter,
@@ -34,17 +35,35 @@ class _LifecycleMixin:
 
         After sleep, generation will fail until wake() is called.
         """
+        # Serialise against in-flight generation: swapping weights off the
+        # device mid-forward corrupts the active decode state.
+        with self._gen_lock:
+            self._sleep_impl(level)
+
+    def _sleep_impl(self, level: int) -> None:
         if level not in (1, 2):
             raise ConfigurationError(
                 f"sleep level must be 1 or 2, got {level}")
         if not self._awake and level <= self._sleep_level:
             return  # Already asleep
-        is_flux = self.model.__class__.__name__ == "FluxLM"
+        is_flux = _is_memory_model(self.model)
         if level == 2 and not self.checkpoint_path and not is_flux:
             raise RuntimeError("Sleep level 2 requires a checkpoint path")
 
         if level == 1:
-            self.model.to("cpu", non_blocking=True)
+            if is_flux:
+                # FluxLM tensors are plain attrs — nn.Module.to() is a
+                # no-op on them.  Dense readout offloads via to_device();
+                # cuda_primary GPU tables can't be torn down piecemeal,
+                # so they stay resident (level 2 frees via snapshot).
+                if getattr(self.model, "_gpu", False):
+                    self._log("Sleep level 1: cuda_primary tables stay "
+                              "resident — use sleep(level=2) to free "
+                              "VRAM", level="warn")
+                else:
+                    self.model.to_device("cpu")
+            else:
+                self.model.to("cpu", non_blocking=True)
             self._clear_cuda_cache()
             self._awake = False
             self._sleep_level = 1
@@ -88,11 +107,21 @@ class _LifecycleMixin:
         Level 1 wake: CPU→GPU copy (~2-3s). Preserves all strategies.
         Level 2 wake: Reload from checkpoint (~5-10s). Strategies must be re-activated.
         """
+        with self._gen_lock:
+            self._wake_impl()
+
+    def _wake_impl(self) -> None:
         if self._awake:
             return  # Already awake
 
         if self._sleep_level == 1:
-            self.model.to(self.device, non_blocking=True)
+            if _is_memory_model(self.model):
+                # cuda_primary tables never left; only the dense readout
+                # may need moving back.
+                if not getattr(self.model, "_gpu", False):
+                    self.model.to_device(str(self.device))
+            else:
+                self.model.to(self.device, non_blocking=True)
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
             self._awake = True

@@ -104,7 +104,7 @@ def _discover_domains() -> dict[str, type[BaseDomain]]:
         "synthetic", "quant", "kv_eviction", "sparse_attn", "hqe_kv", "kara",
         "attention_domains", "kv_domains", "quant_domains",
         "training_domains", "memory_domains", "decoding_domains", "arch_domains",
-        "random_task_domain",
+        "random_task_domain", "math_prog_domain",
     ]
     registry = {}
     for mod_name in modules:

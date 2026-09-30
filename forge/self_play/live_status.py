@@ -217,16 +217,20 @@ class LiveStatusWriter:
             self._write_status()
 
     def task_done(self, task_idx: int, task: str, success: bool,
-                  rounds_used: int = 0, best_quality: float = 0.0) -> None:
+                  rounds_used: int = 0, best_quality: float = 0.0,
+                  preview: str = "", expected: str = "") -> None:
         with self._lock:
             self._touch_progress()
             self._tasks_done += 1
             if success:
                 self._epoch_successes += 1
             self._task_done_ts.append(time.time())
+            # preview/expected let spectators see what the model actually
+            # produced vs the verified answer — the core spectation signal
             self._emit_locked("task_done", task_idx=task_idx, task=task[:120],
                               success=success, rounds_used=max(int(rounds_used), 0),
-                              best_quality=round(best_quality, 4))
+                              best_quality=round(best_quality, 4),
+                              preview=preview[:200], expected=expected[:80])
             self._refresh_rates()
             self._write_status(force=True)
 
