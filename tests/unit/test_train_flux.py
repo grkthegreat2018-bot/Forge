@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from train_flux import (  # noqa: E402
     _flatten_dict_entry,
+    _hf_row_text,
     _iter_texts,
     _resolve_topics,
     _topic_scorer,
@@ -112,3 +113,28 @@ class TestIterTextsFilter:
         p = tmp_path / "notes.txt"
         p.write_text("a recipe for chocolate cake", encoding="utf-8")
         assert len(list(_iter_texts(p, None, False, sc))) == 1
+
+
+class TestHfTemplate:
+    def test_qa_template(self):
+        row = {"question": "What is entropy?",
+               "answer": "a measure of disorder"}
+        out = _hf_row_text(row, "Q: {question} A: {answer}")
+        assert out == "Q: What is entropy? A: a measure of disorder"
+
+    def test_squad_style_answers_dict(self):
+        # squad rows: answers = {"text": [...], "answer_start": [...]}
+        row = {"question": "Capital of France?",
+               "answers": {"text": ["Paris"], "answer_start": [0]}}
+        out = _hf_row_text(row, "Q: {question} A: {answers}")
+        assert out == "Q: Capital of France? A: Paris"
+
+    def test_triviaqa_style_value_list(self):
+        row = {"question": "H2O is?",
+               "answer": {"value": "water", "aliases": ["w"]}}
+        out = _hf_row_text(row, "Q: {question} A: {answer}")
+        assert "water" in out
+
+    def test_missing_key_blank(self):
+        out = _hf_row_text({"a": "1"}, "{a}|{missing}")
+        assert out == "1|"

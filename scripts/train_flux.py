@@ -215,6 +215,30 @@ def _resolve_topics(arg: str) -> dict:
     return merged
 
 
+def _hf_scalar(v) -> str:
+    """HF row value -> printable text (lists join, dicts unwrap
+    common answer-ish keys)."""
+    if isinstance(v, dict):
+        for k in ("text", "value", "answer", "answers"):
+            if k in v:
+                return _hf_scalar(v[k])
+        return " | ".join(_hf_scalar(x) for x in v.values())
+    if isinstance(v, (list, tuple)):
+        return " | ".join(_hf_scalar(x) for x in v[:8])
+    return "" if v is None else str(v)
+
+
+def _hf_row_text(row: dict, template: str) -> str:
+    """Render a dataset row through a format template —
+    'Q: {question} A: {answer}' for QA-style datasets (squad,
+    trivia_qa, natural_questions); unknown keys -> ''."""
+    class _Map(dict):
+        def __missing__(self, k):
+            return ""
+    return template.format_map(
+        _Map({k: _hf_scalar(v) for k, v in row.items()}))
+
+
 def _iter_hf(args):
     """Stream rows from an HF dataset — yields (title, text) pairs."""
     from datasets import load_dataset  # late import — heavy dep
@@ -232,7 +256,8 @@ def _iter_hf(args):
     n_scan = n_skip = 0
     for row in ds:
         title = str(row.get("title") or "")
-        text = row.get(args.hf_field)
+        text = (_hf_row_text(row, args.hf_template)
+                if args.hf_template else row.get(args.hf_field))
         if not isinstance(text, str) or not text:
             continue
         n_scan += 1
@@ -343,6 +368,12 @@ def main() -> int:
     ap.add_argument("--hf-config", default=None)
     ap.add_argument("--hf-split", default="train")
     ap.add_argument("--hf-field", default="text")
+    ap.add_argument("--hf-template", default=None,
+                    help="row format template, e.g. "
+                         "'Q: {question} A: {answer}' — renders "
+                         "QA/chat-style datasets (squad, trivia_qa, "
+                         "natural_questions); lists join, dicts unwrap "
+                         "text/value keys; overrides --hf-field")
     ap.add_argument("--wiki-filter", action="store_true",
                     help="skip disambiguation/list/stub wiki pages")
     ap.add_argument("--topic", default=None,
@@ -361,6 +392,22 @@ def main() -> int:
     ap.add_argument("--gsyn", action="store_true",
                     help="enable the dense delta-rule gsyn channel — "
                          "ignored when --resume")
+    ap.add_argument("--gsyn-deep", action="store_true",
+                    help="enable the nonlinear TTT-MLP gsyn_deep "
+                         "channel (learned-function memory, separate "
+                         "from linear gsyn) — ignored when --resume")
+    ap.add_argument("--dnet", action="store_true",
+                    help="enable the iterated delta-rule dnet channel "
+                         "(stacked linear-attention memory, no KV "
+                         "cache) — ignored when --resume")
+    ap.add_argument("--gen-recall", type=float, default=0.0,
+                    help="recall->gen write floor: warm contexts write "
+                         "gen channels at max(surprise, GEN_RECALL) — "
+                         "ignored when --resume")
+    ap.add_argument("--gen-consolidate", action="store_true",
+                    help="run consolidate_gen() before the final "
+                         "snapshot — promotes on-ring order-cell "
+                         "evidence into gcell/gsyn/_Rl")
     args = ap.parse_args()
 
     if not args.corpus and not args.hf:
@@ -368,7 +415,9 @@ def main() -> int:
 
     cfg = FluxConfig(vocab_size=args.vocab, device=args.device,
                      cuda_primary=args.cuda_primary,
-                     gcell=args.gcell, gsyn=args.gsyn)
+                     gcell=args.gcell, gsyn=args.gsyn,
+                     gsyn_deep=args.gsyn_deep, dnet=args.dnet,
+                     gen_recall=args.gen_recall)
     model = (FluxLM.load(args.resume, device=args.device,
                          cuda_primary=args.cuda_primary or None)
              if args.resume else FluxLM(cfg))
@@ -406,6 +455,12 @@ def main() -> int:
                   f"({state['tokens'] / max(el, 1e-9):,.0f} tok/s)")
             if done:
                 break
+
+    if args.gen_consolidate:
+        # all_ring: per-pack soft_resets leave an empty current
+        # episode — cross-episode replay covers the whole corpus
+        rep_c = model.consolidate_gen(tag="gencon", all_ring=True)
+        print(f"  consolidate_gen: {rep_c}")
 
     out = model.snapshot(args.out)
     rep = model.memory_report()
