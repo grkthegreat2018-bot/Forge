@@ -17,9 +17,11 @@ import os
 _FLUX_DEBUG_NAN = bool(os.environ.get("FLUX_DEBUG_NAN"))
 
 from .helpers import (_HASH_P, _MASK64, _MIX1, _MIX2,
-                      _group_add, _group_totals,
-                      _load_teacher_embedding, _mix64, _s64,
-                      _scatter_sum)
+                      _MIX1U, _MIX2U,
+                      _group_add, _group_apply, _group_prefix,
+                      _group_sort, _group_totals,
+                      _load_teacher_embedding, _mix64, _mix64_np,
+                      _mix64_py, _s64, _scatter_sum)
 from .config import FluxConfig
 from .journal import FluxJournal
 from .tables import _GPUCellTables
@@ -84,9 +86,16 @@ class _LearnMixin:
                  if c.sleeping_experts else None)
         m_x = (rows_t == x.to(torch.int32))
         cnt_x = (rows_c.double() * m_x).sum(dim=1)
+        if c.ppm_escape_c:
+            # method-C: escape mass = distinct followers per cell
+            a_o = ((((rows_t >= 0) & (rows_t < V)) & hit[:, None])
+                   .sum(dim=1).double().clamp(min=1e-9))
+        else:
+            a_o = float(c.alpha)         # python float - no H2D copy
+                                         # inside the captured graph
         p_o = torch.where(hit & (tots > 0),
-                          (cnt_x + c.alpha * uni_x)
-                          / (tots.double() + c.alpha),
+                          (cnt_x + a_o * uni_x)
+                          / (tots.double() + a_o),
                           uni_x.expand(O))
         rw[:O] = torch.where(live_k, p_o, uni_x.expand(O))
         if awake is not None:
@@ -102,9 +111,12 @@ class _LearnMixin:
                 fe=found1[gt.row_epi].reshape(1), dk=dk_e)
             vt = votes.sum().double()
             vx = votes.index_select(0, x.reshape(1)).squeeze(0).double()
+            a_d = (votes.gt(0).sum().double().clamp(min=1e-9)
+                   if c.ppm_escape_c
+                   else float(c.alpha))   # python float - graph-safe
             rw[self._chix["deep"]] = torch.where(
-                vt > 0, (vx + c.alpha * uni_x)
-                / (vt + c.alpha), uni_x)
+                vt > 0, (vx + a_d * uni_x)
+                / (vt + a_d), uni_x)
             if awake is not None:
                 awake[self._chix["deep"]] = vt > 0
         a_x = self._A.index_select(0, x.reshape(1)).squeeze(0)
@@ -112,10 +124,10 @@ class _LearnMixin:
         cos_t = (a_x @ self._c) \
             / (a_x.norm() * cn + 1e-8)
         if c.calib_rewards:
-            # implied channel dist p(v) ∝ p_uni(v)·exp(β·cos_v) - the
+            # implied channel dist p(v) âˆ p_uni(v)Â·exp(Î²Â·cos_v) - the
             # additive-lift channels get a NORMALIZED reward, not the
             # raw sigmoid (~0.5-for-everything) that lets them hoard
-            # weight.  Z = Σ_v p_uni·exp(β·cos_v) costs one [V] matvec.
+            # weight.  Z = Î£_v p_uniÂ·exp(Î²Â·cos_v) costs one [V] matvec.
             uni_pv = (self._unig + c.uni_alpha) / denom
             chat = self._c / cn.clamp(min=1e-8)
             sims_t = (self._A @ chat) / self._An.clamp(min=1e-8)
@@ -152,27 +164,26 @@ class _LearnMixin:
         row = self._csem_rows.index_select(0, cs).squeeze(0).double()
         rn = row.norm()
         cos_c = (ax_c @ row) / (ax_c.norm() * rn + 1e-8)
+        r_ok = (rn > 1e-8) & torch.isfinite(rn)
         if c.calib_rewards:
             rhat = row / rn.clamp(min=1e-8)
             csims = (self._Ac @ rhat.float()) / self._Acn.clamp(min=1e-8)
             z_c = (uni_pv * torch.exp(c.csem_beta * csims)).sum()
             rw[self._chix["csem"]] = torch.where(
-                cf.squeeze() & cok & (rn > 1e-8),
+                cf.squeeze() & cok & r_ok,
                 (uni_x * torch.exp(c.csem_beta * cos_c)
                  / z_c.clamp(min=1e-12)).double(), uni_x)
         else:
             rw[self._chix["csem"]] = torch.where(
-                cf.squeeze() & cok & (rn > 1e-8),
+                cf.squeeze() & cok & r_ok,
                 torch.sigmoid(c.csem_beta * cos_c).double(), uni_x)
         if awake is not None:
-            awake[self._chix["csem"]] = cf.squeeze() & cok & (rn > 1e-8)
+            awake[self._chix["csem"]] = cf.squeeze() & cok & r_ok
         # knn reward: top-k fingerprint neighbours' successor vote on x.
         # fp_store reuses the query fingerprint for the bank write below
         # - compute it even when lite (the write still needs it)
         if c.use_knn:
-            qk = self._c @ self._Pcsem
-            qkn = qk.norm()
-            fp_store = (qk / (qkn + 1e-8)).to(self._knn_fp.dtype)
+            fp_store = self._knn_fp_ctx(end).to(self._knn_fp.dtype)
             if lite:
                 rw[self._chix["knn"]] = uni_x   # scan skipped -> uni
                 if awake is not None:
@@ -181,7 +192,11 @@ class _LearnMixin:
                 # live ring prefix only - bucketed so the slice stays
                 # shape-static inside the captured graph
                 kb = self._knn_rows() if knn_rows is None else knn_rows
-                kvt, kvx = self._knn_reward_dev(kb, fp_store, x)
+                kvt, kvx = self._knn_reward_dev(kb, fp_store, x,
+                                                end=end)
+                # weighted-vote cell: distinct-count has no cheap
+                # graph-safe analog (unique breaks capture) - keeps
+                # the configured alpha under ppm_escape_c
                 rw[self._chix["knn"]] = torch.where(
                     kvt > 0, (kvx + c.alpha * uni_x)
                     / (kvt + c.alpha), uni_x)
@@ -203,7 +218,7 @@ class _LearnMixin:
                 awake[self._chix["backoff"]] = False
         sv, epi_gate, knn_gate, gap = self._hedge_dev(
             end, x, rw, hit, tots, cnt_x, uni_x, jcur, live_k,
-            awake=awake)
+            awake=awake, rows_t=rows_t, rows_c=rows_c)
 
         # -- writes -------------------------------------------------
         # order rows (branchless; keys written only on new+valid)
@@ -343,7 +358,7 @@ class _LearnMixin:
         # the graph (cudaErrorStreamCaptureInvalidated)
         kb = self._knn_rows() if knn_rows is None else knn_rows
         if c.use_knn and kb > 0 and not lite:
-            kv, kvt = self._knn_votes_dev(kb)
+            kv, kvt = self._knn_votes_dev(kb, end=pos - 1)
         else:
             kv = torch.zeros(V, dtype=torch.float32, device=dev)
             kvt = torch.zeros((), dtype=torch.float32, device=dev)
@@ -713,6 +728,10 @@ class _LearnMixin:
                 crr.index_select(0, cs)))
         upd = prev_row * (1.0 - c.csem_lr * sv) \
             + ax_c.float() * (c.csem_lr * sv)
+        # fp16 range guard: _A magnitudes can exceed 65504; rescale
+        # direction-preservingly so .half() cannot produce inf rows
+        upd = torch.nan_to_num(upd)
+        upd = upd * (6e4 / upd.abs().max().clamp(min=6e4))
         self._csem_rows.index_copy_(
             0, cs,
             torch.where(cok, upd.half().unsqueeze(0),
@@ -751,7 +770,7 @@ class _LearnMixin:
 
     @torch._dynamo.disable
     def _hedge_dev(self, end, x, rw, hit, tots, cnt_x, uni_x, jcur,
-                   live_k, awake=None):
+                   live_k, awake=None, rows_t=None, rows_c=None):
         """Channel-tail rewards + AdaHedge + surprise/gate flags.
 
         dynamo-disabled: this block holds every scalar reduction in the
@@ -765,8 +784,8 @@ class _LearnMixin:
         age = (end - self._seen_g.index_select(
             0, x.reshape(1)).squeeze(0)).double()
         if c.calib_rewards:
-            # implied channel dist p(v) ∝ p_uni(v)·exp(±lift(v)):
-            # reward = p_uni(x)·exp(f_x)/Z, Z = 1 + Σ_v p_uni·(e^f−1)
+            # implied channel dist p(v) âˆ p_uni(v)Â·exp(Â±lift(v)):
+            # reward = p_uni(x)Â·exp(f_x)/Z, Z = 1 + Î£_v p_uniÂ·(e^fâˆ’1)
             # over the live span window (unseen tokens contribute 0).
             denom_v = (self._tot_g + c.uni_alpha * self.vocab_size)
             uni_pv = (self._unig + c.uni_alpha) / denom_v
@@ -815,6 +834,14 @@ class _LearnMixin:
             rw[i] = uni_x
             if awake is not None:
                 awake[i] = False
+        # fuzzy lift channels: real probs are computed in the eager and
+        # bulk paths; the fused per-token step abstains (neutral uni
+        # fallback preserves weight - their arbitration lives where
+        # bulk training happens)
+        for i in self._fidx:
+            rw[i] = uni_x
+            if awake is not None:
+                awake[i] = False
         # backoff reward: prob of x under the longest evidenced order
         if c.use_backoff:
             ok_bo = hit & (tots >= c.backoff_min_tot)
@@ -829,10 +856,16 @@ class _LearnMixin:
             cnt_k = cnt_x.index_select(
                 0, kstar.reshape(1)).squeeze(0)
             conf = tot_k / (tot_k + c.backoff_kappa)
+            if c.ppm_escape_c:
+                rk = rows_t.index_select(0, kstar.reshape(1)).squeeze(0)
+                a_bk = ((rk >= 0) & (rk < self.vocab_size)).sum() \
+                    .double().clamp(min=1e-9)
+            else:
+                a_bk = float(c.alpha)    # python float - graph-safe
             rw[self._chix["backoff"]] = torch.where(
                 bo_hit,
-                conf * (cnt_k + c.alpha * uni_x)
-                / (tot_k + c.alpha), uni_x)
+                conf * (cnt_k + a_bk * uni_x)
+                / (tot_k + a_bk), uni_x)
         else:
             rw[self._chix["backoff"]] = uni_x
         # hedge update on device weights (AdaHedge: lr adapts to the
@@ -842,7 +875,22 @@ class _LearnMixin:
             # warm = some order cell held evidence.  Same probe bits
             # the order channels already computed; stashed on
             # _reg_used_g because _logits_dev overwrites _regime_g.
-            r_now = (hit & (tots > c.thin_tot)).any().long()
+            # evidence_share>0: warmth requires concentrated mass -
+            # must match the predict-side gate or rewards route to
+            # the wrong regime row.
+            if rows_c is not None and (c.thin_share > 0
+                                       or c.evidence_share > 0):
+                sh_l = rows_c.max(dim=1).values \
+                    / tots.clamp(min=1e-9)
+                if c.thin_share > 0:
+                    r_now = (hit & (tots > c.thin_tot)
+                             & (sh_l >= c.thin_share)).any().long()
+                else:
+                    r_now = (hit & (tots * sh_l.clamp(min=0.0)
+                                   ** c.evidence_share
+                                   > c.thin_tot)).any().long()
+            else:
+                r_now = (hit & (tots > c.thin_tot)).any().long()
             self._reg_used_g.copy_(r_now)
             r1 = r_now.view(1)
             wrow = self._wgR.index_select(0, r1).squeeze(0)
@@ -873,6 +921,8 @@ class _LearnMixin:
         else:
             pmix = (wrow * rw).sum()
         if c.adahedge:
+            if c.hedge_discount < 1.0:
+                hmx.mul_(c.hedge_discount)
             hmx.add_(rw.max() - pmix)
             eta = torch.minimum(
                 self._const_eta_max,
@@ -882,14 +932,23 @@ class _LearnMixin:
         wrow.mul_(torch.exp(eta * (rw - pmix)))
         wrow.clamp_(c.hedge_min, c.hedge_max)
         wrow.div_(wrow.sum())
+        if c.hedge_share > 0:
+            # fixed-share diffusion: uniform-share floor so a collapsed
+            # channel can re-track after a regime switch
+            wrow.mul_(1.0 - c.hedge_share).add_(
+                c.hedge_share / len(self.channels))
         if c.cond_hedge:
             self._wgR.index_copy_(0, r1, wrow.unsqueeze(0))
             self._hmxRg.index_copy_(0, r1, hmx.reshape(1))
 
         # surprise: magnitude of this token's writes (1 - p_mix)
-        sv = ((torch.clamp(self._const_1 - pmix,
-                           min=c.surprise_floor)
-               if c.surprise_gate else self._const_1)).float()
+        # nan_to_num: a NaN pmix (poisoned channel) -> maximal, never
+        # a NaN write strength
+        sv = torch.nan_to_num(
+            ((torch.clamp(self._const_1 - pmix,
+                          min=c.surprise_floor)
+              if c.surprise_gate else self._const_1)).float(),
+            nan=1.0)
 
         # write gate: epi entries only for thin contexts or surprises,
         # knn rows only for surprises - branchless folds (dok1 mask +
@@ -968,7 +1027,8 @@ class _LearnMixin:
             if self.config.gcell:
                 gc_pre = self._gcell_codes_from_feats(
                     gxf[None])[0]
-            if self.config.gsyn:
+            if (self.config.gsyn or self.config.gsyn_deep
+                    or self.config.dnet):
                 gq_k = self._gsyn_keys(gxf)
         self._run_dev_step()
         bi = self._bout.tolist()                     # the ONE sync
@@ -1039,12 +1099,15 @@ class _LearnMixin:
         # host tables/keys mean one pass serves the whole row
         row_t = None
         gcw = gcr = gkw = gkr = None
-        if c.gcell or c.gsyn:
+        gcpre = None
+        if (c.gcell or c.gsyn or c.gsyn_deep or c.dnet
+                or c.r_live):
             row_t = torch.as_tensor(row, dtype=torch.int64,
                                     device=dev)
             gcpre = self._cprev_seq(row_t)          # [n+1, d]
             gc2pre = (self._c2prev_seq(row_t)
                       if c.bigram_sketch else None)
+        if c.gcell or c.gsyn or c.gsyn_deep or c.dnet:
             # write feats: pre-token context (rows 0..n-1);
             # read feats: post-token context (rows 1..n)
             f_w = self._gcell_feats_bulk(
@@ -1056,7 +1119,7 @@ class _LearnMixin:
             if c.gcell:
                 gcw = self._gcell_codes_from_feats(f_w)
                 gcr = self._gcell_codes_from_feats(f_r)
-            if c.gsyn:
+            if c.gsyn or c.gsyn_deep or c.dnet:
                 gkw = self._gsyn_keys(f_w)
                 gkr = self._gsyn_keys(f_r)
         for i, x in enumerate(row):
@@ -1074,13 +1137,39 @@ class _LearnMixin:
             bev_fs = bev_f_seq.cpu().numpy()
         else:
             bev_is = bev_fs = None
+        # live generalizer: one batched probe over every position's
+        # order keys (post-row cells - the transferred distribution
+        # includes the row's own writes, the consolidate_gen-class
+        # approximation) - folded into the row's single readback
+        gl_rt = gl_rc = gl_tot = gl_found = None
+        if c.gen_live > 0 and not self._predict_only:
+            O = self._gt.O
+            kk = torch.tensor(
+                [[bi[oi] for oi in range(O)] for bi in bis],
+                dtype=torch.int64, device=dev)
+            pk = _mix64(
+                kk * _MIX1 + self._gt._salt[:O][None, :])
+            rows = self._gt._ordx[None, :].expand(T, O).reshape(-1)
+            slot_g, found_g = self._gt.probe_fixed(
+                pk.reshape(-1), rows=rows)
+            gl_rt = self._gt.ttoks[rows, slot_g].cpu().numpy()
+            gl_rc = self._gt.tcnt[rows, slot_g].cpu().numpy()
+            gl_tot = self._gt.ttot[rows, slot_g].cpu().numpy()
+            gl_found = found_g.cpu().numpy()
         for i, x in enumerate(row):
+            glc = (None if gl_rt is None else (
+                gl_rt[i * self._gt.O:(i + 1) * self._gt.O],
+                gl_rc[i * self._gt.O:(i + 1) * self._gt.O],
+                gl_tot[i * self._gt.O:(i + 1) * self._gt.O],
+                gl_found[i * self._gt.O:(i + 1) * self._gt.O]))
             self._bookkeep_fused(
                 int(x), bis[i], (jcur0 + i) % c.vec_delta_cap,
                 None if bev_is is None else bev_is[i],
                 None if bev_fs is None else bev_fs[i],
                 gc_code=None if gcw is None else int(gcw[i]),
-                gsyn_k=None if gkw is None else gkw[i])
+                gsyn_k=None if gkw is None else gkw[i],
+                rl_ctx=None if gcpre is None else gcpre[i],
+                gl_cells=glc)
             # sparse lift inside the replay loop so step i sees only
             # writes up to i inclusive - CPU per-token timing parity
             self._apply_sparse_lift_dev(
@@ -1092,7 +1181,9 @@ class _LearnMixin:
     def _bookkeep_fused(self, x: int, bi, jcur: int,
                         bev_i=None, bev_f=None,
                         gc_code: int | None = None,
-                        gsyn_k: torch.Tensor | None = None) -> None:
+                        gsyn_k: torch.Tensor | None = None,
+                        rl_ctx: torch.Tensor | None = None,
+                        gl_cells: tuple | None = None) -> None:
         """Host mirrors + journal for one completed ``_step_dev``.
 
         ``bi`` is the step's ``_bout`` row (host list); ``bev_i``/
@@ -1225,6 +1316,10 @@ class _LearnMixin:
                 if key is None:
                     continue
                 tab = self._ptabs[taps]
+                if self._bloom_ready() and key not in tab \
+                        and not self._bloom_touch(
+                            self._bloom_salt(self._BFAM_SPARSE, j), key):
+                    continue
                 cell = tab.get(key)
                 if cell is None:
                     cell = tab[key] = {}
@@ -1241,6 +1336,10 @@ class _LearnMixin:
                 if key is None:
                     continue
                 tab = self._gtabs[k]
+                if self._bloom_ready() and key not in tab \
+                        and not self._bloom_touch(
+                            self._bloom_salt(self._BFAM_CLASS, k), key):
+                    continue
                 cell = tab.get(key)
                 if cell is None:
                     cell = tab[key] = {}
@@ -1257,6 +1356,10 @@ class _LearnMixin:
                 if key is None:
                     continue
                 tab = self._wtabs[j]
+                if self._bloom_ready() and key not in tab \
+                        and not self._bloom_touch(
+                            self._bloom_salt(self._BFAM_WORD, j), key):
+                    continue
                 cell = tab.get(key)
                 if cell is None:
                     cell = tab[key] = {}
@@ -1273,6 +1376,10 @@ class _LearnMixin:
                 if key is None:
                     continue
                 tab = self._htabs[j]
+                if self._bloom_ready() and key not in tab \
+                        and not self._bloom_touch(
+                            self._bloom_salt(self._BFAM_HYBRID, j), key):
+                    continue
                 cell = tab.get(key)
                 if cell is None:
                     cell = tab[key] = {}
@@ -1285,10 +1392,75 @@ class _LearnMixin:
         # learned-key cell channel: gc_code is the SimHash code of the
         # PRE-x context (caller computes it - device state is already
         # post-update by bookkeep time)
+        # recall->gen floor: the device thin flag is 1 when an order
+        # cell held evidence at this context - recall-proven tokens
+        # get the gen_recall write floor instead of their (small)
+        # surprise scale
+        s_gen = (max(s_h, c.gen_recall)
+                 if c.gen_recall > 0 and bi[self._boff_thin]
+                 else s_h)
         if gc_code is not None and c.gcell and not self._predict_only:
-            self._gcell_write(gc_code, x, s_h)
+            self._gcell_write(gc_code, x, s_gen)
         if gsyn_k is not None and c.gsyn and not self._predict_only:
-            self._gsyn_write(gsyn_k, x, s_h)
+            self._gsyn_write(gsyn_k, x, s_gen)
+        if gsyn_k is not None and c.gsyn_deep \
+                and not self._predict_only:
+            # deep memory rides the same context key/surprise as the
+            # linear channel - separate weights, separate undo scope
+            self._gsd_write(gsyn_k, x, s_gen)
+        if gsyn_k is not None and c.dnet and not self._predict_only:
+            self._dnet_step(gsyn_k, x, s_gen)
+        if c.r_live and not self._predict_only:
+            # the device step already advanced _c - rl_ctx carries the
+            # pre-x context for row replays (_fused_seq); the single-
+            # step path recovers it by inverting the topic EMA
+            xr = (x if torch.is_tensor(x)
+                  else torch.tensor(x)).reshape(1).long().to(self._dev)
+            if rl_ctx is not None:
+                c_pre = rl_ctx
+            else:
+                lam = float(c.topic_decay)
+                rold = self._R.index_select(0, xr).squeeze(0).float()
+                c_pre = ((self._c - rold * (1.0 - lam)) / lam
+                         if abs(lam) > 1e-6 else self._c)
+            self._rl_write(xr, c_pre, s_gen)
+        # live generalizer "gen head" (R68): the order cells this
+        # step's keys address now hold the post-write state (the
+        # realized token's count included); their recalled successor
+        # distribution transfers into the gen channels.  ``gl_cells``
+        # carries the batched probe rows on the _fused_seq path;
+        # single-step callers take the small re-probe branch.
+        if c.gen_live > 0 and not self._predict_only \
+                and (gc_code is not None or gsyn_k is not None
+                     or c.r_live):
+            gl_min = (c.gen_live_min_tot
+                      if c.gen_live_min_tot > 0 else c.thin_tot)
+            if gl_cells is not None:
+                rt_h, rc_h, tot_h, found_h = gl_cells
+            else:
+                gt = self._gt
+                kt = torch.tensor(keys, dtype=torch.int64,
+                                  device=self._dev)
+                pk = _mix64(kt * _MIX1 + gt._salt[:gt.O])
+                slot, found = gt.probe_fixed(pk, rows=gt._ordx)
+                rt_h = gt.ttoks[gt._ordx, slot].cpu().numpy()
+                rc_h = gt.tcnt[gt._ordx, slot].cpu().numpy()
+                tot_h = gt.ttot[gt._ordx, slot].cpu().numpy()
+                found_h = found.cpu().numpy()
+            votes: dict[int, float] = {}
+            conf = 0.0
+            for oi in range(len(found_h)):
+                if not found_h[oi] or tot_h[oi] <= gl_min:
+                    continue
+                conf = max(conf,
+                           tot_h[oi] / (tot_h[oi] + c.backoff_kappa))
+                for t, ct in zip(rt_h[oi], rc_h[oi]):
+                    if t >= 0 and ct > 0:
+                        votes[int(t)] = votes.get(int(t), 0.0) \
+                            + float(ct)
+            self._genlive_write(
+                votes, conf, gc_code, gsyn_k,
+                c_pre if c.r_live else None)
         self.journal.append(("a", x, jcur))
         if cs_ev:
             r_ = bev_i[self._gt.row_csem]
@@ -1359,7 +1531,9 @@ class _LearnMixin:
         denom = self._total + c.uni_alpha * self.vocab_size
 
         # Hedge update on channel weights (reward = channel prob of x)
-        skip = {"deep", "topic", "sem", "knn"} if fast else ()
+        skip = ({"deep", "topic", "sem", "knn",
+                 "gcell", "gsyn", "gsd", "dnet"}
+                if fast else ())
         probs = np.empty(len(self.channels))
         awake = np.ones(len(self.channels), dtype=bool)
         for i, ch in enumerate(self.channels):
@@ -1394,6 +1568,8 @@ class _LearnMixin:
             p_mix = float((wv * rewards).sum())
         # AdaHedge: lr adapts to accumulated mixability gap
         if c.adahedge:
+            if c.hedge_discount < 1.0:
+                hmx_v *= c.hedge_discount
             hmx_v += float(rewards.max() - p_mix)
             eta = min(c.hedge_eta_max,
                       math.log(len(self.channels))
@@ -1412,12 +1588,22 @@ class _LearnMixin:
         wv *= factors
         np.clip(wv, c.hedge_min, c.hedge_max, out=wv)
         wv /= wv.sum()
+        if c.hedge_share > 0:
+            # fixed-share diffusion: uniform-share floor so a collapsed
+            # channel can re-track after a regime switch
+            wv *= (1.0 - c.hedge_share)
+            wv += c.hedge_share / len(self.channels)
         if c.cond_hedge:
             self._w[:] = wv      # keep the active-row mirror current
 
         # surprise s: magnitude of this token's writes (Titans-style)
+        # non-finite p_mix (a poisoned channel logit) -> maximally
+        # surprising (R60 convention); a NaN s must never reach the
+        # _Rl/gsyn write paths - it would poison state permanently
         s = (max(1.0 - p_mix, c.surprise_floor)
              if c.surprise_gate else 1.0)
+        if not math.isfinite(s):
+            s = 1.0
 
         # write gate: skip redundant episodic/knn writes when the order
         # tables already cover this context (pre-write cell mass) and
@@ -1447,12 +1633,29 @@ class _LearnMixin:
         self._log_uni_num[x] = math.log(self._uni[x] + c.uni_alpha)
         self.journal.append(("u", x))
 
+        # recall->gen floor, PRE-write: an order cell that already
+        # covers this context (tot > thin_tot) means recall predicted
+        # the token before we observed it - gen channels learn the
+        # proven association at the gen_recall floor rather than the
+        # (small) surprise scale.  Pre-write matches the device thin
+        # flag, which is computed during the predict phase.
+        s_gen = s
+        if c.gen_recall > 0 and keys:
+            tt = c.thin_tot
+            if any(self._totals[k].get(key, 0.0) > tt
+                   for k, key in keys.items()):
+                s_gen = max(s, c.gen_recall)
+
         # order tables (surprise-scaled fractional counts) - skipped by
         # predict-only streams: their updates travel in the FluxPacket
         # instead and the single learner applies selected ones post-hoc
         if not self._predict_only:
             for k, key in keys.items():
                 tab = self._tables[k]
+                if self._bloom_ready() and key not in tab \
+                        and not self._bloom_touch(
+                            self._bloom_salt(self._BFAM_ORDER, k), key):
+                    continue
                 cell = tab.get(key)
                 if cell is None:
                     cell = tab[key] = {}
@@ -1469,6 +1672,10 @@ class _LearnMixin:
                 if key is None:
                     continue
                 tab = self._ptabs[taps]
+                if self._bloom_ready() and key not in tab \
+                        and not self._bloom_touch(
+                            self._bloom_salt(self._BFAM_SPARSE, j), key):
+                    continue
                 cell = tab.get(key)
                 if cell is None:
                     cell = tab[key] = {}
@@ -1483,6 +1690,10 @@ class _LearnMixin:
                 if key is None:
                     continue
                 tab = self._gtabs[k]
+                if self._bloom_ready() and key not in tab \
+                        and not self._bloom_touch(
+                            self._bloom_salt(self._BFAM_CLASS, k), key):
+                    continue
                 cell = tab.get(key)
                 if cell is None:
                     cell = tab[key] = {}
@@ -1497,6 +1708,10 @@ class _LearnMixin:
                 if key is None:
                     continue
                 tab = self._wtabs[j]
+                if self._bloom_ready() and key not in tab \
+                        and not self._bloom_touch(
+                            self._bloom_salt(self._BFAM_WORD, j), key):
+                    continue
                 cell = tab.get(key)
                 if cell is None:
                     cell = tab[key] = {}
@@ -1511,6 +1726,10 @@ class _LearnMixin:
                 if key is None:
                     continue
                 tab = self._htabs[j]
+                if self._bloom_ready() and key not in tab \
+                        and not self._bloom_touch(
+                            self._bloom_salt(self._BFAM_HYBRID, j), key):
+                    continue
                 cell = tab.get(key)
                 if cell is None:
                     cell = tab[key] = {}
@@ -1522,14 +1741,49 @@ class _LearnMixin:
                     self._decay_table(tab, tots)
             # learned-key cell channel: SimHash of the PRE-x context
             # (_c/_c2 still pre-update - _push runs at the end)
-            if c.gcell or c.gsyn:
-                # one feature build feeds both gen channels
+            code_e = gk_e = None
+            if c.gcell or c.gsyn or c.gsyn_deep or c.dnet:
+                # one feature build feeds all four gen channels
                 fx = self._gcell_feats(self._c, self._c2, end)
                 if c.gcell:
-                    self._gcell_write(
-                        self._gcell_code_from_feats(fx), x, s)
+                    code_e = self._gcell_code_from_feats(fx)
+                    self._gcell_write(code_e, x, s_gen)
+                gk_e = (self._gsyn_keys(fx)
+                        if (c.gsyn or c.gsyn_deep or c.dnet) else None)
                 if c.gsyn:
-                    self._gsyn_write(self._gsyn_keys(fx), x, s)
+                    self._gsyn_write(gk_e, x, s_gen)
+                if c.gsyn_deep:
+                    self._gsd_write(gk_e, x, s_gen)
+                if c.dnet:
+                    self._dnet_step(gk_e, x, s_gen)
+            if c.r_live:
+                # _c still holds the pre-x context (_push runs last):
+                # the token's feature row drifts toward where it was
+                # seen - co-occurrence embedding written by the stream
+                self._rl_write(x, self._c, s_gen)
+            # live generalizer "gen head": the order cells' recalled
+            # successor distribution (post-write - includes this
+            # token) transfers into the gen channels at gen_live*conf.
+            # Thin contexts contribute nothing: a first-seen cell's
+            # post-write mass ~ s stays below min_tot.
+            if c.gen_live > 0 and keys:
+                gl_min = (c.gen_live_min_tot
+                          if c.gen_live_min_tot > 0 else c.thin_tot)
+                votes: dict[int, float] = {}
+                conf = 0.0
+                for k, key in keys.items():
+                    cell = self._tables[k].get(key)
+                    if not cell:
+                        continue
+                    tot = self._totals[k].get(key, 0.0)
+                    if tot <= gl_min:
+                        continue
+                    conf = max(conf, tot / (tot + c.backoff_kappa))
+                    for t, ct in cell.items():
+                        votes[t] = votes.get(t, 0.0) + ct
+                self._genlive_write(
+                    votes, conf, code_e, gk_e,
+                    self._c if c.r_live else None)
 
         # topic row: delta-rule write - subtract the current readout
         # along the context direction before committing (error-corrected
@@ -1622,6 +1876,7 @@ class _LearnMixin:
         # block's own "bc" header (silent un-revertable writes).
         # _undo_block replays blk["sub"] in reverse via _undo_entry.
         self._blk_journal = blk["sub"] = []
+        self._blk_active = blk
 
         # -- ring + prefix hashes (closed form, mod 2^64 via int64 wrap)
         # ring/hash writes are chunked to <=cap positions so each
@@ -1689,6 +1944,39 @@ class _LearnMixin:
         rows_f = self._gt._ordx[:, None].expand(O, n).reshape(-1)
         slot_f, found_f = self._gt.probe_fixed(
             pk_all.reshape(-1), rows=rows_f)
+        # bloom doorkeeper: first-sighting context keys set counter
+        # bits instead of materializing rows - hapax-heavy streams
+        # would otherwise flood the tables with cells that never fire
+        # again.  write_o is the WRITE mask only: found_f/p_o/rewards
+        # still see true pre-block state.
+        write_o = valid_o
+        if self._bloom_ready():
+            pf = pk_all.reshape(-1)
+            vf = valid_o.reshape(-1)
+            miss = vf & ~found_f
+            BM = self._bloom_g.numel()
+            b1 = pf.remainder(BM)
+            b2 = _mix64(pf * _MIX2 + _MIX1).remainder(BM)
+            thr = c.bloom_admit - 1
+            hit = (self._bloom_g.index_select(0, b1) >= thr) \
+                & (self._bloom_g.index_select(0, b2) >= thr)
+            # intra-block repeats: a key's 2nd+ sighting in this same
+            # block promotes - the first sighting just set its bits
+            ordb = torch.argsort(pf)
+            pfs = pf[ordb]
+            dup = torch.zeros_like(miss)
+            dup[ordb[1:]] = pfs[1:] == pfs[:-1]
+            admit = found_f | hit | (miss & dup)
+            drop = vf & ~admit
+            # count every miss sighting (saturating int16 counters)
+            midx = torch.nonzero(miss).squeeze(1)
+            if midx.numel():
+                ones = torch.ones(midx.numel(), dtype=torch.int16,
+                                  device=dev)
+                self._bloom_g.index_add_(0, b1[midx], ones)
+                self._bloom_g.index_add_(0, b2[midx], ones)
+                self._bloom_g.clamp_(0, 32767)
+            write_o = (vf & ~drop).reshape(O, n)
         denom0 = float(self._total) + c.uni_alpha * V
         uni_pre = (self._unig[ids_t] + c.uni_alpha) / denom0  # [n]
         uni_rep = uni_pre[None, :].expand(O, n).reshape(-1)
@@ -1698,19 +1986,22 @@ class _LearnMixin:
         tots_f = self._gt.ttot[rows_f, slot_f]
         cnt_x = (rc_f * (rt_f == ids_f[:, None].to(torch.int32))
                  ).sum(dim=1)                                     # [On]
+        if c.ppm_escape_c:
+            a_f = (((rt_f >= 0) & (rt_f < V)) & found_f[:, None]) \
+                .sum(dim=1).clamp(min=1e-9)                       # [On]
+        else:
+            a_f = float(c.alpha)           # python float - H2D-free
         p_o = torch.where(
             found_f & (tots_f > 0),
-            (cnt_x + c.alpha * uni_rep) / (tots_f + c.alpha),
+            (cnt_x + a_f * uni_rep) / (tots_f + a_f),
             uni_rep)
         # per-token surprise: 1 - p_mix under the (constant-w) chunk
         # mixture - order probs are exact; non-order channels fall back
         # to the unigram prior, same as the bulk reward approximation
         w_o = torch.from_numpy(
             self._w[:O].astype(np.float32)).to(dev)[:, None]
-        awake_o = None
-        if c.sleeping_experts:
-            awake_o = valid_o & found_f.reshape(O, n) \
-                & (tots_f.reshape(O, n) > 0)           # [O,n]
+        awake_o = valid_o & found_f.reshape(O, n) \
+            & (tots_f.reshape(O, n) > 0)               # [O,n]
         if c.sleeping_experts == 2:
             # renormalized pmix: asleep channels abstain entirely, so
             # the mixture prob comes only from channels that responded.
@@ -1752,6 +2043,48 @@ class _LearnMixin:
         # a NaN mixture (dead tables, fp blowup) must not propagate
         # into every downstream write - treat as fully surprising
         s_v = torch.nan_to_num(s_v, nan=1.0)
+        # in-block recurrence correction for the WRITE deltas: the
+        # eager path's surprise decays live as a repeated (context,
+        # token) sighting lands in the cell, so counts grow
+        # sublinearly (~log n).  A flat pre-block s_v writes ~full
+        # deltas on every in-block repeat -> counts grow linearly in
+        # frequency and a hot low-order cell swamps the deeper orders
+        # that carry the actual answer.  Exclusive group prefix sums
+        # give each position the mass earlier same-block positions
+        # already wrote under its context (m_ctx) and its context+
+        # token pair (m_pair); p_post recomputes the mixture under
+        # that evidence.  Doorkeeper-dropped positions contribute no
+        # mass (write_o mask).
+        sv_flat = torch.where(
+            write_o.reshape(-1),
+            s_v[None, :].expand(O, n).reshape(-1),
+            torch.zeros((), device=dev))
+        m_ctx = _group_prefix(pk_all.reshape(-1), sv_flat)
+        m_pair = _group_prefix(pk_all.reshape(-1), sv_flat, ids_f)
+        tot_p = tots_f + m_ctx
+        cnt_p = cnt_x + m_pair
+        p_post = torch.where(
+            tot_p > 0,
+            (cnt_p + a_f * uni_rep) / (tot_p + a_f),
+            uni_rep)
+        # effective surprise for WRITE deltas: awake-renormalized
+        # mixture - a channel that fires with real evidence votes at
+        # full strength regardless of the (frozen within-block) hedge
+        # weight, matching what the converged sequential mixture would
+        # predict.  Without this, uniform early weights keep every
+        # position maximally surprising -> gen matrices (gsyn/dnet)
+        # blow up to 300x their eager norms.
+        awake_p = awake_o.reshape(-1) | (
+            valid_o.reshape(-1) & (m_ctx > 0))
+        _num = (w_o * p_post.reshape(O, n)
+                * awake_p.reshape(O, n)).sum(0)
+        _den = (w_o * awake_p.reshape(O, n)).sum(0)
+        pmix_e = torch.where(_den > 1e-9,
+                             _num / _den.clamp(min=1e-9),
+                             uni_pre)
+        s_eff = torch.clamp(1.0 - pmix_e, min=c.surprise_floor) \
+            if c.surprise_gate else s_v
+        s_eff = torch.nan_to_num(s_eff, nan=1.0)
         # per-position order rewards kept for the chunked hedge update
         # below (weights evolve within the block, not one flat update).
         # sleeping experts: asleep positions take pmix (neutral reward)
@@ -1774,18 +2107,55 @@ class _LearnMixin:
             if gp.numel():
                 self._gaps.extend(gp.cpu().tolist())
 
-        # ONE batched write across all orders, surprise-scaled
-        # (distinct-column disambiguation makes it equivalent to
-        # sequential adds)
-        d_all = s_v[None, :].expand(O, n)
+        # ONE batched write across all orders, surprise-scaled with
+        # the in-block-corrected deltas (distinct-column
+        # disambiguation makes it equivalent to sequential adds)
+        d_all = s_eff[None, :].expand(O, n)
         ins_rows, ev_snap, col_snap = self._gt.add_multi(
-            kk_all, ids_t[None, :].expand(O, n), d_all, valid_o)
+            kk_all, ids_t[None, :].expand(O, n), d_all, write_o)
+        # reward fix-up: the pre-block probe misses every context on a
+        # fresh first pass, which left order channels at uniform reward
+        # for entire corpora - hedge could never differentiate.  Re-
+        # probe the POST-write table: a key that recurred within the
+        # block now sees the real cell.  Each position's own delta is
+        # subtracted back out (self-leak); later same-key writes stay
+        # in - a mild forward leak vs sequential semantics, bounded.
+        slot2, found2 = self._gt.probe_fixed(
+            pk_all.reshape(-1), rows=rows_f)
+        new_cell = ~found_f & found2
+        if bool(new_cell.any()):
+            wrote = write_o.reshape(-1)
+            rt2 = self._gt.ttoks[rows_f, slot2]
+            rc2 = self._gt.tcnt[rows_f, slot2]
+            tot2 = self._gt.ttot[rows_f, slot2]
+            cnt2 = (rc2 * (rt2 == ids_f[:, None].to(torch.int32))
+                    ).sum(dim=1)
+            d_flat = s_eff[None, :].expand(O, n).reshape(-1)
+            # writers remove their own delta (self-leak); positions
+            # gated by the doorkeeper read the sibling-built cell clean
+            cnt_eff = torch.where(wrote, (cnt2 - d_flat).clamp(min=0),
+                                  cnt2)
+            tot_eff = torch.where(wrote, (tot2 - d_flat).clamp(min=0),
+                                  tot2)
+            p_post = (cnt_eff + a_f * uni_rep) / (tot_eff + a_f)
+            p_eff = torch.where(new_cell, p_post, p_o)
+            if c.sleeping_experts:
+                # under sequential ingest the cell would exist by this
+                # position - the channel was effectively awake
+                awake_eff = awake_o.reshape(-1) | (
+                    valid_o.reshape(-1) & new_cell & (tot_eff > 0))
+                rw_o = torch.where(awake_eff, p_eff, pmix_o
+                                   ).double().reshape(O, n)
+            else:
+                rw_o = torch.where(valid_o.reshape(-1), p_eff,
+                                   uni_rep).double().reshape(O, n)
         # stash the full key/valid/delta matrices - undo re-derives.
         # HOST copies: keeping GPU tensors here would pin VRAM for the
         # journal's lifetime (blocks accumulate during corpus ingest)
         blk["writes_all"] = (kk_all.cpu(), ids_t.cpu(),
-                             valid_o.cpu())
+                             write_o.cpu())
         blk["surprise"] = s_v.cpu()
+        blk["surprise_eff"] = s_eff.cpu()   # actual written deltas
         blk["evicted"] = tuple(
             t.cpu() for t in ev_snap)      # victim rows (undo)
         blk["col_evicted"] = tuple(
@@ -1974,9 +2344,33 @@ class _LearnMixin:
             c2prev = (self._chunk_c2prev(xchunk, c0, base, ids_t)
                       if c.bigram_sketch else None)
             if c.use_knn:
-                fp_c = cprev.float() @ self._Pcsem
-                knn_fps.append(
-                    fp_c / (fp_c.norm(dim=1, keepdim=True) + 1e-8))
+                if c.knn_window > 0:
+                    # windowed fp: bag-of-features over the W tokens
+                    # before each position (content-weighted) - the
+                    # EMA buries a 15-token question under ~140 tokens
+                    # of prose, so retrieval matched format not text
+                    W = int(c.knn_window)
+                    m_c = xchunk.numel()
+                    wi = (torch.arange(c0, c0 + m_c, device=self._dev)
+                          [:, None] - W + torch.arange(
+                              W, device=self._dev)[None, :]
+                          ).clamp(min=0)
+                    wt = ids_t.index_select(
+                        0, wi.reshape(-1)).reshape(
+                            m_c, W).long().clamp(0, V - 1)
+                    rw_ = self._R.index_select(
+                        0, wt.reshape(-1)).reshape(
+                            m_c, W, -1).float()
+                    if c.knn_idf:
+                        w_ = self._knn_tok_w(wt.reshape(-1)).reshape(
+                            m_c, W)
+                        xw = (rw_ * w_[..., None]).sum(1) \
+                            / w_.sum(1, keepdim=True).clamp(min=1e-8)
+                    else:
+                        xw = rw_.mean(1)
+                    knn_fps.append(self._knn_fp_of(xw))
+                else:
+                    knn_fps.append(self._knn_fp_of(cprev))
             if c.delta_rule:
                 chat = cprev / (cprev.norm(dim=1, keepdim=True)
                                 + 1e-8)
@@ -2016,13 +2410,17 @@ class _LearnMixin:
             # kappa = |sum chat_i|/m: exact when the duplicate writes
             # align (phi -> geometric limit), near-1 when they are
             # orthogonal (no compounding to damp).
-            u, tot = _group_totals(xchunk, dc_)            # [u,d] sums
-            _, mcnt = _group_totals(xchunk, torch.ones(
+            # one sort of xchunk serves all four grouped reductions -
+            # the sort was ~1/3 of post-doorkeeper ingest time when
+            # each _group_totals re-sorted the same keys
+            xsrt, xord = _group_sort(xchunk)
+            u, tot = _group_apply(xsrt, xord, xchunk, dc_)  # [u,d] sums
+            _, mcnt = _group_apply(xsrt, xord, xchunk, torch.ones(
                 xchunk.numel(), 1, device=dev))
-            _, sbar = _group_totals(xchunk, s_chunk[:, None])
+            _, sbar = _group_apply(xsrt, xord, xchunk, s_chunk[:, None])
             sbar = sbar / mcnt.clamp(min=1.0)
             if c.delta_rule:
-                _, csum = _group_totals(xchunk, chat)
+                _, csum = _group_apply(xsrt, xord, xchunk, chat)
                 kap = (csum.norm(dim=1) / mcnt[:, 0]).clamp(0.0, 1.0)
                 a = (c.hebb_lr * sbar[:, 0]).clamp(0.0, 0.9999)
                 # 1-(1-a)^m without the 1-x cancellation: -expm1(m*log1p(-a))
@@ -2065,11 +2463,33 @@ class _LearnMixin:
             # gen channels: per-position context features -> SimHash
             # codes (gcell) and projected keys (gsyn); writes journal
             # individually and undo before the "bc" snapshot restores
-            if (c.gcell or c.gsyn) and not self._predict_only:
+            if (c.gcell or c.gsyn or c.gsyn_deep or c.dnet or c.r_live) \
+                    and not self._predict_only:
+                # recall->gen floor: positions whose context was warm
+                # at probe time (pre-write cell tot > thin_tot) write
+                # gen channels at gen_recall instead of their surprise.
+                # Uses s_eff (in-block-aware) like the order deltas -
+                # raw s_v overwrites fuzzy matrices on in-block repeats.
+                se_chunk = s_eff[c0:c0 + m]
+                s_gen_chunk = se_chunk
+                if c.gen_recall > 0:
+                    warm_c = (found_f.reshape(O, n)
+                              & (tots_f.reshape(O, n)
+                                 > c.thin_tot)).any(0)[c0:c0 + m]
+                    s_gen_chunk = torch.where(
+                        warm_c,
+                        se_chunk.clamp(min=c.gen_recall),
+                        se_chunk)
+            fx = gk = gcodes = None
+            if (c.gcell or c.gsyn or c.gsyn_deep or c.dnet) \
+                    and not self._predict_only:
                 fx = self._gcell_feats_bulk(cprev, c2prev, xchunk,
                                             c0, base, ids_t)
-                s_host = s_chunk.tolist()
+                s_host = s_gen_chunk.tolist()
                 ids_l = ids_np[c0:c0 + m].tolist()
+                gk = (self._gsyn_keys(fx)             # [m,dk]
+                      if (c.gsyn or c.gsyn_deep or c.dnet)
+                      else None)
                 if c.gcell:
                     gcodes = self._gcell_codes_from_feats(fx)
                     for i, cd in enumerate(gcodes):
@@ -2084,8 +2504,96 @@ class _LearnMixin:
                         blk["gsyn"] = (
                             self._S.detach().cpu().clone(),
                             self._Ss.detach().cpu().clone())
-                    gk = self._gsyn_keys(fx)                 # [m,dk]
-                    self._gsyn_chunk(gk, xchunk, s_chunk)
+                    self._gsyn_chunk(gk, xchunk, s_gen_chunk)
+                if c.gsyn_deep:
+                    # nonlinear memory: batched TTT-style grad steps
+                    # (LaCT large-chunk).  Undo = blk["gsd"] theta
+                    # pre-state, journaled lazily inside _gsd_chunk
+                    self._gsd_chunk(gk, xchunk, s_gen_chunk)
+                if c.dnet:
+                    # iterated stack: exact sequential per-position
+                    # steps (layer l needs l-1's current state)
+                    self._dnet_chunk(gk, xchunk, s_gen_chunk)
+            if c.r_live and not self._predict_only:
+                # live features: every token's _Rl row drifts toward
+                # its pre-token context sketch (cprev row i = c_{i-1})
+                self._rl_bulk(xchunk, cprev, s_gen_chunk)
+            # live generalizer "gen head" (R68): the order cells'
+            # recalled successor distribution - re-read off the
+            # POST-write re-probe (slot2/found2 after add_multi, so
+            # cells hold this block's writes like the eager path's
+            # post-write read; later same-key writes leak in, the
+            # documented reward fix-up class) - transfers into the
+            # gen channels at gen_live*conf.
+            if c.gen_live > 0 and not self._predict_only:
+                gl_min = (c.gen_live_min_tot
+                          if c.gen_live_min_tot > 0 else c.thin_tot)
+                M = self._gt.M
+                sl_c = slot2.reshape(O, n)[:, c0:c0 + m].reshape(-1)
+                fd_c = found2.reshape(O, n)[:, c0:c0 + m]
+                rows_c = self._gt._ordx[:, None].expand(
+                    O, m).reshape(-1)
+                tH = self._gt.ttot[rows_c, sl_c].reshape(O, m)
+                ev = fd_c & (tH > gl_min)                    # [O,m]
+                if bool(ev.any()):
+                    rtB = self._gt.ttoks[rows_c, sl_c].reshape(O, m, M)
+                    rcB = self._gt.tcnt[rows_c, sl_c].reshape(O, m, M)
+                    conf_t = torch.where(
+                        ev, tH / (tH + float(c.backoff_kappa)),
+                        tH.new_zeros(())).amax(0)            # [m]
+                    ok = ev[:, :, None] & (rtB >= 0) & (rcB > 0)
+                    rcB = torch.where(ok, rcB, rcB.new_zeros(()))
+                    rcB = rcB.permute(1, 0, 2).reshape(m, O * M)
+                    rtB = rtB.permute(1, 0, 2).reshape(m, O * M)
+                    topm = min(int(c.gen_live_topm), O * M)
+                    cnts, ix = torch.topk(rcB, topm, dim=1)
+                    toks = rtB.gather(1, ix)                 # [m, topm]
+                    tsum = cnts.sum(1, keepdim=True)
+                    keep = (conf_t > 0) & (tsum[:, 0] > 0)
+                    sel = torch.nonzero(keep).squeeze(1)
+                    if sel.numel():
+                        s_i = conf_t[sel] * float(c.gen_live)
+                        w = cnts[sel] / tsum[sel].clamp(min=1e-9)
+                        w = torch.where(cnts[sel] > 0, w,
+                                        w.new_zeros(()))
+                        tk = toks[sel].long()                # [K, topm]
+                        if gk is not None and (c.gsyn
+                                               or c.gsyn_deep
+                                               or c.dnet):
+                            Rm = (self._Reff
+                                  if self._Reff is not None
+                                  else self._R)
+                            vt = (Rm[tk].float()
+                                  * w[:, :, None]).sum(1)    # [K, d]
+                            if c.gsyn:
+                                self._gsyn_chunk(
+                                    gk[sel], xchunk[sel], s_i, v=vt)
+                            if c.gsyn_deep:
+                                self._gsd_chunk(
+                                    gk[sel], xchunk[sel], s_i, v=vt)
+                            if c.dnet:
+                                self._dnet_chunk(
+                                    gk[sel], xchunk[sel], s_i, v=vt)
+                        if c.r_live:
+                            # followers share the position's context
+                            # sketch - grouped residual _rl_bulk
+                            wm = w.reshape(-1) > 0
+                            xs_f = tk.reshape(-1)[wm]
+                            cv_f = cprev[sel][:, None, :].expand(
+                                -1, topm, -1).reshape(
+                                    -1, c.topic_dim)[wm]
+                            s_f = (s_i[:, None] * w).reshape(-1)[wm]
+                            self._rl_bulk(xs_f, cv_f, s_f)
+                        if gcodes is not None and c.gcell:
+                            sel_h = sel.tolist()
+                            for pi, (trow, wrow, si) in enumerate(
+                                    zip(tk.tolist(), w.tolist(),
+                                        s_i.tolist())):
+                                cd = gcodes[sel_h[pi]]
+                                for t_, w_ in zip(trow, wrow):
+                                    if w_ > 0:
+                                        self._gcell_write(
+                                            cd, int(t_), si * w_)
 
         # -- real knn hedge rewards on the PRE-WRITE bank --------------
         # (the write below would let positions match their own rows)
@@ -2094,12 +2602,26 @@ class _LearnMixin:
                 and self._knn_cur > 0:
             fpq = torch.cat(knn_fps).float()                 # [n, d]
             kb = min(int(self._knn_cur), c.knn_capacity)
-            ksims = fpq @ self._knn_fp[:kb].float().T        # [n, kb]
-            ksims = torch.where(
-                (self._knn_pos[:kb] >= 0)[None, :], ksims,
-                torch.full((), -1e9, device=dev))
+            # query-blocked top-k: a full [n, kb] sim matrix is
+            # n*kb*4B - 37GB at kb~0.5M on a 12GB card.  topk only
+            # needs per-row maxima, so scan in query blocks sized to
+            # ~2GB of transient memory.
+            fpb = self._knn_fp[:kb].float().T                # [d, kb]
+            live = (self._knn_pos[:kb] >= 0)[None, :]
             kk = int(min(c.knn_k, kb))
-            topv, topi = torch.topk(ksims, kk, dim=1)
+            qb = max(256, min(int(fpq.shape[0]),
+                              int(2e9 // (4 * max(kb, 1)))))
+            tv_l, ti_l = [], []
+            for s0 in range(0, int(fpq.shape[0]), qb):
+                sims = fpq[s0:s0 + qb] @ fpb
+                sims = torch.where(
+                    live, sims,
+                    torch.full((), -1e9, device=dev))
+                v, i = torch.topk(sims, kk, dim=1)
+                tv_l.append(v)
+                ti_l.append(i)
+            topv = torch.cat(tv_l)
+            topi = torch.cat(ti_l)
             kwv = (topv.clamp(min=0.0) ** c.knn_gamma) \
                 * (topv > c.knn_min_sim)
             ksucc = self._knn_succ.index_select(
@@ -2199,9 +2721,11 @@ class _LearnMixin:
                 # deterministic group sums - float-weighted bincount and
                 # index_add_ both accumulate through CUDA atomics, whose
                 # arrival order varies run to run (inv repeats by design)
-                _gi, ssum = _group_totals(inv, s_ci.float())
-                _gi, asum = _group_totals(inv,
-                                          Ac.float() * s_ci[:, None])
+                _isrt, _iord = _group_sort(inv)
+                _gi, ssum = _group_apply(_isrt, _iord, inv,
+                                         s_ci.float())
+                _gi, asum = _group_apply(_isrt, _iord, inv,
+                                         Ac.float() * s_ci[:, None])
                 amean = asum / ssum.clamp(min=1e-9)[:, None]
                 rows = self._csem_rows[uniq_s].float()   # pre-block rows
                 slot_new = torch.zeros(uniq_s.numel(), dtype=torch.bool,
@@ -2216,6 +2740,9 @@ class _LearnMixin:
                 decay_m = (1.0 - lr_eff) ** m_per
                 new_rows = rows * decay_m[:, None] \
                     + amean * (1.0 - decay_m)[:, None]
+                new_rows = torch.nan_to_num(new_rows)
+                mx = new_rows.abs().amax(dim=1, keepdim=True)
+                new_rows = new_rows * (6e4 / mx.clamp(min=6e4))
                 self._csem_rows[uniq_s] = new_rows.half()
                 _group_add(self._gt.tocc[rcs], slot,
                            torch.ones(slot.numel(), device=dev))
@@ -2249,8 +2776,8 @@ class _LearnMixin:
                          1.0 - c.fatigue_decay
                          ** np.clip(ages, 0, None), 1.0)
         if c.calib_rewards:
-            # implied channel dist p(v) ∝ p_uni(v)·exp(±lift(v)) ->
-            # reward = p_uni(x)·exp(f_x)/Z.  Z per position = sliding
+            # implied channel dist p(v) âˆ p_uni(v)Â·exp(Â±lift(v)) ->
+            # reward = p_uni(x)Â·exp(f_x)/Z.  Z per position = sliding
             # window over the last `span` tokens (dedup approximated -
             # repeated tokens in the window count twice).
             uni_np = uni_pre.cpu().numpy()
@@ -2270,7 +2797,8 @@ class _LearnMixin:
                 -c.fatigue_strength * fat_x) / np.maximum(zf, 1e-12)
         col = {ch: i for i, ch in enumerate(self.channels)}
         nonord = [col[ch] for ch in
-                  ("deep", "topic", "sem", "csem", "knn", "backoff")]
+                  ("deep", "topic", "sem", "csem", "knn", "backoff",
+                   "gcell", "gsyn", "gsd", "dnet") if ch in col]
         uni_d = uni_pre.double()
         uni_np = uni_pre.cpu().numpy()
 
@@ -2331,6 +2859,119 @@ class _LearnMixin:
             real_r[col["deep"]] = (deep_r, deep_fire)
             if knn_r is not None:
                 real_r[col["knn"]] = (knn_r, knn_fire)
+            # fuzzy lift channels: prob of the observed token under
+            # each channel's own log-softmax readout, evaluated on
+            # POST-block state (documented approximation - matching
+            # the proto-EMA convention; a strict pre-write pass would
+            # need a second feature walk before any writes).  This is
+            # what lets hedge actually punish a harmful fuzzy channel
+            # during bulk training - the fixed-weight bypass was the
+            # measured cause of the seen_qa 0.82->0.28 regression.
+            if self._fidx and (c.gcell or c.gsyn or c.gsyn_deep
+                               or c.dnet):
+                Rm = (self._Reff if self._Reff is not None
+                      else self._R).float()
+                xcol = ids_t.long()
+
+                def _p_chan(o_mat, temp):  # [n,d] readouts -> p(x_i)
+                    on = o_mat / o_mat.norm(dim=1, keepdim=True
+                                            ).clamp(min=1e-8)
+                    out = torch.empty(n, dtype=torch.float64,
+                                      device=dev)
+                    for j0 in range(0, n, 1024):
+                        a = (on[j0:j0 + 1024] @ Rm.T) * temp
+                        a = torch.nan_to_num(a, nan=0.0)
+                        p_i = a.gather(1, xcol[j0:j0 + 1024, None]
+                                       ).squeeze(1).double()
+                        out[j0:j0 + 1024] = torch.exp(
+                            p_i - torch.logsumexp(a, dim=1).double())
+                    return out.cpu().numpy()
+
+                gk_all = None
+                if any(ch in col for ch in ("gsyn", "gsd", "dnet")):
+                    _gk = []
+                    for c0r in range(0, n, CH):
+                        xr = ids_t[c0r:c0r + CH]
+                        f_r = self._gcell_feats_bulk(
+                            self._chunk_cprev(xr),
+                            (self._chunk_c2prev(xr, c0r, base, ids_t)
+                             if c.bigram_sketch else None),
+                            xr, c0r, base, ids_t)
+                        _gk.append(self._gsyn_keys(f_r))
+                    gk_all = torch.cat(_gk).float()
+                if "gsyn" in col:
+                    rr = uni_np.copy()
+                    fr = np.zeros(n, dtype=bool)
+                    if float(self._S.norm()) > 1e-8:
+                        o_all = gk_all @ self._S.T
+                        if c.gsyn_slow_decay > 0:
+                            o_all = o_all + gk_all @ self._Ss.T
+                        rr = _p_chan(o_all, c.gsyn_temp)
+                        fr[:] = True
+                    real_r[col["gsyn"]] = (rr, fr)
+                    # gsd/dnet share the key tensor
+                    if "gsd" in col:
+                        rr = uni_np.copy()
+                        fr = np.zeros(n, dtype=bool)
+                        if self._Wd2 is not None \
+                                and float(self._Wd2.norm()) > 1e-8:
+                            h_r = torch.relu(
+                                gk_all @ self._Wd1.T
+                                + self._Sb1)
+                            rr = _p_chan(h_r @ self._Wd2.T
+                                         + self._Sb2,
+                                         c.gsyn_deep_temp)
+                            fr[:] = True
+                        real_r[col["gsd"]] = (rr, fr)
+                    if "dnet" in col:
+                        rr = uni_np.copy()
+                        fr = np.zeros(n, dtype=bool)
+                        if any(float(s_.norm()) > 1e-8
+                               for s_ in self._DS):
+                            h_r = gk_all
+                            for l_ in range(len(self._DS)):
+                                kk_ = h_r @ self._Dk[l_].float()
+                                kk_ = kk_ / kk_.norm(
+                                    dim=1, keepdim=True
+                                ).clamp(min=1e-8)
+                                h_r = kk_ @ self._DS[l_].T
+                                if c.dnet_relu:
+                                    h_r = torch.relu(h_r)
+                            rr = _p_chan(h_r, c.dnet_temp)
+                            fr[:] = True
+                        real_r[col["dnet"]] = (rr, fr)
+                if "gcell" in col:
+                    rr = uni_np.copy()
+                    fr = np.zeros(n, dtype=bool)
+                    if self._gc:
+                        for c0r in range(0, n, CH):
+                            xr = ids_t[c0r:c0r + CH]
+                            f_r = self._gcell_feats_bulk(
+                                self._chunk_cprev(xr),
+                                (self._chunk_c2prev(xr, c0r, base, ids_t)
+                                 if c.bigram_sketch else None),
+                                xr, c0r, base, ids_t)
+                            cds = self._gcell_codes_from_feats(f_r)
+                            if torch.is_tensor(cds):
+                                cds = cds.tolist()
+                            for i, cd in enumerate(cds):
+                                num = den = 0.0
+                                for cc, dst in self._gcell_neighbors(
+                                        int(cd)):
+                                    cell = self._gc.get(cc)
+                                    if cell:
+                                        w_ = c.gcell_neighbor_decay \
+                                            ** dst
+                                        num += w_ * cell.get(
+                                            int(ids_np[c0r + i]), 0.0)
+                                        den += w_ * self._gct.get(
+                                            cc, 0.0)
+                                if den > 0:
+                                    rr[c0r + i] = (
+                                        num + c.alpha * uni_np[c0r + i]
+                                        * den) / (den + c.alpha)
+                                    fr[c0r + i] = True
+                    real_r[col["gcell"]] = (rr, fr)
 
         # per-position evidence regime (cond_hedge): warm = some order
         # cell held real mass for this position's context - rewards
@@ -2434,7 +3075,7 @@ class _LearnMixin:
             s_np = s_v.cpu().numpy().astype(np.float64)
             cls_ring = None
 
-        def _tab_write(tab, tots, kk, xx, dd, rec):
+        def _tab_write(tab, tots, kk, xx, dd, rec, salt=None):
             """Dedup-grouped write into a {key:{succ:cnt}} table:
             lexsort+reduceat collapses repeated (key,x) pairs in the
             block into one dict update each - adds commute, so the
@@ -2448,6 +3089,27 @@ class _LearnMixin:
             st = np.flatnonzero(hd)
             uk, ux = kk_s[st], xx_s[st]
             ud = np.add.reduceat(dd_s, st)
+            if salt is not None and self._bloom_ready():
+                # doorkeeper at key granularity: unique keys already
+                # resident pass; first-sighting keys set bits and are
+                # dropped (their deltas never reach the journal); a
+                # key sighted >=2x in this block promotes outright.
+                hdk = np.ones(kk_s.size, bool)
+                hdk[1:] = kk_s[1:] != kk_s[:-1]
+                stk = np.flatnonzero(hdk)
+                ukk = kk_s[stk]
+                # per-key sighting count (positions, not just groups)
+                cnts = np.diff(np.append(stk, kk_s.size))
+                mk = cnts >= 2
+                have = np.fromiter((int(k_) in tab for k_ in ukk),
+                                   dtype=bool, count=ukk.size)
+                keepk = self._bloom_keep_np(salt, ukk, have, mk)
+                if not keepk.all():
+                    kidx = np.searchsorted(ukk, uk)
+                    keep = keepk[kidx]
+                    uk, ux, ud = uk[keep], ux[keep], ud[keep]
+                    if not uk.size:
+                        return
             rec += (uk, ux, ud)
             self._jadd(rec)
             tabg = tab.get
@@ -2472,7 +3134,8 @@ class _LearnMixin:
                 vi = np.nonzero(valid)[0]
                 _tab_write(self._ptabs[taps], self._ptots[taps],
                            keys[vi], ids_np[vi], s_np[vi],
-                           ("Cb", j))
+                           ("Cb", j),
+                           self._bloom_salt(self._BFAM_SPARSE, j))
                 if len(self._ptabs[taps]) > c.max_cells_per_order:
                     self._decay_table(self._ptabs[taps],
                                       self._ptots[taps])
@@ -2493,7 +3156,8 @@ class _LearnMixin:
                 vi = np.nonzero(valid)[0]
                 _tab_write(self._gtabs[k], self._gtots[k],
                            keys[vi], ids_np[vi], s_np[vi],
-                           ("Kb", k))
+                           ("Kb", k),
+                           self._bloom_salt(self._BFAM_CLASS, k))
                 if len(self._gtabs[k]) > c.max_cells_per_order:
                     self._decay_table(self._gtabs[k],
                                       self._gtots[k])
@@ -2513,7 +3177,8 @@ class _LearnMixin:
                 vi = np.nonzero(okk)[0]
                 _tab_write(self._wtabs[j], self._wtots[j],
                            keys[vi], ids_np[vi], s_np[vi],
-                           ("Wb", j))
+                           ("Wb", j),
+                           self._bloom_salt(self._BFAM_WORD, j))
                 if len(self._wtabs[j]) > c.max_cells_per_order:
                     self._decay_table(self._wtabs[j],
                                       self._wtots[j])
@@ -2536,12 +3201,15 @@ class _LearnMixin:
                 vi = np.nonzero(valid)[0]
                 _tab_write(self._htabs[j], self._htots[j],
                            keys[vi], ids_np[vi], s_np[vi],
-                           ("Hb", j))
+                           ("Hb", j),
+                           self._bloom_salt(self._BFAM_HYBRID, j))
                 if len(self._htabs[j]) > c.max_cells_per_order:
                     self._decay_table(self._htabs[j],
                                       self._htots[j])
 
         self._blk_journal = None
+        self.journal.seal_bc(blk)         # payload budget + evict
+        self._blk_active = None
         self._epi_flush_sync()            # batched GPU row resync
         self._count += n
         # device scalars + hedge weights mirrors
@@ -2636,7 +3304,13 @@ class _LearnMixin:
             valid = pos_ij >= 0
             in_new = pos_ij >= base
             tok_new = ids_t[(pos_ij - base).clamp(min=0)].long()
-            tok_old = self._ringg[
+            ringg = getattr(self, "_ringg", None)
+            if ringg is None:
+                # CPU path: host ring is authoritative (consolidate_gen
+                # calls this on non-GPU models too)
+                ringg = torch.from_numpy(
+                    np.asarray(self._ring, dtype=np.int64)).to(dev)
+            tok_old = ringg[
                 (pos_ij % cap).clamp(min=0)].long()
             tok = torch.where(valid, torch.where(in_new, tok_new,
                                                  tok_old),
@@ -2673,43 +3347,62 @@ class _LearnMixin:
             device=self._dev))).sum(1)
         return codes.tolist()
 
-    def _cprev_seq(self, xchunk: torch.Tensor) -> torch.Tensor:
+    def _cprev_seq(self, xchunk: torch.Tensor,
+                   c0: torch.Tensor | None = None) -> torch.Tensor:
         """[n+1, d] pre-token context states for a row - PURE (does
         not advance self._c); index m = post-row context.  For
         fused-seq replay: write-side code for step i uses row i,
-        read-side lift for the emitted logits uses row i+1."""
+        read-side lift for the emitted logits uses row i+1.
+
+        ``c0`` overrides the seed context (consolidation replays the
+        ring seeded at zero - episode boundary reset - instead of the
+        live ``self._c``)."""
         c = self.config
+        c0 = self._c if c0 is None else c0
         m = xchunk.numel()
         j = torch.arange(m, dtype=torch.float64, device=self._dev)
         rj = self._R[xchunk.long()].double()
         lamj = c.topic_decay ** j
         csum = torch.cumsum(rj * (c.topic_decay ** -j)[:, None], 0)
-        C = (c.topic_decay ** (j + 1))[:, None] * self._c.double() \
+        C = (c.topic_decay ** (j + 1))[:, None] * c0.double() \
             + (1 - c.topic_decay) * lamj[:, None] * csum
-        return torch.cat([self._c[None].double(), C])
+        return torch.cat([c0[None].double(), C])
 
-    def _c2prev_seq(self, xchunk: torch.Tensor) -> torch.Tensor:
+    def _c2prev_seq(self, xchunk: torch.Tensor,
+                    c20: torch.Tensor | None = None,
+                    prev0: int | None = None) -> torch.Tensor:
         """[n+1, d] pre-token sketch states - PURE counterpart of
-        _chunk_c2prev (does not advance self._c2)."""
+        _chunk_c2prev (does not advance self._c2).
+
+        ``c20``/``prev0`` override the seed sketch and the token
+        preceding the chunk (prev0=-1 forces an invalid first pair -
+        episode start)."""
         c = self.config
+        c20 = self._c2 if c20 is None else c20
         m = xchunk.numel()
         prev = torch.empty(m, dtype=torch.int64, device=self._dev)
         prev[1:] = xchunk[:-1].long()
         b0_ok = 1.0
-        if self._count > self._ep_start:
-            prev[0] = int(self._ring[(self._count - 1)
-                                     % c.ring_capacity])
-        else:
+        if prev0 is None:
+            if self._count > self._ep_start:
+                prev[0] = int(self._ring[(self._count - 1)
+                                         % c.ring_capacity])
+            else:
+                prev[0] = 0
+                b0_ok = 0.0
+        elif prev0 < 0:
             prev[0] = 0
             b0_ok = 0.0
+        else:
+            prev[0] = prev0
         b = self._bigram_feats(prev, xchunk.long())
         b[0] *= b0_ok
         j = torch.arange(m, dtype=torch.float64, device=self._dev)
         lamj = c.topic_decay ** j
         csum = torch.cumsum(b.double() * (lamj ** -j)[:, None], 0)
-        C = (c.topic_decay ** (j + 1))[:, None] * self._c2.double() \
+        C = (c.topic_decay ** (j + 1))[:, None] * c20.double() \
             + (1 - c.topic_decay) * lamj[:, None] * csum
-        return torch.cat([self._c2[None].double(), C])
+        return torch.cat([c20[None].double(), C])
 
     def ingest(self, ids, tag: str | None = None, learn: bool = True) -> int:
         """Stream-train on token ids (instant, hot). Returns #tokens."""
@@ -2719,22 +3412,34 @@ class _LearnMixin:
         if tag is not None:
             self.tag = tag
         self.learning = learn
-        if self.learning and self._gpu:
-            try:
-                n = self._ingest_bulk(ids)
-            finally:
-                # a mid-block exception must not leave later writes
-                # silently diverted into a dead block's sub-journal
-                self._blk_journal = None
-        else:
-            n = 0
-            for x in ids:
-                x = int(x)
-                if self.learning:
-                    self._learn_token(x)
-                else:
-                    self._push(x)
-                n += 1
+        if self.learning:
+            self._rl_session = {}       # one "rB" entry per call
+            self._gsd_session = {}      # one "gd" entry per call
+            self._dnet_session = {}     # one "dn" entry per call
+        try:
+            if self.learning and self._gpu:
+                try:
+                    n = self._ingest_bulk(ids)
+                finally:
+                    # a mid-block exception must not leave later writes
+                    # silently diverted into a dead block's sub-journal
+                    self._blk_journal = None
+                    if self._blk_active is not None:
+                        self.journal.seal_bc(self._blk_active)
+                        self._blk_active = None
+            else:
+                n = 0
+                for x in ids:
+                    x = int(x)
+                    if self.learning:
+                        self._learn_token(x)
+                    else:
+                        self._push(x)
+                    n += 1
+        finally:
+            self._rl_flush()
+            self._gsd_flush()
+            self._dnet_flush()
         self.tag, self.learning = prev_tag, prev_learn
         return n
 
@@ -2816,6 +3521,82 @@ class _LearnMixin:
             tots[key] = tots.get(key, 0.0) + d
             self.journal.append((op, ident, key, int(t), float(d)))
         return len(deltas)
+
+    # -- bloom doorkeeper ------------------------------------------------
+    # Family salts decorrelate the shared filters per table identity:
+    # order cells use k*PHI (matching the device probe salt so a key's
+    # admission state is consistent if the same key is ever probed on
+    # both paths); host families get disjoint bands.
+    _BFAM_ORDER = 0
+    _BFAM_SPARSE = 1 << 32
+    _BFAM_CLASS = 2 << 32
+    _BFAM_WORD = 3 << 32
+    _BFAM_HYBRID = 4 << 32
+    _BPHI = 0x9E3779B97F4A7C15
+
+    def _bloom_salt(self, fam: int, ident: int) -> int:
+        return (((fam + ident) * self._BPHI) & 0xFFFFFFFFFFFFFFFF)
+
+    def _bloom_ready(self) -> bool:
+        """Lazy allocator: config is user-flippable post-init (eval
+        --set), so the filters materialize on first gated write."""
+        c = self.config
+        if c.bloom_admit < 2:
+            return False
+        if self._bloom_h is None:
+            self._bloom_h = np.zeros(c.bloom_bits, dtype=np.int16)
+        if self._gpu and self._bloom_g is None:
+            self._bloom_g = torch.zeros(
+                c.bloom_bits, dtype=torch.int16, device=self._dev)
+        return True
+
+    def _bloom_touch(self, salt: int, key: int) -> bool:
+        """Host admission test-and-set for one (family-salt, key):
+        False = first sightings (bits now set, no cell yet), True =
+        promote (the key is worth a real row)."""
+        b = self._bloom_h
+        if b is None:
+            return True
+        M = b.shape[0]
+        pk = _mix64_py((key * 0x9E3779B97F4A7C15 + salt)
+                       & 0xFFFFFFFFFFFFFFFF)
+        b1 = pk % M
+        b2 = _mix64_py((pk * 0xBF58476D1CE4E5B9 + 0x9E3779B97F4A7C15)
+                       & 0xFFFFFFFFFFFFFFFF) % M
+        thr = self.config.bloom_admit - 1
+        hit = b[b1] >= thr and b[b2] >= thr
+        if b[b1] < 32767:
+            b[b1] += 1
+        if b[b2] < 32767:
+            b[b2] += 1
+        return hit
+
+    def _bloom_keep_np(self, salt: int, uk: np.ndarray,
+                       have: np.ndarray, multi: np.ndarray
+                       ) -> np.ndarray:
+        """Vectorized admission for grouped bulk writes: ``uk`` =
+        unique candidate keys, ``have`` = already-resident in the
+        table, ``multi`` = sighted >1 time in this block (the first
+        sighting set its bits, so repeats promote).  Sets bits on all
+        absent keys and returns the keep mask."""
+        b = self._bloom_h
+        if b is None:
+            return np.ones(uk.shape, dtype=bool)
+        M = np.uint64(b.shape[0])
+        thr = np.int16(self.config.bloom_admit - 1)
+        pk = _mix64_np(uk.astype(np.uint64)
+                       * _MIX1U + np.uint64(salt))
+        b1 = (pk % M).astype(np.int64)
+        b2 = (_mix64_np(pk * _MIX2U + _MIX1U) % M).astype(np.int64)
+        hit = (b[b1] >= thr) & (b[b2] >= thr)
+        miss = ~have
+        np.add.at(b, b1[miss], 1)
+        np.add.at(b, b2[miss], 1)
+        # saturating counters: clamp only the touched cells (a full-
+        # array np.minimum would be O(bits) per table-write call)
+        ti = np.unique(np.concatenate([b1[miss], b2[miss]]))
+        b[ti] = np.minimum(b[ti], 32767)
+        return have | (miss & (hit | multi))
 
     def _write_counts_keys(self, keys: dict[int, int],
                            deltas: dict[int, float]) -> int:
@@ -2925,12 +3706,25 @@ class _LearnMixin:
                 rep["csem"] += 1
             if i == 0 and c.use_knn and ctx:
                 # one bank entry: fp(context) -> first target token
-                fp = self._knn_fp_of(self._context_vector(ctx))
+                if c.knn_window > 0:
+                    wids = torch.as_tensor(
+                        ctx[-int(c.knn_window):], dtype=torch.long,
+                        device=self._dev).clamp(0, self.vocab_size - 1)
+                    rows = self._R.index_select(0, wids).float()
+                    if c.knn_idf:
+                        w = self._knn_tok_w(wids)
+                        fp = self._knn_fp_of(
+                            (rows * w[:, None]).sum(0)
+                            / w.sum().clamp(min=1e-8))
+                    else:
+                        fp = self._knn_fp_of(rows.mean(0))
+                else:
+                    fp = self._knn_fp_of(self._context_vector(ctx))
                 self._knn_write(t, self._count + i, fp=fp)
                 if self._gpu:
                     self._jcur = (self._jcur + 1) % c.vec_delta_cap
                 rep["knn"] += 1
-            if (c.gcell or c.gsyn) and ctx:
+            if (c.gcell or c.gsyn or c.gsyn_deep or c.dnet) and ctx:
                 gxf = self._gcell_feats_ctx(ctx + tgt[:i])
             if c.gcell and ctx:
                 # learned-code cell: code(prefix) -> target, repeated
@@ -2946,6 +3740,26 @@ class _LearnMixin:
                 for _ in range(max(1, min(int(round(weight)), 12))):
                     self._gsyn_write(gk, t, 1.0)
                 rep["gsyn"] = rep.get("gsyn", 0) + 1
+            if c.gsyn_deep and ctx:
+                # deep channel gets the same repeated writes - theta
+                # snapshots journal once per write scope
+                gkd = self._gsyn_keys(gxf)
+                for _ in range(max(1, min(int(round(weight)), 12))):
+                    self._gsd_write(gkd, t, 1.0)
+                rep["gsyn_deep"] = rep.get("gsyn_deep", 0) + 1
+            if c.dnet and ctx:
+                # iterated stack: teach mass writes through all layers
+                gkn = self._gsyn_keys(gxf)
+                for _ in range(max(1, min(int(round(weight)), 12))):
+                    self._dnet_step(gkn, t, 1.0)
+                rep["dnet"] = rep.get("dnet", 0) + 1
+            if c.r_live and ctx:
+                # the taught target's feature row drifts toward this
+                # context too - instant semantic binding, no teacher;
+                # per-token "rL" entries ride the ws/we block and undo
+                # through revert_writes
+                self._rl_write(
+                    t, self._context_vector(ctx + tgt[:i]), 1.0)
         self.journal.append(("we", tag))
         return rep
 
@@ -2971,7 +3785,7 @@ class _LearnMixin:
         ``reinforce:<tag>`` so reinforcement itself is revertible.
         Forgetting entirely is ``revert_tag(tag)``.
 
-        ``span``: optional ``(lo, hi)`` absolute stream positions —
+        ``span``: optional ``(lo, hi)`` absolute stream positions â€”
         only deltas written for tokens inside the range are replayed
         (fine-grained credit: reinforce just the answer span of a
         partially-good episode).  ``gain`` may be a callable
@@ -3027,7 +3841,7 @@ class _LearnMixin:
                 pend = []
                 blk = e[1]
                 kk_all, tt_all, valid_o = blk["writes_all"]
-                s_v = blk.get("surprise")
+                s_v = blk.get("surprise_eff", blk.get("surprise"))
                 b0 = blk["count"]
                 for oi, k in enumerate(self.config.orders):
                     idx = torch.nonzero(valid_o[oi]).squeeze(1)
@@ -3069,10 +3883,10 @@ class _LearnMixin:
         On success the runner-ups share a little of the win; on
         failure (call with gain>0 then revert_writes(tag)) the untried
         actions keep credit for what the tried one lost.  The writes
-        are journaled under ``cf:<tag>`` — independently revertible.
+        are journaled under ``cf:<tag>`` â€” independently revertible.
 
         Requires the packet to have been applied under ``tag`` first
-        (the journal block is the source of the per-position keys —
+        (the journal block is the source of the per-position keys â€”
         "c"/"t" groups on the host path, "bc" writes_all on GPU).
         """
         alts = getattr(packet, "alts", None) or []
@@ -3243,6 +4057,244 @@ class _LearnMixin:
         self.journal.append(("we", tag))
         return rep
 
+    def consolidate_gen(self, mass: float = 1.0, top_m: int = 4,
+                        min_tot: float | None = None,
+                        tag: str = "gencon",
+                        all_ring: bool = False) -> dict:
+        """Recall->gen consolidation: replay on-ring stream positions
+        and write the order cells' recalled successor DISTRIBUTION
+        (top-m followers, share-weighted) into the gen channels -
+        gcell cells, the gsyn delta state (soft-feature target), and
+        the live _Rl rows.  The gen side distills what the recall
+        side already proved, without re-ingesting the source stream:
+        the memory contents update the generator directly.
+
+        Contexts reconstruct exactly inside the current episode:
+        _c/_c2 reset to zero at ``_ep_start`` and the ring retains
+        every episode token, so the closed-form EMA replay
+        (_cprev_seq seeded at zero) reproduces each pre-token context.
+        When the ring truncated mid-episode (floor > ep_start) the
+        missing pre-floor mass is approximate - it decays as
+        lam^age, negligible after ~1/(1-lam) positions.
+        ``all_ring=True`` drops the episode floor to the ring floor -
+        cross-episode replay carries stale context mass across old
+        boundaries (the same decaying-approximation class as ring
+        truncation); for post-corpus consolidation (train_flux
+        --gen-consolidate after per-pack soft_resets) it is the only
+        mode that covers more than the last episode.
+
+        Only positions whose context holds order-cell evidence
+        (tot > min_tot) transfer - mass is scaled by the cell's
+        confidence tot/(tot+kappa).  All writes are journaled inside
+        one ws/we block under ``tag``: gsyn via a single ("gs", S,
+        Ss) pre-state snapshot (the factor ring would overflow on a
+        big sweep), _Rl via the session mechanism ("rB"), gcell via
+        per-cell "G" entries.  Revertible via revert_writes(tag) /
+        revert_tag(tag)."""
+        c = self.config
+        dev = self._dev
+        cap = c.ring_capacity
+        ring_floor = max(0, self._count - cap)
+        floor = (ring_floor if all_ring
+                 else max(self._ep_start, ring_floor))
+        n = self._count - floor
+        rep = {"positions": 0, "gcell": 0, "gsyn": 0, "rl": 0,
+               "gsyn_deep": 0, "dnet": 0}
+        if n < 1 or not (c.gcell or c.gsyn or c.gsyn_deep or c.dnet
+                         or c.r_live):
+            return rep
+        min_tot = c.thin_tot if min_tot is None else min_tot
+        # the whole retained range as a closed-form replay, SLICED so
+        # big rings don't materialize [n, in_dim] fp64 all at once
+        # (897K positions * ~1728 dims * 8B would need ~12GB);
+        # context state carries across slices via c_run/c2_run/p_run
+        ids_np = np.array(
+            [int(self._ring[p % cap]) for p in range(floor,
+                                                     self._count)],
+            dtype=np.int64)
+        ids_t = torch.from_numpy(ids_np).to(dev)
+        zero = torch.zeros(c.topic_dim, dtype=torch.float32,
+                           device=dev)
+        # token before the replay floor is only valid while it is
+        # still on the ring (all_ring drops the episode floor)
+        p_run = (int(self._ring[(floor - 1) % cap])
+                 if floor - 1 >= ring_floor else -1)
+        Rm = self._Reff if self._Reff is not None else self._R
+        SLICE = 1 << 16
+        self.journal.append(("ws", tag))
+        self._rl_session = {}                    # one "rB" undo entry
+        self._gsd_session = {}                   # one "gd" undo entry
+        self._dnet_session = {}                  # one "dn" undo entry
+        if c.gsyn:
+            # one pre-state snapshot covers the whole gsyn sweep
+            self.journal.append(
+                ("gs", self._S.detach().cpu().clone(),
+                 self._Ss.detach().cpu().clone()
+                 if c.gsyn_slow_decay > 0 else None))
+        c_run, c2_run = zero, zero.clone()
+        try:
+            for i0 in range(0, n, SLICE):
+                i1 = min(i0 + SLICE, n)
+                m_s = i1 - i0
+                ids_s = ids_t[i0:i1]
+                cprev = self._cprev_seq(ids_s, c0=c_run)   # [m+1, d]
+                c2prev = (self._c2prev_seq(ids_s, c20=c2_run,
+                                           prev0=p_run)
+                          if c.bigram_sketch else None)
+                c_run = cprev[m_s].float()
+                if c2prev is not None:
+                    c2_run = c2prev[m_s].float()
+                feats = self._gcell_feats_bulk(
+                    cprev[:m_s],
+                    None if c2prev is None else c2prev[:m_s],
+                    ids_s, 0, floor + i0, ids_s)        # [m, in_dim]
+                gcodes = (self._gcell_codes_from_feats(feats)
+                          if c.gcell else None)
+                gkeys = (self._gsyn_keys(feats)
+                         if (c.gsyn or c.gsyn_deep or c.dnet)
+                         else None)
+                # per-position raw suffix keys for every order, over
+                # the host _H ring (ends[i] = floor+i0+i-1; a k-order
+                # key is only well-defined while its whole suffix
+                # stays on-ring)
+                ends = floor + i0 - 1 + np.arange(m_s,
+                                                  dtype=np.int64)
+                He = self._H[ends % cap].astype(np.uint64)
+                votes_l: list[dict[int, float]] = []
+                conf = np.zeros(m_s, dtype=np.float64)
+                if self._gpu:
+                    # batch-probe all (order, position) keys once:
+                    # s64 raw keys -> pk -> slot/found -> row gather
+                    kk = np.empty((len(c.orders), m_s),
+                                  dtype=np.uint64)
+                    for oi, k in enumerate(c.orders):
+                        He_k = np.where(
+                            ends - k >= 0,
+                            self._H[(ends - k) % cap].astype(np.uint64),
+                            0)
+                        # uint64 arithmetic wraps mod 2^64 already
+                        kk[oi] = He - He_k * np.uint64(self._pows[k])
+                        kk[oi][ends - k + 1 < ring_floor] = 0
+                    kk_t = torch.from_numpy(
+                        kk.astype(np.int64)).to(dev)          # [O, m]
+                    pk_all = _mix64(kk_t * _MIX1
+                                    + self._gt._salt[
+                                        :len(c.orders), None])
+                    rows_f = self._gt._ordx[
+                        :len(c.orders), None].expand(
+                            len(c.orders), m_s).reshape(-1)
+                    slot_f, found_f = self._gt.probe_fixed(
+                        pk_all.reshape(-1), rows=rows_f)
+                    tot_f = self._gt.ttot[rows_f, slot_f]
+                    rt_f = self._gt.ttoks[rows_f, slot_f]
+                    rc_f = self._gt.tcnt[rows_f, slot_f]
+                    found_h = found_f.reshape(len(c.orders),
+                                              m_s).cpu().numpy()
+                    tot_h = tot_f.reshape(len(c.orders),
+                                          m_s).cpu().numpy()
+                    rt_h = rt_f.reshape(len(c.orders), m_s,
+                                        -1).cpu().numpy()
+                    rc_h = rc_f.reshape(len(c.orders), m_s,
+                                        -1).cpu().numpy()
+                    for i in range(m_s):
+                        v: dict[int, float] = {}
+                        for oi in range(len(c.orders)):
+                            if (not found_h[oi, i]
+                                    or tot_h[oi, i] <= min_tot):
+                                continue
+                            conf[i] = max(
+                                conf[i], tot_h[oi, i]
+                                / (tot_h[oi, i] + c.backoff_kappa))
+                            for t, ct in zip(rt_h[oi, i],
+                                             rc_h[oi, i]):
+                                if t >= 0 and ct > 0:
+                                    v[int(t)] = v.get(int(t), 0.0) \
+                                        + float(ct)
+                        votes_l.append(v)
+                else:
+                    for i in range(m_s):
+                        v = {}
+                        for k in c.orders:
+                            if ends[i] - k + 1 < ring_floor:
+                                continue
+                            key = (int(He[i])
+                                   - int(self._H[(ends[i] - k)
+                                                 % cap])
+                                   * int(self._pows[k])) % (1 << 64)
+                            cell = self._tables[k].get(key)
+                            if not cell:
+                                continue
+                            tot = self._totals[k].get(key, 0.0)
+                            if tot <= min_tot:
+                                continue
+                            conf[i] = max(
+                                conf[i],
+                                tot / (tot + c.backoff_kappa))
+                            for t, ct in cell.items():
+                                v[t] = v.get(t, 0.0) + ct
+                        votes_l.append(v)
+                p_run = int(ids_np[i1 - 1])
+                ks, vs, ss = [], [], []
+                for i in range(m_s):
+                    v = votes_l[i]
+                    if not v:
+                        continue
+                    top = sorted(v.items(),
+                                 key=lambda kv: -kv[1])[:top_m]
+                    tot_v = sum(w_ for _, w_ in top)
+                    if tot_v <= 0:
+                        continue
+                    s_i = mass * conf[i]
+                    if s_i <= 0:
+                        continue
+                    rep["positions"] += 1
+                    if c.gcell:
+                        for t, w_ in top:
+                            self._gcell_write(gcodes[i], t,
+                                              s_i * w_ / tot_v)
+                            rep["gcell"] += 1
+                    if c.gsyn or c.gsyn_deep or c.dnet:
+                        vt = torch.stack(
+                            [Rm[t].float() for t, w_ in top])
+                        wv = torch.tensor(
+                            [w_ / tot_v for _, w_ in top],
+                            dtype=torch.float32, device=dev)
+                        ks.append(gkeys[i])
+                        vs.append((vt * wv[:, None]).sum(0))
+                        ss.append(s_i)
+                        if c.gsyn:
+                            rep["gsyn"] += 1
+                        if c.gsyn_deep:
+                            rep["gsyn_deep"] += 1
+                        if c.dnet:
+                            rep["dnet"] += 1
+                    if c.r_live:
+                        cv = cprev[i].float()
+                        for t, w_ in top:
+                            self._rl_write(t, cv, s_i * w_ / tot_v)
+                            rep["rl"] += 1
+                if ks:
+                    kk_t = torch.stack(ks)
+                    ss_t = torch.tensor(ss, dtype=torch.float32,
+                                        device=dev)
+                    vv_t = torch.stack(vs)
+                    if c.gsyn:
+                        self._gsyn_chunk(
+                            kk_t,
+                            torch.zeros(len(ks), dtype=torch.long,
+                                        device=dev),
+                            ss_t, v=vv_t)
+                    if c.gsyn_deep:
+                        self._gsd_chunk(kk_t, None, ss_t, v=vv_t)
+                    if c.dnet:
+                        self._dnet_chunk(kk_t, None, ss_t, v=vv_t)
+        finally:
+            self._rl_flush()
+            self._gsd_flush()
+            self._dnet_flush()
+        self.journal.append(("we", tag))
+        return rep
+
     # -- teacher graft -------------------------------------------------
 
     def graft_teacher(self, emb, method: str | None = None) -> dict:
@@ -3307,6 +4359,11 @@ class _LearnMixin:
         R = R / R.norm(dim=1, keepdim=True).clamp(min=1e-8) \
             * math.sqrt(c.topic_dim)
         self._R = R.float().to(self._dev)
+        if self._Rl is not None:
+            # graft rebases the feature space - rebuild the blended
+            # readout matrix over the new rows (Rl is zero anyway:
+            # graft is only legal before learning)
+            self._Reff = self._R.float() + self._Rl
         self._graft = {"src": str(emb), "method": method,
                        "teacher_dim": int(E.shape[1]),
                        "topic_dim": int(c.topic_dim)}
@@ -3616,3 +4673,4 @@ class _LearnMixin:
             self._ep_g.fill_(self._count)
             self._regime_g.fill_(0)
             self._reg_used_g.fill_(0)
+

@@ -587,6 +587,66 @@ def test_cuda_bulk_ring_wrap_integrity():
     assert (m._ringg.cpu().numpy() == m._ring.astype(np.int32)).all()
 
 
+def test_cuda_primary_no_phantom_follower():
+    """Hot context with >M distinct followers in one block: surplus
+    newcomers must be dropped, not clamped into column M-1 under a
+    wrong label (the phantom mega-count that made hot o3 cells vote
+    context-free frequent tokens)."""
+    if not torch.cuda.is_available():
+        import pytest
+        pytest.skip("no CUDA")
+    m = FluxLM(_cfg(device="cuda", cuda_primary=True))
+    seq = []
+    for f in range(40):                      # 40 followers > M=16
+        seq += [10, 11, 12, 100 + f]
+    m.ingest(seq)
+    for t in (10, 11, 12):
+        m._push(t)
+    end = torch.tensor(m._count - 1, device=m._dev)
+    keys, _valid = m._keys_dev(end)
+    pk = m._gt.ctx_hash_all(keys)
+    slot, found = m._gt.probe_fixed(pk, rows=m._gt._ordx)
+    oi3 = m._gt.kidx[3]
+    assert bool(found[oi3])
+    rc = m._gt.tcnt[oi3, slot[oi3]]
+    live = rc[rc > 0]
+    tot = float(m._gt.ttot[oi3, slot[oi3]])
+    # every (ctx, tok) pair was sighted once - no column may hold the
+    # aggregated mass of many dropped followers
+    assert float(live.max()) <= 3.0 * float(live.median())
+    # honest sightings total: includes dropped followers' mass
+    assert tot >= float(live.sum())
+    assert tot >= 20.0
+
+
+def test_fuzzy_lift_weight_scaled_clip():
+    """A bulk-diverged dense state (_S reaching ~300x eager norm on
+    cuda_primary) must not inject kilohertz-scale logits through the
+    fuzzy lift channels: the clip scales with the channel's hedged
+    weight, so a muted channel stays a whisper."""
+    m = FluxLM(_cfg(gsyn=True, gsyn_deep=True, dnet=True))
+    # simulate the diverged-state regime directly
+    m._S.mul_(0).add_(1e6)
+    if getattr(m, "_Wd1", None) is not None:
+        m._Wd1.mul_(0).add_(1e4)
+        m._Wd2.mul_(0).add_(1e4)
+    for ds in getattr(m, "_DS", []):
+        ds.mul_(0).add_(1e6)
+    # drive the channel weight to the hedge floor (the muted regime)
+    for ch in ("gsyn", "gsd", "dnet"):
+        m._w[m._chix[ch]] = m.config.hedge_min
+    m._w /= m._w.sum()
+    for t in (1, 2, 3):
+        m._push(t)
+    cap = m.config.lift_clip * min(
+        len(m.channels) * m.config.hedge_min, 1.0) * 1.01
+    for fn in (m._gsyn_lift_vec, m._gsd_lift_vec, m._dnet_lift_vec):
+        v = fn(0)
+        assert v is not None
+        assert torch.isfinite(v).all()
+        assert float(v.abs().max()) <= cap + 1e-4
+
+
 def test_cuda_deep_votes_no_ghost_on_miss():
     """An epi probe MISS must yield zero deep votes — _deep_votes_dev
     previously read cells from the default slot's unrelated row."""
@@ -863,6 +923,20 @@ def test_fused_seq_matches_fused_step():
     assert m1._knn_cur == m2._knn_cur
     assert m1._epi_n == m2._epi_n
     assert (m1._ring == m2._ring).all()
+
+
+def test_ppm_escape_c_fused_step():
+    """ppm_escape_c on the cuda_primary fused path must not crash —
+    regression for _hedge_dev reading rows_t/V from _step_dev's frame
+    (unbound in its own scope → NameError mid-graph-warmup)."""
+    if not torch.cuda.is_available():
+        import pytest
+        pytest.skip("no CUDA")
+    m = FluxLM(_cfg(device="cuda", cuda_primary=True, ppm_escape_c=True,
+                    compile_dev=False))
+    m.ingest(_ids("the cat sat on the mat. " * 10))
+    lg = m._fused_step(ord(" ") % 512)
+    assert torch.isfinite(lg).all()
 
 
 def test_cuda_forward_deterministic():
@@ -1909,3 +1983,745 @@ def test_reinforce_alts_skips_greedy():
         alts = [[(ids[0], 1.0), (5, 1e-9)]]
     rep = m.reinforce_alts("g", P, gain=2.0)
     assert rep["applied"] == 0
+
+def test_journal_bytes_bounds_bulk_payload():
+    """journal_bytes caps retained "bc" block payload: oldest blocks
+    prefix-drop (revert horizon shrinks) while the count stays honest.
+    CPU ingest uses _learn_token (no bc blocks) - needs cuda_primary."""
+    if not torch.cuda.is_available():
+        return
+    m = FluxLM(_cfg(device="cuda", cuda_primary=True, journal_bytes=1))
+    for i in range(4):
+        m.ingest(_ids(f"payload block number {i} " * 60), tag=f"b{i}")
+        m.soft_reset()
+    j = m.journal
+    # every bc block was evicted by the ~0-byte budget
+    assert j.block_bytes == 0
+    assert j.dropped_blocks >= 1
+    assert not any(e[0] == "bc" for e in j.entries)
+    # revert still runs cleanly over what remains
+    rep = m.revert_since()
+    assert "reverted" in rep
+
+
+def test_journal_bytes_keeps_recent_block():
+    """A roomy budget retains the block AND its payload accounting, so
+    tag-scoped revert still undoes a fresh bulk ingest exactly."""
+    if not torch.cuda.is_available():
+        return
+    m = FluxLM(_cfg(device="cuda", cuda_primary=True,
+                    journal_bytes=1 << 30))
+    m.ingest(_ids("keep me stable context. " * 40), tag="keep")
+    m.soft_reset()
+    m.ingest(_ids("zzqxyv junk data " * 200), tag="junk")
+    m.soft_reset()
+    before = m.journal.block_bytes
+    assert before > 0                    # both blocks' payloads counted
+    rep = m.revert_tag("junk")
+    assert rep["reverted"] > 0
+    # junk's block payload released; "keep" still retained
+    assert 0 < m.journal.block_bytes < before
+
+
+# ---- r_live: no-SFT live features (params + knobs, not distillation) ---------
+
+
+def _cfg_rlive(**kw):
+    kw.setdefault("vocab_size", 512)
+    kw.setdefault("eos_token_id", -1)
+    kw.setdefault("gsyn", True)
+    kw.setdefault("gcell", True)
+    return FluxConfig(**kw)
+
+
+def test_r_live_rows_drift_and_locality():
+    """r_live: _Rl[tok] EMAs toward the pre-token context sketch -
+    rows for SEEN tokens move off zero, unseen rows stay zero, and
+    the frozen _R seed table is never touched (undo math needs it)."""
+    m = FluxLM(_cfg_rlive())
+    assert m._R.dtype == torch.int8          # frozen feature base
+    assert m._Rl is not None and m._Reff is not None
+    R0, Re0 = m._R.clone(), m._Reff.clone()
+    ids = _ids("the cat sat on the mat. " * 8)
+    m.ingest(ids, tag="t")
+    seen = set(ids)
+    assert torch.equal(m._R, R0)             # context-side untouched
+    assert all(float(m._Rl[t].norm()) > 0 for t in seen)
+    assert all(float(m._Rl[t].norm()) == 0
+               for t in range(512) if t not in seen)
+    assert not torch.equal(m._Reff, Re0)
+
+
+def test_r_live_semantic_convergence():
+    """Tokens sharing contexts converge toward similar effective
+    features - the structure a teacher graft would inject comes
+    from the stream."""
+    m = FluxLM(_cfg_rlive())
+    # X and Y always appear in the same slot of the pattern
+    ids = _ids("cat ctxX mid dog ctxY mid " * 12)
+    m.ingest(ids, tag="t")
+    X, Y, Z = ord("X") % 512, ord("Y") % 512, ord("q") % 512
+    cos_xy = torch.nn.functional.cosine_similarity(
+        m._Reff[X], m._Reff[Y], dim=0).item()
+    cos_xz = torch.nn.functional.cosine_similarity(
+        m._Reff[X], m._Reff[Z], dim=0).item()
+    assert cos_xy > cos_xz
+
+
+def test_r_live_revert_restores_rows():
+    """revert_tag un-learns the feature drift too - _Rl zeroes back
+    out and the blended _Reff returns to its pre-tag values."""
+    m = FluxLM(_cfg_rlive())
+    m.ingest(_ids("baseline text " * 4), tag="keep")
+    Re_mid, Rl_mid = m._Reff.clone(), m._Rl.clone()
+    ids = _ids("poison features here " * 4)
+    m.ingest(ids, tag="bad")
+    assert not torch.equal(m._Rl, Rl_mid)
+    m.revert_tag("bad")
+    assert torch.equal(m._Rl, Rl_mid)
+    assert torch.equal(m._Reff, Re_mid)
+
+
+def test_r_live_gsyn_readout_no_teacher():
+    """gsyn alone - no graft, no distill - lifts the observed
+    follower after live-learned ingest."""
+    m = FluxLM(_cfg_rlive())
+    m.ingest(_ids("the cat sat on the mat. " * 8), tag="t")
+    m.soft_reset()
+    m.ingest(_ids("on the"), learn=False)
+    gk = m._gsyn_keys(m._gcell_feats(m._c, m._c2, m._count - 1))
+    top = torch.topk(m._gsyn_logits(gk), 8).indices.tolist()
+    assert ord(" ") % 512 in top
+
+
+def test_r_live_off_keeps_bipolar_rows():
+    """r_live=False: no drift table at all - _R stays the seeded int8
+    bipolar init and _Reff doesn't exist."""
+    m = FluxLM(_cfg_rlive(r_live=False))
+    assert m._R.dtype == torch.int8
+    assert m._Rl is None and m._Reff is None
+    R0 = m._R.clone()
+    m.ingest(_ids("the cat sat on the mat. " * 4), tag="t")
+    assert torch.equal(m._R, R0)
+
+
+def test_r_live_snapshot_roundtrip(tmp_path):
+    """The live-learned _Rl drift table survives snapshot/load and
+    _Reff re-derives as _R + _Rl."""
+    m = FluxLM(_cfg_rlive())
+    m.ingest(_ids("persistent features " * 4), tag="t")
+    p = tmp_path / "m.flux"
+    m.snapshot(p)
+    m2 = FluxLM.load(p)
+    assert m2._Rl is not None and m2._Reff is not None
+    assert torch.equal(m2._Rl, m._Rl)
+    assert torch.equal(m2._Reff, m._Reff)
+
+
+# ---- recall->gen transfer: gen channels learn from what recall knows ----
+
+
+def test_gen_recall_floor():
+    """gen_recall: tokens the order cells already predict (warm
+    context -> low surprise) still reach the gen channels at the
+    floor weight - recall-proven associations don't fade to ~0."""
+    ids = _ids("the cat sat on the mat. " * 6)
+    m_off = FluxLM(_cfg_rlive(gen_recall=0.0))
+    m_on = FluxLM(_cfg_rlive(gen_recall=0.9))
+    m_off.ingest(ids, tag="t")
+    m_on.ingest(ids, tag="t")
+    # same corpus, same seed -> identical seeded state; the floor
+    # writes strictly more gen-channel mass on repeated contexts
+    assert float(m_on._S.norm()) > float(m_off._S.norm())
+    assert float(m_on._Rl.abs().sum()) \
+        > float(m_off._Rl.abs().sum())
+
+
+def test_consolidate_gen_transfers_recall():
+    """consolidate_gen mines the recall channels (order cells) and
+    writes their successor distributions into gcell/gsyn/_Rl - the
+    gen side absorbs memory contents without re-ingest."""
+    m = FluxLM(_cfg_rlive())
+    m.ingest(_ids("the cat sat on the mat. " * 6), tag="t")
+    gc0, S0, Rl0 = len(m._gc), m._S.clone(), m._Rl.clone()
+    rep = m.consolidate_gen(mass=1.0, top_m=3, tag="gencon")
+    assert rep["positions"] > 0
+    assert rep["gcell"] > 0 and rep["gsyn"] > 0 and rep["rl"] > 0
+    assert len(m._gc) >= gc0
+    assert not torch.equal(m._S, S0)
+    assert not torch.equal(m._Rl, Rl0)
+
+
+def test_consolidate_gen_revert_exact():
+    """A consolidation sweep is fully journaled: revert_writes(tag)
+    restores _S/_Ss/_Rl/_Reff and the gcell map bit-exactly."""
+    m = FluxLM(_cfg_rlive(gsyn_slow_decay=0.99))
+    m.ingest(_ids("revert me please " * 8), tag="t")
+    S0, Ss0 = m._S.clone(), m._Ss.clone()
+    Rl0, Re0 = m._Rl.clone(), m._Reff.clone()
+    gc0 = {k: dict(v) for k, v in m._gc.items()}
+    gct0 = dict(m._gct)
+    m.consolidate_gen(mass=2.0, top_m=3, tag="gencon")
+    rep = m.revert_writes("gencon")
+    assert rep["reverted"] > 0
+    assert torch.equal(m._S, S0) and torch.equal(m._Ss, Ss0)
+    assert torch.equal(m._Rl, Rl0) and torch.equal(m._Reff, Re0)
+    assert {k: dict(v) for k, v in m._gc.items()} == gc0
+    assert m._gct == gct0
+
+
+def test_consolidate_gen_gpu(gpu_available):
+    """GPU path: batched probe over order cells + host ring features."""
+    m = FluxLM(_cfg_rlive(device="cuda", cuda_primary=True))
+    m.ingest(_ids("gpu recall transfer " * 8), tag="t")
+    rep = m.consolidate_gen(mass=1.0, top_m=3, tag="gencon")
+    assert rep["positions"] > 0 and rep["gsyn"] > 0
+    S1 = m._S.clone()
+    rep2 = m.revert_writes("gencon")
+    assert rep2["reverted"] > 0
+    assert not torch.equal(m._S, S1)
+
+
+# -- gen_live: the live generalizer "gen head" (R68) ------------------
+
+
+def test_gen_live_off_default():
+    """gen_live defaults OFF - opt-in knob, zero behavior change."""
+    assert FluxConfig().gen_live == 0.0
+    m = FluxLM(_cfg_rlive())
+    m.ingest(_ids("plain ingest " * 6), tag="t")
+    assert m.config.gen_live == 0.0
+
+
+def test_gen_live_writes_more_mass_on_warm():
+    """On repeated text the order cells converge (surprise -> ~0), so
+    the realized-token writes fade - but the generalizer keeps
+    transferring the recalled distribution at gen_live*conf.  Same
+    corpus + seed: strictly more gen-channel mass than gen_live=0."""
+    ids = _ids("the cat sat on the mat. " * 8)
+    m_off = FluxLM(_cfg_rlive(gen_live=0.0))
+    m_on = FluxLM(_cfg_rlive(gen_live=1.0))
+    m_off.ingest(ids, tag="t")
+    m_on.ingest(ids, tag="t")
+    assert float(m_on._S.norm()) > float(m_off._S.norm())
+    assert float(m_on._Rl.abs().sum()) \
+        > float(m_off._Rl.abs().sum())
+
+
+def test_gen_live_thin_gate():
+    """First-seen contexts transfer nothing: a cell's post-write mass
+    (~surprise <= 1) stays below thin_tot, so conf = 0 and the gen
+    stores match a gen_live=0 model exactly."""
+    ids = list(range(1, 200))            # all-distinct: every ctx thin
+    m_off = FluxLM(_cfg_rlive(gen_live=0.0))
+    m_on = FluxLM(_cfg_rlive(gen_live=2.0))
+    m_off.ingest(ids, tag="t")
+    m_on.ingest(ids, tag="t")
+    assert torch.equal(m_on._S, m_off._S)
+    assert torch.equal(m_on._Rl, m_off._Rl)
+    assert len(m_on._gc) == len(m_off._gc)
+
+
+def test_gen_live_revert_exact():
+    """The generalizer's writes ride the same journal ops as every
+    other write - revert_since restores _gc/_gct/_Rl bit-exactly and
+    _S to fp16-factor precision (same class as test_gsyn_revert)."""
+    m = FluxLM(_cfg_rlive(gen_live=1.5))
+    m.ingest(_ids("revert me please " * 8), tag="t")
+    mark = m._count
+    S0, Rl0, Re0 = m._S.clone(), m._Rl.clone(), m._Reff.clone()
+    gc0 = {k: dict(v) for k, v in m._gc.items()}
+    gct0 = dict(m._gct)
+    m.ingest(_ids("revert me please " * 4), tag="gen")
+    assert not torch.equal(m._S, S0)      # transfers happened
+    m.revert_since(seq_pos=mark)
+    assert torch.allclose(m._S, S0, atol=2e-3)
+    assert torch.equal(m._Rl, Rl0) and torch.equal(m._Reff, Re0)
+    assert {k: dict(v) for k, v in m._gc.items()} == gc0
+    assert m._gct == gct0
+
+
+def test_gen_live_distribution_covers_alternates():
+    """A context with TWO distinct followers transfers both into the
+    gen channels on every occurrence - not just the realized token.
+    Alternate 'ab'->X and 'ab'->Y; the gen-live model's gcell writes
+    carry the second follower even on occurrences where it was not
+    the observed token (strictly more gcell write mass)."""
+    # "ab" + X / "ab" + Y alternating - the o2/o3 cells hold {X,Y}
+    ids = []
+    for i in range(12):
+        ids += _ids("ab") + [100 + (i % 2)]
+    m_off = FluxLM(_cfg_rlive(gen_live=0.0))
+    m_on = FluxLM(_cfg_rlive(gen_live=1.0))
+    m_off.ingest(ids, tag="t")
+    m_on.ingest(ids, tag="t")
+    tot_off = sum(m_off._gct.values())
+    tot_on = sum(m_on._gct.values())
+    assert tot_on > tot_off
+
+
+def test_gen_live_gpu(gpu_available):
+    """GPU bulk path: the slot2 post-write re-probe feeds the
+    transfer, so first-pass ingests generalize too; strictly more
+    gen mass than off."""
+    ids = _ids("gpu gen live check " * 8)
+    m_off = FluxLM(_cfg_rlive(device="cuda", cuda_primary=True,
+                            gen_live=0.0))
+    m_on = FluxLM(_cfg_rlive(device="cuda", cuda_primary=True,
+                           gen_live=1.0))
+    m_off.ingest(ids, tag="t")
+    m_on.ingest(ids, tag="t")
+    assert float(m_on._S.norm()) > float(m_off._S.norm())
+
+
+# -- gsyn_deep: separate nonlinear (TTT-MLP) memory channel ----------
+
+
+def _cfg_gsd(**kw):
+    kw.setdefault("vocab_size", 512)
+    kw.setdefault("eos_token_id", -1)
+    kw.setdefault("gsyn_deep", True)
+    return FluxConfig(**kw)
+
+
+def test_gsyn_deep_off_by_default():
+    """Opt-in channel: state tensors are None unless enabled."""
+    m = FluxLM(FluxConfig(vocab_size=512, eos_token_id=-1))
+    assert m._Wd1 is None and m._Wd2 is None
+    assert m.memory_report()["gsyn_deep_MB"] == 0.0
+    assert m.probe_gsyn_deep()["enabled"] is False
+
+
+def test_gsyn_deep_state_and_write():
+    """Init: seeded Wd1, zero Wd2 (silent channel).  Online writes
+    move theta; momentum buffers stay finite."""
+    m = FluxLM(_cfg_gsd())
+    assert m._Wd2.abs().sum().item() == 0.0     # zero-init
+    snap0 = m._gsd_snap()
+    m.ingest(_ids("deep memory learns " * 12), tag="t")
+    assert not torch.equal(m._Wd2, snap0[2])    # Wd2 moved
+    assert torch.isfinite(m._Wd1).all()
+    assert torch.isfinite(m._Wd2).all()
+    assert m._Sm2.abs().sum() > 0               # momentum ran
+
+
+def test_gsyn_deep_affects_prediction():
+    """Channel contributes logits in thin contexts (gate: votes only
+    when recall is silent)."""
+    m = FluxLM(_cfg_gsd(gsyn_deep_w=4.0))
+    m.ingest(_ids("unique deep tokens " * 10), tag="t")
+    q = m._gsyn_keys(m._gcell_feats(m._c, m._c2, m._count - 1))
+    lp = m._gsd_logits(q)
+    assert lp.shape[0] == m.vocab_size
+    assert torch.isfinite(lp).all()
+    gl = m._gsd_lift_vec(0)                     # thin -> votes
+    assert gl is not None and gl.abs().sum() > 0
+    gl_warm = m._gsd_lift_vec(1)                # warm -> abstains
+    assert gl_warm is None
+
+
+def test_gsyn_deep_nonlinear_vs_linear():
+    """The expressivity gap, controlled: antipodal keys (+u,-u) ->
+    same target is impossible for a linear map f(-u)=-f(u); the MLP
+    solves it.  This is the TTT-MLP vs TTT-Linear difference."""
+    torch.manual_seed(0)
+    m = FluxLM(_cfg_gsd(gsyn=True, r_live=False,
+                        gsyn_deep_lr=0.05))
+    dk = m.config.gsyn_dim
+    u1 = torch.randn(dk); u1 /= u1.norm()
+    u2 = torch.randn(dk); u2 /= u2.norm()
+    u2 = u2 - u2.dot(u1) * u1; u2 /= u2.norm()
+    ta, tb = m._R.float()[101], m._R.float()[202]
+    keys = [(u1, ta), (-u1, ta), (u2, tb), (-u2, tb)]
+    for i in range(3200):
+        k_, v_ = keys[i % 4]
+        m._gsyn_write_vec(k_, v_, 1.0, journal=False)
+        m._gsd_write_vec(k_, v_, 1.0, journal=False)
+    lin_ok = dep_ok = 0
+    for k_, v_ in keys:
+        tgt = 101 if torch.equal(v_, ta) else 202
+        lin_ok += int(int(m._gsyn_logits(k_).argmax()) == tgt)
+        dep_ok += int(int(m._gsd_logits(k_).argmax()) == tgt)
+    assert dep_ok == 4                  # MLP solves antipodal map
+    assert lin_ok < dep_ok              # linear provably cannot
+
+
+def test_gsyn_deep_journal_and_revert():
+    """Session-scoped ("gd", snap) entries; revert_tag restores
+    theta+momentum bit-exactly and must not bleed into the previous
+    span's snapshot (boundary semantics)."""
+    m = FluxLM(_cfg_gsd())
+    ids = _ids("journal me deeply " * 8)
+    m.ingest(ids, tag="keep")
+    pre = m._gsd_snap()
+    m.ingest(ids[:40], tag="undo_me")
+    m.revert_tag("undo_me")
+    assert all(torch.equal(a, b)
+               for a, b in zip(m._gsd_params(), pre))
+    # the earlier span's snapshot survives (was a real bug: "gd"
+    # wasn't a boundary op and the rewind overshot)
+    assert sum(1 for e in m.journal.entries if e[0] == "gd") == 1
+
+
+def test_gsyn_deep_snapshot_roundtrip(tmp_path):
+    m = FluxLM(_cfg_gsd())
+    m.ingest(_ids("persist the deep " * 8), tag="t")
+    p = tmp_path / "m.flux"
+    m.snapshot(str(p))
+    m2 = FluxLM.load(str(p))
+    assert all(torch.equal(a, b)
+               for a, b in zip(m._gsd_params(), m2._gsd_params()))
+    # predictions carry over too
+    q = m2._gsyn_keys(m2._gcell_feats(m2._c, m2._c2,
+                                      m2._count - 1))
+    assert torch.equal(m._gsd_logits(q), m2._gsd_logits(q))
+
+
+def test_gsyn_deep_consolidate_writes():
+    """consolidate_gen sweeps order-cell evidence into the deep
+    channel alongside gsyn (same key space, separate theta)."""
+    m = FluxLM(_cfg_gsd(gsyn=True, gcell=True, r_live=True))
+    m.ingest(_ids("consolidate deeply " * 8), tag="t")
+    rep = m.consolidate_gen(mass=1.0, top_m=3, tag="gencon")
+    assert rep["gsyn_deep"] > 0
+    assert rep["gsyn"] > 0
+
+
+def test_gsyn_deep_explain_marks_channel():
+    m = FluxLM(_cfg_gsd(gsyn_deep_w=4.0))
+    m.ingest(_ids("explain the deep channel " * 8), tag="t")
+    # a context with no order-cell evidence is thin -> deep votes
+    m._c.zero_(); m._c2.zero_()
+    rep = m.explain()
+    chans = set()
+    for e in rep["top"]:
+        chans.update(e["channels"].keys())
+    # channel may abstain when uniform - but when it contributes the
+    # label must be present and nonzero
+    if "gsyn_deep" in chans:
+        assert any(abs(e["channels"].get("gsyn_deep", 0)) > 0
+                   for e in rep["top"])
+
+
+def test_gsyn_deep_nan_guard():
+    """Non-finite keys/values/surprise are refused - theta stays
+    finite (the S-poisoning bug class, pre-guarded here)."""
+    m = FluxLM(_cfg_gsd())
+    k = torch.full((m.config.gsyn_dim,), float("nan"))
+    v = torch.zeros(m.config.topic_dim)
+    m._gsd_write_vec(k, v, 1.0)
+    k0 = torch.randn(m.config.gsyn_dim)
+    m._gsd_write_vec(k0, torch.full((m.config.topic_dim,),
+                                    float("nan")), 1.0)
+    m._gsd_write_vec(k0, v, float("nan"))       # s=NaN -> maximal
+    assert torch.isfinite(m._Wd1).all()
+    assert torch.isfinite(m._Wd2).all()
+
+
+def test_gsyn_deep_gpu(gpu_available):
+    """GPU path: fused-step writes land + lift applies post-logits."""
+    m = FluxLM(_cfg_gsd(device="cuda", cuda_primary=True,
+                        gsyn=True, gcell=True))
+    m.ingest(_ids("gpu deep memory " * 8), tag="t")
+    assert float(m._Wd2.abs().sum()) > 0
+    pb = m.probe_gsyn_deep()
+    assert pb["enabled"] and pb["theta_drift"] > 0
+
+
+# -- dnet: iterated (stacked delta-rule) memory channel ---------------
+
+
+def _cfg_dnet(**kw):
+    kw.setdefault("vocab_size", 512)
+    kw.setdefault("eos_token_id", -1)
+    kw.setdefault("dnet", True)
+    return FluxConfig(**kw)
+
+
+def test_dnet_off_by_default():
+    m = FluxLM(FluxConfig(vocab_size=512, eos_token_id=-1))
+    assert m._DS == []
+    assert m.memory_report()["dnet_MB"] == 0.0
+    assert m.probe_dnet()["enabled"] is False
+
+
+def test_dnet_state_and_write():
+    """Zero-init states; online writes move all layer states; no
+    optimizer/KV state exists at all."""
+    m = FluxLM(_cfg_dnet())
+    assert all(float(s.abs().sum()) == 0.0 for s in m._DS)
+    m.ingest(_ids("iterated memory " * 12), tag="t")
+    assert float(m._DS[0].abs().sum()) > 0
+    assert all(torch.isfinite(s).all() for s in m._DS)
+    assert m.memory_report()["dnet_MB"] < 1.0   # ~0.34MB by design
+
+
+def test_dnet_affects_prediction():
+    m = FluxLM(_cfg_dnet(dnet_w=4.0))
+    m.ingest(_ids("dnet tokens flow " * 10), tag="t")
+    q = m._gsyn_keys(m._gcell_feats(m._c, m._c2, m._count - 1))
+    lp = m._dnet_logits(q)
+    assert lp.shape[0] == m.vocab_size
+    assert torch.isfinite(lp).all()
+    assert m._dnet_lift_vec(0) is not None      # thin -> votes
+    assert m._dnet_lift_vec(1) is None          # warm -> abstains
+
+
+def test_dnet_depth_exceeds_linear_ceiling():
+    """The iteration argument, controlled: antipodal keys (+u,-u) ->
+    same target caps a single delta layer at chance (f(-u)=-f(u) is
+    structural).  relu(o1) breaks odd symmetry, so a 2-layer stack
+    must strictly exceed the single-layer score."""
+    torch.manual_seed(0)
+    scores = []
+    for layers in (1, 2):
+        m = FluxLM(_cfg_dnet(dnet_layers=layers, r_live=False))
+        dk = m.config.gsyn_dim
+        u1 = torch.randn(dk); u1 /= u1.norm()
+        u2 = torch.randn(dk); u2 /= u2.norm()
+        u2 = u2 - u2.dot(u1) * u1; u2 /= u2.norm()
+        ta, tb = m._R.float()[101], m._R.float()[202]
+        keys = [(u1, ta), (-u1, ta), (u2, tb), (-u2, tb)]
+        for i in range(2400):
+            k_, v_ = keys[i % 4]
+            m._dnet_write_vec(k_, v_, 1.0, journal=False)
+        ok = sum(int(m._dnet_logits(k_).argmax()
+                     == (101 if torch.equal(v_, ta) else 202))
+                 for k_, v_ in keys)
+        scores.append(ok)
+    assert scores[0] <= 2           # single layer: linear ceiling
+    assert scores[1] > scores[0]    # stack: strictly more expressive
+
+
+def test_dnet_journal_and_revert():
+    m = FluxLM(_cfg_dnet())
+    ids = _ids("dnet journal " * 8)
+    m.ingest(ids, tag="keep")
+    pre = m._dnet_snap()
+    m.ingest(ids[:40], tag="undo_me")
+    m.revert_tag("undo_me")
+    assert all(torch.equal(a, b) for a, b in zip(m._DS, pre))
+    assert sum(1 for e in m.journal.entries if e[0] == "dn") == 1
+
+
+def test_dnet_snapshot_roundtrip(tmp_path):
+    m = FluxLM(_cfg_dnet())
+    m.ingest(_ids("persist dnet " * 8), tag="t")
+    p = tmp_path / "m.flux"
+    m.snapshot(str(p))
+    m2 = FluxLM.load(str(p))
+    assert all(torch.equal(a, b) for a, b in zip(m._DS, m2._DS))
+    q = m2._gsyn_keys(m2._gcell_feats(m2._c, m2._c2,
+                                      m2._count - 1))
+    assert torch.equal(m._dnet_logits(q), m2._dnet_logits(q))
+
+
+def test_dnet_consolidate_writes():
+    m = FluxLM(_cfg_dnet(gsyn=True, gcell=True, r_live=True))
+    m.ingest(_ids("consolidate the stack " * 8), tag="t")
+    rep = m.consolidate_gen(mass=1.0, top_m=3, tag="gencon")
+    assert rep["dnet"] > 0
+
+
+def test_dnet_nan_guard():
+    m = FluxLM(_cfg_dnet())
+    bad = torch.full((m.config.gsyn_dim,), float("nan"))
+    m._dnet_write_vec(bad, torch.zeros(m.config.topic_dim), 1.0)
+    ok = torch.randn(m.config.gsyn_dim)
+    m._dnet_write_vec(ok, torch.full((m.config.topic_dim,),
+                                     float("nan")), 1.0)
+    m._dnet_write_vec(ok, torch.zeros(m.config.topic_dim),
+                      float("nan"))
+    assert all(torch.isfinite(s).all() for s in m._DS)
+
+
+def test_dnet_gpu(gpu_available):
+    m = FluxLM(_cfg_dnet(device="cuda", cuda_primary=True,
+                         gsyn=True, gcell=True))
+    m.ingest(_ids("gpu iterated memory " * 8), tag="t")
+    assert float(m._DS[0].abs().sum()) > 0
+    pb = m.probe_dnet()
+    assert pb["enabled"] and len(pb["layers"]) == 2
+
+
+def test_bloom_doorkeeper_eager():
+    """bloom_admit=2: a context's first sighting sets filter bits
+    instead of a cell; the row materializes on the second sighting.
+    Hapax-heavy streams then grow ~no tables/journal; repeated streams
+    admit everything (losing only the first observation)."""
+    seq = _ids("door keeper test phrase. ")
+    m = FluxLM(_cfg(bloom_admit=2))
+    m.ingest(seq)
+    cells1 = sum(len(t) for t in m._tables.values())
+    j1 = len(m.journal.entries)
+    m.ingest(seq)
+    m.ingest(seq)
+    cells2 = sum(len(t) for t in m._tables.values())
+    assert cells2 > cells1          # recurring contexts promoted
+    assert cells1 == 0              # nothing materialized on sighting 1
+    # random stream: ~all keys are hapax -> near-total suppression
+    rng = np.random.RandomState(0)
+    ids = rng.randint(0, 512, 4000).tolist()
+    mg = FluxLM(_cfg(bloom_admit=2))
+    mg.ingest(ids)
+    mu = FluxLM(_cfg())
+    mu.ingest(ids)
+    cg = sum(len(t) for t in mg._tables.values())
+    cu = sum(len(t) for t in mu._tables.values())
+    assert cg < cu // 4
+    assert len(mg.journal.entries) < len(mu.journal.entries)
+
+
+def test_bloom_doorkeeper_teach_bypasses():
+    """teach() is explicit supervision - the admission gate must not
+    swallow it."""
+    m = FluxLM(_cfg(bloom_admit=2))
+    m.teach(_ids("the answer is"), [42])
+    cells = sum(len(t) for t in m._tables.values())
+    assert cells > 0
+
+
+def test_bloom_doorkeeper_revert_consistent():
+    """Gated writes never journal; undo still exactly restores state."""
+    m = FluxLM(_cfg(bloom_admit=2))
+    seq = _ids("revertible bloom phrase ")
+    m.ingest(seq * 3, tag="keep")
+    n = sum(len(t) for t in m._tables.values())
+    m.ingest(seq * 2, tag="undo_me")
+    rep = m.revert_tag("undo_me")
+    assert rep["found"]
+    n2 = sum(len(t) for t in m._tables.values())
+    assert n2 == n
+
+
+def test_cuda_csem_inf_rows_cannot_poison_logits():
+    """fp16 csem rows that overflowed to +-inf (observed on a real
+    350k-tok bulk ingest: _A magnitudes ~3e8 >> fp16 max 65504) must be
+    masked at read time - rn=inf used to pass the `rn > 1e-8` guard and
+    0*inf=NaN then poisoned the whole logit vector."""
+    if not torch.cuda.is_available():
+        import pytest
+        pytest.skip("no CUDA")
+    m = FluxLM(_cfg(device="cuda", cuda_primary=True))
+    seq = _ids("csem overflow regression ") * 4
+    m.ingest(seq, tag="t")
+    m._csem_rows.fill_(float("inf"))            # worst-case corruption
+    for x in seq[:16]:
+        m._learn_token(x)
+    lg = torch.as_tensor(m._predict()).float()
+    assert torch.isfinite(lg).all()
+
+
+def test_knob_head_attach_remix_and_open_system(tmp_path):
+    """KnobHead: attach routes _predict through the remix, tables are
+    inspectable/removable/restorable, and snapshot round-trips state."""
+    from forge.model.flux import KnobHead
+    m = FluxLM(_cfg())
+    m.ingest(_ids("knob head routing test data " * 4), tag="t")
+    raw = torch.as_tensor(m._predict()).float()
+
+    head = KnobHead()
+    # seed the cells this model will key into: dom=0 (empty-stats
+    # argmax), any conf bin; plus the conf-only fallback row
+    for b in range(9):
+        head.mixes[(0, b)] = np.full(head.C, 1.0 / head.C)
+        head.cov[(0, b)] = [4.0, 4.0]
+        head.lam[(0, b)] = 0.5
+        head.mixes[(-1, b)] = np.full(head.C, 1.0 / head.C)
+        head.cov[(-1, b)] = [4.0, 4.0]
+    m.attach_head(head)
+    out = torch.as_tensor(m._predict()).float()
+    assert torch.isfinite(out).all()
+    assert not torch.allclose(out, raw)          # remix applied
+    assert abs(float(torch.softmax(out, -1).sum()) - 1.0) < 1e-3
+
+    rep = head.report()
+    assert "conf_bin" in rep and "w_rest" in rep
+    cp = head.checkpoint()
+    k0 = next(iter(head.mixes))
+    assert head.remove_pattern(k0) and k0 not in head.mixes
+    head.restore(cp)
+    assert k0 in head.mixes                      # exact restore
+
+    p = m.snapshot(tmp_path / "h.flux")
+    m2 = FluxLM.load(p)
+    assert m2._head is not None
+    assert m2._head.mixes.keys() == head.mixes.keys()
+    out2 = torch.as_tensor(m2._predict()).float()
+    assert torch.isfinite(out2).all()
+    m.detach_head()
+    raw2 = torch.as_tensor(m._predict()).float()
+    assert torch.allclose(raw2, raw)             # detach restores
+
+
+def test_knob_head_engine_routing(tmp_path):
+    """ForgeEngine passthrough: attach_head + generate route through
+    the remix on the memory-model path."""
+    from forge.model.flux import KnobHead
+    from forge.engine.forge_engine import ForgeEngine
+    eng = ForgeEngine.from_flux(config=_cfg(vocab_size=65536))
+    eng.model.ingest(_ids("engine head routing " * 6), tag="boot")
+    head = KnobHead()
+    for b in range(9):
+        head.mixes[(0, b)] = np.full(head.C, 1.0 / head.C)
+        head.cov[(0, b)] = [4.0, 4.0]
+        head.mixes[(-1, b)] = np.full(head.C, 1.0 / head.C)
+        head.cov[(-1, b)] = [4.0, 4.0]
+    eng.attach_head(head)
+    assert "conf_bin" in eng.head_report()
+    txt = eng.generate("engine head", max_new_tokens=8,
+                       temperature=0.0, learn=False)
+    assert isinstance(txt, str)
+    eng.detach_head()
+    assert eng.model._head is None
+
+
+def test_knob_head_poe_tables_and_thin_cells(tmp_path):
+    """vpos/gof (product-of-experts veto stats) fit from counting,
+    veto_vec is centered/normalized, thin_cells exposes failure
+    contexts, and the geo arm runs inside remix."""
+    from forge.model.flux import KnobHead
+    head = KnobHead()
+    C = head.C
+    rng = np.random.default_rng(0)
+    N, K, V = 400, 16, 4096
+    scal = rng.random((N, 128)).astype(np.float32)
+    ltgt = np.log(rng.uniform(1e-4, 0.5, (N, C))).astype(np.float32)
+    csup = np.log(rng.uniform(1e-4, 0.5, (N, K, C)))
+    cid = rng.integers(0, V, (N, K))
+    cpr = np.log(rng.uniform(0.01, 0.9, (N, K)))
+    tgt = rng.integers(0, V, N)
+    cid[::2, 0] = tgt[::2]                       # half covered
+    head.fit({"scal": scal, "ltgt": ltgt, "csup": csup,
+              "cid": cid, "cpr": cpr}, tgt, rounds=2)
+
+    assert head.vpos                             # vpos fitted
+    b = head.veto_vec(next(iter(head.vpos)))
+    assert np.abs(b).max() <= 1.0 + 1e-9
+    assert abs(b.mean()) < 1e-6                  # centered
+    assert all(0.0 <= g <= 1.0 for g in head.gof.values())
+
+    thin = head.thin_cells(min_n=30, min_miss=0.3)
+    assert thin and all("key" in t and "mix" in t for t in thin)
+
+    cp = head.checkpoint()
+    k0 = next(iter(head.vpos))
+    assert head.remove_pattern(k0) and k0 not in head.vpos
+    head.restore(cp)
+    assert k0 in head.vpos
+
+    st = head.state_dict()
+    h2 = KnobHead.load_state_dict(st)
+    assert h2.vpos.keys() == head.vpos.keys()
+    assert h2.gof == head.gof
+
+    # live remix with the geo arm on (seed gof on conf fallback row)
+    m = FluxLM(_cfg(vocab_size=65536))
+    m.ingest(_ids("poe head live remix " * 6), tag="t")
+    for kk in list(h2.mixes):
+        h2.gof[kk] = 1.0                         # force pure geo arm
+    m.attach_head(h2)
+    out = torch.as_tensor(m._predict()).float()
+    assert torch.isfinite(out).all()
+    rep = h2.report()
+    assert "veto" in rep or "gof" in rep

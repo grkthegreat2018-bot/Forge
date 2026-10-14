@@ -126,10 +126,12 @@ if HAS_TRITON:
 
         if USE_CSEM:
             rn = tl.load(rn_ptr)
-            okc = tl.load(cf_ptr) & tl.load(cok_ptr) & (rn > 1e-8)
+            okc = tl.load(cf_ptr) & tl.load(cok_ptr) \
+                & (rn > 1e-8) & (rn < float("inf"))
             w = tl.load(wg_ptr + CSEMX).to(tl.float32)
-            lg += okc.to(tl.float32) * w * BETA_CSEM \
-                * tl.load(csims_ptr + off, mask=m, other=0.0)
+            lg += tl.where(okc, w * BETA_CSEM
+                           * tl.load(csims_ptr + off, mask=m,
+                                     other=0.0), 0.0)
 
         kvt = tl.load(kvt_ptr)
         f_k = (kvt > 0).to(tl.float32)

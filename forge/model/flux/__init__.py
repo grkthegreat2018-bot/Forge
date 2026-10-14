@@ -61,9 +61,10 @@ from .journal import FluxJournal
 from .tables import _GPUCellTables
 from .kernels import HAS_TRITON
 from .model import FluxLM
+from .knobhead import KnobHead
 
 __all__ = [
-    "FluxLM", "FluxConfig", "FluxJournal", "HAS_TRITON",
+    "FluxLM", "FluxConfig", "FluxJournal", "KnobHead", "HAS_TRITON",
     "_GPUCellTables", "_HASH_P", "_MASK64", "_MIX1", "_MIX2",
     "_load_teacher_embedding", "_mix64", "_s64", "_scatter_sum",
     "_group_add", "_group_totals",

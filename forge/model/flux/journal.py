@@ -23,13 +23,22 @@ class FluxJournal:
     """
 
     __slots__ = ("entries", "cap", "dropped", "vec_ring", "vec_cursor",
-                 "vec_cap", "w_ring", "w_cursor", "w_cap")
+                 "vec_cap", "w_ring", "w_cursor", "w_cap",
+                 "block_bytes", "block_cap", "dropped_blocks")
 
     def __init__(self, cap: int, vec_cap: int, topic_dim: int,
-                 n_chan: int):
+                 n_chan: int, block_cap: int = 1 << 30):
         self.entries: list[tuple] = []
         self.cap = cap
         self.dropped = 0
+        # bulk-block payload budget: "bc" entries carry per-block undo
+        # tensors + sub-journals (~50-200MB each) - counting them as
+        # one entry made `cap` blind to bytes.  `block_cap` bounds the
+        # retained block payload; eviction is prefix-order (oldest
+        # first), the same semantics revert already tolerates.
+        self.block_bytes = 0
+        self.block_cap = block_cap
+        self.dropped_blocks = 0
         self.vec_ring = np.zeros((vec_cap, topic_dim), dtype=np.float16)
         self.vec_cursor = 0
         self.vec_cap = vec_cap
@@ -43,8 +52,46 @@ class FluxJournal:
         self.entries.append(entry)
         if len(self.entries) > self.cap:
             # drop oldest chunk (amortized) - revert horizon shrinks
+            for e in self.entries[: self.cap // 10]:
+                if e[0] == "bc":
+                    self.block_bytes -= _block_bytes(e[1])
+                    self.dropped_blocks += 1
             del self.entries[: self.cap // 10]
             self.dropped += self.cap // 10
+
+    def seal_bc(self, blk: dict) -> int:
+        """A bulk-ingest block finished collecting: account its payload
+        and prefix-evict oldest entries until the block byte budget
+        holds.  Returns the block's estimated bytes."""
+        n = _block_bytes(blk)
+        self.block_bytes += n
+        while self.entries and self.block_bytes > self.block_cap:
+            e = self.entries[0]
+            if e[0] == "bc":
+                self.block_bytes -= _block_bytes(e[1])
+                self.dropped_blocks += 1
+            del self.entries[0]
+            self.dropped += 1
+        return n
+
+    def pop_tail(self) -> tuple:
+        """entries.pop() with block accounting (undo paths)."""
+        e = self.entries.pop()
+        if e[0] == "bc":
+            self.block_bytes -= _block_bytes(e[1])
+        return e
+
+    def drop_range(self, lo: int, hi: int) -> None:
+        """del entries[lo:hi] with block accounting (undo paths)."""
+        for e in self.entries[lo:hi]:
+            if e[0] == "bc":
+                self.block_bytes -= _block_bytes(e[1])
+        del self.entries[lo:hi]
+
+    def recompute(self) -> None:
+        """Rebuild block_bytes after load() swapped in entries."""
+        self.block_bytes = sum(
+            _block_bytes(e[1]) for e in self.entries if e[0] == "bc")
 
     def append_vec(self, tok: int, delta: np.ndarray) -> tuple:
         slot = -1
@@ -66,6 +113,32 @@ class FluxJournal:
 
     def __len__(self) -> int:
         return len(self.entries)
+
+
+def _block_bytes(blk: dict) -> int:
+    """Rough retained-payload estimate for a "bc" block: tensor/array
+    nbytes + container overhead for sub-journal tuples, epi pairs, and
+    dict snapshots.  A heuristic bound, not exact accounting."""
+    total = 512
+    stack = [blk]
+    while stack:
+        x = stack.pop()
+        nb = getattr(x, "nbytes", None)
+        if nb is not None:
+            try:
+                total += int(nb)
+                continue
+            except Exception:
+                pass
+        if isinstance(x, dict):
+            total += 232 + 96 * len(x)
+            stack.extend(x.values())
+        elif isinstance(x, (list, tuple)):
+            total += 56 + 64 * len(x)
+            stack.extend(x)
+        elif isinstance(x, np.ndarray):
+            total += x.nbytes
+    return total
 
 
 # -- CUDA-primary sparse backend ----------------------------------------

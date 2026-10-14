@@ -61,13 +61,27 @@ class FluxLM(_StateMixin, _PredictMixin, _LearnMixin, _RevertMixin,
             + [f"p{j}" for j in range(len(c.sparse_taps))] \
             + [f"g{k}" for k in c.class_orders] \
             + [f"w{j}" for j in range(len(c.word_orders))] \
-            + [f"h{j}" for j in range(len(c.hybrid_taps))]
+            + [f"h{j}" for j in range(len(c.hybrid_taps))] \
+            + [ch for ch, on in (("gcell", c.gcell), ("gsyn", c.gsyn),
+                                 ("gsd", c.gsyn_deep),
+                                 ("dnet", c.dnet)) if on]
         self._chix = {ch: i for i, ch in enumerate(self.channels)}
+        # fuzzy lift-channel indices: hedged like every channel now
+        # (previously fixed-weight bypass - the measured cause of the
+        # ablation regression).  Real rewards in the eager and bulk
+        # paths; abstain (neutral uni fallback) on the fused device step.
+        self._fset = {"gcell", "gsyn", "gsd", "dnet"}
+        self._fidx = [self._chix[ch] for ch in
+                      ("gcell", "gsyn", "gsd", "dnet")
+                      if ch in self._chix]
         # host-table abstain mask: p<j>/g<k>/w<j>/h<j> channels have no
         # device reward on GPU - they take the mixture prob as a
         # neutral reward (weight-preserving) instead of the unigram
-        # fallback, which would decay them to hedge_min over training
+        # fallback, which would decay them to hedge_min over training.
+        # Fuzzy channels are excluded: their bulk rewards arrive via
+        # real_r (overwriting them here would kill that signal).
         self._pmask = np.array([ch.startswith(("p", "g", "w", "h"))
+                                and ch not in self._fset
                                 for ch in self.channels], dtype=bool)
         self._pidx = np.nonzero(self._pmask)[0].tolist()
         # thin_boost mask: retrieval/semantic channel indices that get
@@ -125,6 +139,16 @@ class FluxLM(_StateMixin, _PredictMixin, _LearnMixin, _RevertMixin,
             j: {} for j in range(len(c.hybrid_taps))}
         self._uni = np.zeros(V, dtype=np.float64)
         self._total = 0
+        # bloom doorkeeper (R63): counting-Bloom admission in front of
+        # cell creation - a key's first sighting sets bits, the row
+        # materializes on its bloom_admit-th sighting.  _bloom_h serves
+        # the dict tables (eager + bulk host-table writes); _bloom_g
+        # (init below) serves the GPU order-row write gate.  Admission
+        # metadata - not journaled; revert restores cells exactly and
+        # stale bits only over-promote afterward.
+        self._bloom_h = (np.zeros(c.bloom_bits, dtype=np.int16)
+                         if c.bloom_admit >= 2 else None)
+        self._bloom_g = None
 
         # device: dense readout tensors live here; sparse memory stays host.
         self._dev = torch.device(
@@ -162,6 +186,20 @@ class FluxLM(_StateMixin, _PredictMixin, _LearnMixin, _RevertMixin,
         self._R = ((torch.randint(0, 2, (V, c.topic_dim),
                                   generator=g, dtype=torch.int8) * 2 - 1)
                    .to(self._dev))
+        # live features (r_live): additive co-occurrence embedding -
+        # _Rl[x] EMAs toward the pre-x context sketch, so tokens seen
+        # in similar contexts converge.  KEPT SEPARATE from _R: the
+        # context-side sketch/bigram EMAs invert exactly under revert
+        # via frozen _R rows; the vocab-facing gen readouts use the
+        # blended _Re() = _R + _Rl.  This is the no-SFT substitute for
+        # graft_teacher/distill_gen - seeded params + knobs only.
+        self._Rl = (torch.zeros(V, c.topic_dim, dtype=torch.float32,
+                               device=self._dev) if c.r_live else None)
+        # materialized _R + _Rl for vocab-facing reads (gsyn readout,
+        # delta-rule targets) - kept current by _rl_write/_rl_bulk and
+        # the rL/rB undo paths; None when r_live is off
+        self._Reff = (self._R.float()
+                      if c.r_live else None)
         self._A = torch.zeros((V, c.topic_dim), dtype=torch.float32,
                               device=self._dev)
         self._c = torch.zeros(c.topic_dim, dtype=torch.float32,
@@ -214,6 +252,69 @@ class FluxLM(_StateMixin, _PredictMixin, _LearnMixin, _RevertMixin,
             (c.vec_delta_cap, 2 + c.topic_dim + c.gsyn_dim),
             dtype=np.float16)
         self._gsyn_cur = 0
+        # nonlinear memory channel (gsyn_deep): theta = 2-layer MLP
+        # f(normalize(_Wq^T feats)) -> expected _Reff row - the
+        # TTT-MLP/Titans-style test-time-trained complement to the
+        # linear delta table _S.  Wd2 zero-init: the channel is silent
+        # until the first gradient steps land.  Sm* = momentum buffers
+        # (heavy-ball online optimizer state, journaled with theta so
+        # revert is exact).  All None when disabled.
+        if c.gsyn_deep:
+            hd = int(c.gsyn_deep_hidden)
+            gd = torch.Generator().manual_seed(c.seed ^ 0x6CE13)
+            self._Wd1 = (torch.randn(hd, c.gsyn_dim, generator=gd)
+                         / math.sqrt(c.gsyn_dim)).float().to(self._dev)
+            self._Sb1 = torch.zeros(hd, device=self._dev)
+            self._Wd2 = torch.zeros(c.topic_dim, hd,
+                                    device=self._dev)
+            self._Sb2 = torch.zeros(c.topic_dim, device=self._dev)
+            self._Sm1 = torch.zeros(hd, c.gsyn_dim,
+                                    device=self._dev)
+            self._Smb1 = torch.zeros(hd, device=self._dev)
+            self._Sm2 = torch.zeros(c.topic_dim, hd,
+                                    device=self._dev)
+            self._Smb2 = torch.zeros(c.topic_dim, device=self._dev)
+        else:
+            (self._Wd1, self._Sb1, self._Wd2, self._Sb2,
+             self._Sm1, self._Smb1, self._Sm2, self._Smb2) = (
+                None,) * 8
+        # iterated memory channel (dnet): a stack of gated delta-rule
+        # layers - the linear-attention/delta-net "transformer that
+        # learns online".  _DS[l] = recurrent state [topic_dim, dnet_dk]
+        # (zero-init, silent at birth); _Dk/_Dv/_Db = seeded bipolar
+        # int8 projections (knobs, never trained).  Layer-0 input is
+        # the shared gsyn key (gsyn_dim); deeper inputs are relu'd
+        # readouts (topic_dim).  No optimizer state, no KV cache.
+        if c.dnet:
+            nl, dk = int(c.dnet_layers), int(c.dnet_dk)
+            self._DS = [torch.zeros(c.topic_dim, dk,
+                                    device=self._dev)
+                        for _ in range(nl)]
+            self._Dk, self._Dv, self._Db = [], [], []
+            for l in range(nl):
+                din = c.gsyn_dim if l == 0 else c.topic_dim
+                gl = torch.Generator().manual_seed(
+                    c.seed ^ (0x6CE20 + l))
+                self._Dk.append((torch.randint(
+                    0, 2, (din, dk), generator=gl,
+                    dtype=torch.int8) * 2 - 1).to(self._dev))
+                self._Dv.append((torch.randint(
+                    0, 2, (din, c.topic_dim), generator=gl,
+                    dtype=torch.int8) * 2 - 1).to(self._dev))
+                self._Db.append(torch.randn(
+                    din, generator=gl).float().to(self._dev))
+        else:
+            self._DS = self._Dk = self._Dv = self._Db = []
+        # open dnet undo session (same convention as _gsd_session)
+        self._dnet_session: dict | None = None
+        # open deep-memory undo session: first-write snapshot dict
+        # {"snap": theta+momentum tuple} flushed as one ("gd", snap)
+        # entry at the end of ingest/consolidate - mirrors _rl_session
+        self._gsd_session: dict | None = None
+        # open live-feature write session (r_live): {tok: pre-span _R
+        # row} populated by _rl_write, flushed as one ("rB", rows)
+        # journal entry at the end of ingest/teach
+        self._rl_session: dict | None = None
         # recall<->generation runtime dial (engine mem_bias): scales
         # gcell/gsyn lift weights; 1.0 = neutral
         self._gen_bias = 1.0
@@ -222,6 +323,9 @@ class FluxLM(_StateMixin, _PredictMixin, _LearnMixin, _RevertMixin,
         # of journal.entries - keeps bulk ingests below journal_cap so
         # the "bc" header can't be evicted before it can undo
         self._blk_journal: list | None = None
+        # the open "bc" block dict itself - needed so the finally-path
+        # in ingest() can seal its payload accounting too
+        self._blk_active: dict | None = None
         # expected-next-token fingerprint (semantic-spread channel)
         self._proto = torch.zeros(c.topic_dim, dtype=torch.float32,
                                   device=self._dev)
@@ -232,6 +336,11 @@ class FluxLM(_StateMixin, _PredictMixin, _LearnMixin, _RevertMixin,
         # to thin contexts by c.head_thin.
         self._Wh: torch.Tensor | None = None
         self._Wh1: torch.Tensor | None = None
+        # zero-gradient controller head (KnobHead): when attached, every
+        # _predict routes through head.remix(lg, cap) — the head holds
+        # counting tables only (patterns/personality layer), all token
+        # evidence comes from the weight-derived channel lifts in cap
+        self._head = None
 
         # -- recency channel --------------------------------------------
         self._last_seen: dict[int, int] = {}
@@ -357,6 +466,11 @@ class FluxLM(_StateMixin, _PredictMixin, _LearnMixin, _RevertMixin,
             self._csem_rows = torch.zeros((S, c.csem_dim),
                                           dtype=torch.float16,
                                           device=self._dev)
+            if self._bloom_h is not None:
+                # device twin of the host filter - gates the add_multi
+                # write mask without a D2H round-trip per block
+                self._bloom_g = torch.zeros(
+                    c.bloom_bits, dtype=torch.int16, device=self._dev)
             # incremental projections/norms of A - updated by the same
             # rank-1 writes that touch A, so predict never rescans it
             self._Ac = torch.zeros((V, c.csem_dim), dtype=torch.float32,
@@ -523,7 +637,8 @@ class FluxLM(_StateMixin, _PredictMixin, _LearnMixin, _RevertMixin,
 
         # -- provenance -------------------------------------------------
         self.journal = FluxJournal(c.journal_cap, c.vec_delta_cap,
-                                   c.topic_dim, len(self.channels))
+                                   c.topic_dim, len(self.channels),
+                                   block_cap=c.journal_bytes)
         self.learning = True
         self.tag = "boot"
         self._graft: dict | None = None   # teacher-embedding graft info

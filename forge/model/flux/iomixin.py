@@ -229,6 +229,10 @@ class _IOMixin:
             # GPU backend: portable decoded rows {k: (keys, toks, cnts)}
             "table_triplets": (self._gt.triplets() if self._gpu
                                else None),
+            # honest per-row sighting totals - triplets can't rebuild
+            # them (truncated followers' mass isn't serialized)
+            "table_rowtots": (self._gt.row_totals() if self._gpu
+                              else None),
             "csem_cpu": self._csem_cpu if not self._gpu else None,
             "csem_rows_gpu": ((self._gt.tkeys[self._gt.row_csem].cpu(),
                                self._csem_rows.cpu())
@@ -261,6 +265,14 @@ class _IOMixin:
             # tuple (S, Ss) - bare tensor = pre-two-timescale snapshot
             "gs": ((self._S.cpu(), self._Ss.cpu())
                    if self.config.gsyn else None),
+            # nonlinear memory channel (gsyn_deep): theta + momentum,
+            # 8-tuple in _gsd_params() order; seeded init otherwise
+            "gsd": (self._gsd_snap()
+                    if self.config.gsyn_deep else None),
+            # iterated memory channel (dnet): per-layer recurrent
+            # states; projections are seed-derived
+            "dn": (tuple(s.cpu() for s in self._DS)
+                   if self.config.dnet else None),
             # distilled linear head (distill_head); None until trained
             "Wh": (self._Wh.cpu() if self._Wh is not None else None),
             "Wh1": (self._Wh1.cpu() if self._Wh1 is not None
@@ -270,11 +282,28 @@ class _IOMixin:
             # silently revert the graft on load
             "R_graft": ((self._R.cpu(), dict(self._graft))
                         if self._graft else None),
+            # live features (r_live): the drift table is learned
+            # state; _Reff re-derives as _R + _Rl on load
+            "Rl": (self._Rl.cpu() if self._Rl is not None
+                   else None),
+            # bloom doorkeeper admission state (counters are metadata,
+            # not content - persisted so a resumed model keeps the same
+            # admission behavior rather than re-sighting everything)
+            "bloom": ((self._bloom_h,
+                       self._bloom_g.cpu()
+                       if self._bloom_g is not None else None)
+                      if self._bloom_h is not None else None),
             "last_seen": self._last_seen,
             "recent": list(self._recent),
             "journal_entries": self.journal.entries,
             "journal_dropped": self.journal.dropped,
+            "journal_blocks_dropped": self.journal.dropped_blocks,
             "gaps": list(self._gaps),
+            # zero-gradient controller head (KnobHead): counting tables
+            # are model state — persisted so a snapshot round-trips the
+            # learned routing patterns exactly
+            "head": (self._head.state_dict()
+                     if self._head is not None else None),
         }
         return state
 
@@ -301,10 +330,18 @@ class _IOMixin:
                      "_proto", "_log_uni_num", "_Wk", "_Wq", "_S",
                      "_Ss"):
             setattr(self, name, getattr(self, name).to(dev))
-        if self._Wh is not None:
-            self._Wh = self._Wh.to(dev)
-        if self._Wh1 is not None:
-            self._Wh1 = self._Wh1.to(dev)
+        for name in ("_Rl", "_Reff", "_Wh", "_Wh1",
+                     "_Wd1", "_Sb1", "_Wd2", "_Sb2",
+                     "_Sm1", "_Smb1", "_Sm2", "_Smb2"):
+            t = getattr(self, name)
+            if t is not None:
+                setattr(self, name, t.to(dev))
+        for name in ("_DS", "_Dk", "_Dv", "_Db"):
+            lst = getattr(self, name, None)
+            if lst:
+                setattr(self, name, [t.to(dev) for t in lst])
+        if self._bloom_g is not None:
+            self._bloom_g = self._bloom_g.to(dev)
 
     @classmethod
     def load(cls, path: str | Path, device: str | None = None,
@@ -340,6 +377,11 @@ class _IOMixin:
         if rg is not None:
             model._R = rg[0].float().to(model._dev)
             model._graft = dict(rg[1])
+        rl = state.get("Rl")
+        if rl is not None:
+            model._Rl = rl.float().to(model._dev)
+        if model._Rl is not None:
+            model._Reff = model._R.float() + model._Rl
         # remap channel weights by name - survives channel list changes
         saved_w = np.asarray(state["w"], dtype=np.float64)
         saved_ch = state.get("channels")
@@ -351,10 +393,15 @@ class _IOMixin:
             model._w = saved_w
         model._hedge_mix = float(state.get("hedge_mix", 0.0))
         # per-regime hedge state (cond_hedge) - snapshots older than
-        # the flag replicate the global weights into both regimes
-        model._wR = np.asarray(
+        # the flag replicate the global weights into both regimes;
+        # snapshots older than the fuzzy-channel hedge rows get the
+        # name-remapped global weights broadcast instead
+        _wR = np.asarray(
             state.get("wR", np.tile(model._w, (2, 1))),
             dtype=np.float64)
+        if _wR.shape[-1] != len(model.channels):
+            _wR = np.tile(model._w, (int(_wR.shape[0]) or 2, 1))
+        model._wR = _wR
         model._hmxR = np.asarray(
             state.get("hmxR", np.zeros(2)), dtype=np.float64)
         model._regime = int(state.get("regime", 0))
@@ -419,6 +466,9 @@ class _IOMixin:
             tri = state.get("table_triplets")
             if tri:
                 model._gt.load_triplets(tri)
+                rtots = state.get("table_rowtots")
+                if rtots:
+                    model._gt.restore_totals(rtots)
             elif model._tables:
                 for k, cells in model._tables.items():
                     kk, tt, cc = [], [], []
@@ -540,6 +590,16 @@ class _IOMixin:
                 model._Ss = gs_s.float().to(model._dev)
             else:
                 model._Ss = torch.zeros_like(model._S)
+        gsd = state.get("gsd")
+        if gsd is not None and model.config.gsyn_deep:
+            # theta + momentum tuple -> device tensors; a snapshot
+            # without gsyn_deep silently seeds fresh (config-off ablate)
+            model._gsd_restore(
+                tuple(t.float() for t in gsd))
+        dn = state.get("dn")
+        if dn is not None and model.config.dnet:
+            model._dnet_restore(
+                tuple(t.float() for t in dn))
         wh = state.get("Wh")
         if wh is not None:
             if not isinstance(wh, torch.Tensor):
@@ -575,7 +635,29 @@ class _IOMixin:
             model._rebuild_gpu_epi()
         model.journal.entries = list(state.get("journal_entries", []))
         model.journal.dropped = state.get("journal_dropped", 0)
+        model.journal.dropped_blocks = state.get(
+            "journal_blocks_dropped", 0)
+        model.journal.recompute()
         model._gaps = deque(state.get("gaps", []), maxlen=cfg.gap_cap)
+        # bloom doorkeeper: restore admission counters (absent on pre-
+        # bloom snapshots - filters start empty, which just re-sights
+        # existing keys as new; harmless since resident cells skip the
+        # gate anyway)
+        bl = state.get("bloom")
+        if bl is not None and model._bloom_h is not None:
+            bh, bg = bl
+            n_ = min(bh.shape[0], model._bloom_h.shape[0])
+            model._bloom_h[:n_] = bh[:n_]
+            if bg is not None and model._bloom_g is not None:
+                m_ = min(bg.numel(), model._bloom_g.numel())
+                model._bloom_g[:m_] = bg[:m_].to(model._dev)
+        # zero-gradient controller head (KnobHead): restores the learned
+        # routing tables — inspectable counting state, journaled outside
+        # the weight journal by design (knobs are their own layer)
+        hd = state.get("head")
+        if hd is not None:
+            from .knobhead import KnobHead
+            model.attach_head(KnobHead.load_state_dict(hd))
 
     def _rebuild_gpu_epi(self) -> None:
         """Rebuild the GPU episodic index from the host ``_epi`` dict -
@@ -664,7 +746,9 @@ class _IOMixin:
             "knn_MB": (self._knn_fp.nbytes + self._knn_succ.nbytes
                        + self._knn_pos.nbytes) / 1e6,
             "journal_entries": len(self.journal),
+            "journal_blocks_dropped": self.journal.dropped_blocks,
             "journal_MB_est": (len(self.journal.entries) * 160
+                               + self.journal.block_bytes
                                + self.journal.vec_ring.nbytes
                                + self.journal.w_ring.nbytes) / 1e6,
             "py_overhead_MB": sys.getsizeof(self._tables) / 1e6,
@@ -675,6 +759,14 @@ class _IOMixin:
                              * 56) / 1e6,
             "gsyn_MB": (self._S.nbytes + self._Ss.nbytes
                         + self._gsyn_ring.nbytes) / 1e6,
+            "gsyn_deep_MB": (sum(t.nbytes for t in self._gsd_params())
+                             / 1e6 if self.config.gsyn_deep else 0.0),
+            "dnet_MB": (sum(t.nbytes for lst in
+                            (self._DS, self._Dk, self._Dv, self._Db)
+                            for t in lst) / 1e6
+                        if self.config.dnet else 0.0),
+            "rlive_MB": ((self._Rl.nbytes + self._Reff.nbytes) / 1e6
+                         if self._Rl is not None else 0.0),
         }
         if self._gpu:
             c = self.config

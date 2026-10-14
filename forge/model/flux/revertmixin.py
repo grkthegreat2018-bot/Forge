@@ -37,7 +37,11 @@ class _RevertMixin:
         # Block tensors are stored host-side - re-upload on demand.
         kk_all, tt_all, valid_o = (t.to(dev)
                                    for t in blk["writes_all"])
-        s_v = blk.get("surprise")
+        # written deltas were the in-block-corrected surprise when
+        # present (newer blocks); fall back to pre-block s_v (legacy)
+        s_v = blk.get("surprise_eff")
+        if s_v is None:
+            s_v = blk.get("surprise")
         if s_v is not None:
             s_v = s_v.to(dev)
         for oi, k in enumerate(self.config.orders):
@@ -49,7 +53,9 @@ class _RevertMixin:
                  else torch.ones(kk.numel(), dtype=torch.float32,
                                  device=dev))
             self._gt.subtract(k, kk, tt_all[idx], d)
-        # restore follower columns displaced by evict-min writes
+        # restore follower columns displaced by evict-min writes -
+        # tcnt/ttoks only: ttot tracks true sightings, so displaced
+        # mass was never removed from the denominator forward
         cv = blk.get("col_evicted")
         if cv is not None and cv[0].numel():
             cells, toks_v, cnts_v = (t.to(dev) for t in cv)
@@ -57,7 +63,6 @@ class _RevertMixin:
             gt.ttoks.view(-1).index_copy_(
                 0, cells, toks_v.to(torch.int32))
             gt.tcnt.view(-1).index_copy_(0, cells, cnts_v)
-            _group_add(gt.ttot.view(-1), cells // gt.M, cnts_v)
             gt.tocc.copy_(gt.ttot)
         # csem rows
         rcs = self._gt.row_csem
@@ -157,6 +162,12 @@ class _RevertMixin:
         self._ep_start = blk["ep_start"]
         self._last_seen = blk["last_seen"]
         self._seen_g = blk["seen_g"].to(dev)
+        rl_rows = blk.get("rl")
+        if rl_rows and self._Rl is not None:
+            for t_, row_ in rl_rows.items():
+                self._Rl[t_] = row_.to(dev)
+                self._Reff[t_] = (self._R[t_].float()
+                                  + self._Rl[t_])
         if self._gpu:
             self._wg = torch.from_numpy(
                 blk["w"].astype(np.float64)).to(dev)
@@ -292,6 +303,15 @@ class _RevertMixin:
                 self._S.copy_(gs[0].to(dev))
                 if gs[1] is not None and c.gsyn_slow_decay > 0:
                     self._Ss.copy_(gs[1].to(dev))
+            gsd = blk.get("gsd")
+            if gsd is not None:
+                # deep-memory theta pre-state snapshot - wholesale
+                # restore (gradient steps aren't invertible)
+                self._gsd_restore(gsd)
+            dn_ = blk.get("dnet")
+            if dn_ is not None:
+                # iterated-memory layer-state snapshot
+                self._dnet_restore(dn_)
             # block-local journal: per-write entries (G/gE/C/K/W/H)
             # collected on the block instead of journal.entries so bulk
             # ingests can't evict this block's own "bc" header - replay
@@ -415,6 +435,39 @@ class _RevertMixin:
             self._S.sub_(outer, alpha=float(row[0])).div_(g)
             if gs > 0:
                 self._Ss.sub_(outer, alpha=float(row[1])).div_(gs)
+            return True
+        if op == "rL":
+            # live-feature row: restore pre-write _Rl[tok] + blend
+            if self._Rl is None:
+                return True
+            self._Rl[e[1]] = e[2].to(self._dev)
+            self._Reff[e[1]] = (self._R[e[1]].float()
+                                + self._Rl[e[1]])
+            return True
+        if op == "rB":
+            # live-feature session: restore every first-touched row
+            if self._Rl is None:
+                return True
+            for t_, row_ in e[1].items():
+                self._Rl[t_] = row_.to(self._dev)
+                self._Reff[t_] = (self._R[t_].float()
+                                  + self._Rl[t_])
+            return True
+        if op == "gs":
+            # gsyn pre-state snapshot (consolidate_gen / bulk sweeps
+            # bigger than the factor ring) - wholesale restore
+            self._S.copy_(e[1].to(self._dev))
+            if e[2] is not None and self.config.gsyn_slow_decay > 0:
+                self._Ss.copy_(e[2].to(self._dev))
+            return True
+        if op == "gd":
+            # gsyn_deep theta+momentum pre-state snapshot (session or
+            # stray-write scope) - wholesale restore
+            self._gsd_restore(e[1])
+            return True
+        if op == "dn":
+            # dnet layer-state snapshot - wholesale restore
+            self._dnet_restore(e[1])
             return True
         if op == "u":
             if self._uni[e[1]] >= 1.0:
@@ -831,15 +884,18 @@ class _RevertMixin:
         """
         entries = self.journal.entries
         reverted = inexact = popped = 0
-        # Boundaries: "t"/"bc" (token writes), "b" (episode reset), and
-        # "ws"/"we"/"g" (position-free write-block markers).  Write-block
-        # markers count as boundaries so a seq_pos revert can never
-        # descend into a teach/consolidate block below the floor - those
-        # ops belong to revert_writes()/revert_tag(), not a position
-        # floor.
+        # Boundaries: "t"/"bc" (token writes), "b" (episode reset),
+        # "ws"/"we"/"g" (position-free write-block markers), and
+        # "rB"/"rL"/"gd"/"dn" (session/span-scoped restores - they may
+        # legally end a rewind; below them only earlier spans' writes
+        # sit).  Write-block markers count as boundaries so a seq_pos
+        # revert can never descend into a teach/consolidate block below
+        # the floor - those ops belong to revert_writes()/revert_tag(),
+        # not a position floor.
         while entries:
             at_boundary = entries[-1][0] in ("t", "b", "bc",
-                                             "ws", "we", "g")
+                                             "ws", "we", "g",
+                                             "rB", "rL", "gd", "dn")
             if seq_pos is not None and self._count <= seq_pos \
                     and at_boundary:
                 break
@@ -848,7 +904,7 @@ class _RevertMixin:
                 break
             if seq_pos is None and n_entries is None:
                 break
-            e = entries.pop()
+            e = self.journal.pop_tail()
             popped += 1
             if self._undo_entry(e):
                 reverted += 1
@@ -904,7 +960,8 @@ class _RevertMixin:
                         reverted += ok
                         inexact += not ok
                     j -= 1
-                del entries[j:i + 1]          # drop the whole block
+                # drop the whole block (journal keeps byte accounting)
+                self.journal.drop_range(j, i + 1)
                 i = j - 1
             else:
                 i -= 1

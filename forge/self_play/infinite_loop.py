@@ -203,6 +203,18 @@ class LoopConfig:
     flux_cf_topk: int = 8        # 0 disables propensity logging
     flux_cf_scale: float = 0.5   # alt-credit weight vs sampled credit
     flux_cf_fail: bool = True    # counterfactual learning on failures
+    # generalizer (R68): flux_gen_channels enables the fuzzy/generalizing
+    # channel family (gcell/gsyn/gsyn_deep/dnet) on fresh flux models;
+    # flux_gen_live is the live generalizer write mass - the "gen head"
+    # that transfers the order cells' recalled distributions into the
+    # gen channels on every learned position, so verified self-play
+    # knowledge generalizes during ingest rather than waiting for a
+    # batch pass.  flux_gen_consolidate is the per-epoch batch
+    # complement - replays the retained ring so associations that only
+    # became warm after later writes also reach the gen channels.
+    flux_gen_channels: bool = False
+    flux_gen_live: float = 0.0
+    flux_gen_consolidate: float = 0.0
 
     # ── R53: source-grounded goals + tool use ──
     # Goals are drawn from Wikipedia summaries, dictionary entries and
@@ -241,6 +253,14 @@ class LoopConfig:
     grpo_use_repetition_penalty: bool = True  # doom-loop mitigation
     grpo_rl_algorithm: str = "grpo"  # grpo/gtpo/cispo/sppo/psppo/evpo/grpo_or
     grpo_min_trajectories: int = 4   # skip GRPO if fewer verified trajectories
+    # ExGRPO (ICLR'26 experience replay): persist each epoch's rollout
+    # groups scored by correctness_flag * mean-token-entropy; each GRPO
+    # update batch draws exgrpo_replay_fraction of its groups from the
+    # top-valued replay entries.  Opt-in: default OFF keeps the prior
+    # batching behavior bit-identical.
+    use_exgrpo: bool = False
+    exgrpo_replay_size: int = 512      # capacity in rollout groups
+    exgrpo_replay_fraction: float = 0.25  # replay share of each update batch
 
     # Paths
     checkpoint_dir: str = "research/checkpoints"
@@ -514,6 +534,9 @@ class InfiniteSelfPlayLoop:
         self._gen_trace: GenTracer | None = None
         # ForgeEngine retained across self-play → eval for weight-swap reuse.
         self._engine = None
+        # ExGRPO experience-replay buffer (persists across epochs; lazily
+        # created on first _grpo_train when config.use_exgrpo is set).
+        self._exgrpo = None
         # FluxLM mode state: cross-epoch prompt dedup + attempt rng.
         self._flux_seen: set = set()
         self._flux_rng = random.Random()
@@ -678,6 +701,11 @@ class InfiniteSelfPlayLoop:
         cfg = self.config
         fc = FluxConfig(vocab_size=65536, device=cfg.device,
                         cuda_primary=cfg.device == "cuda")
+        # R68 gen head: the fuzzy channel family + live generalizer -
+        # fresh models only (a resumed .flux snapshot restores its own)
+        if cfg.flux_gen_channels or cfg.flux_gen_live > 0:
+            fc.gcell = fc.gsyn = fc.gsyn_deep = fc.dnet = True
+        fc.gen_live = cfg.flux_gen_live
         # R53: teacher-embedding graft — "auto" grafts the V2 embed
         # table when it exists (semantic _R feeds every channel); a
         # resumed .flux snapshot restores its own _R and ignores this.
@@ -1235,15 +1263,18 @@ class InfiniteSelfPlayLoop:
                 n_taught += 1
             model.soft_reset()
         cons = model.consolidate(min_entries=cfg.flux_consolidate_min)
+        gcons = (model.consolidate_gen(mass=cfg.flux_gen_consolidate,
+                                       tag="gencon", all_ring=True)
+                 if cfg.flux_gen_consolidate > 0 else None)
         print(f"  [flux] reinforced={n_reinf} taught={n_taught} "
-              f"consolidated={cons}")
+              f"consolidated={cons} gen={gcons}")
 
         # Snapshot the trained state as this epoch's candidate.
         candidate = self._flux_checkpoint_path(self.epoch)
         model.snapshot(candidate)
         phases["flux"] = {"checkpoint": candidate,
                           "reinforced": n_reinf, "taught": n_taught,
-                          "consolidate": cons}
+                          "consolidate": cons, "gen": gcons}
 
         # Phase 3: fixed held-out eval — post vs pre.
         acc_post = self._flux_eval_acc()
@@ -2101,6 +2132,9 @@ class InfiniteSelfPlayLoop:
             grad_accum_steps=c.grpo_grad_accum,
             rl_algorithm=c.grpo_rl_algorithm,
             use_repetition_penalty=c.grpo_use_repetition_penalty,
+            use_exgrpo=c.use_exgrpo,
+            exgrpo_replay_size=c.exgrpo_replay_size,
+            exgrpo_replay_fraction=c.exgrpo_replay_fraction,
         )
         grpo_config.optimizer = "cpu_offload"  # 12GB VRAM safe
 
@@ -2108,6 +2142,23 @@ class InfiniteSelfPlayLoop:
             model=model, tokenizer=tokenizer, ref_model=ref_model,
             device=c.device, config=grpo_config,
         )
+
+        # ExGRPO (ICLR'26 experience replay): record this epoch's rollout
+        # groups into the persistent buffer.  Value = correctness_flag *
+        # mean-token-entropy — correct-but-uncertain rollouts carry the
+        # most reusable signal.  Groups stored here are sampled into later
+        # update batches (mixed-policy; same group-relative objective).
+        if c.use_exgrpo:
+            if self._exgrpo is None:
+                from forge.self_play.grpo_trainer import ExGRPOReplayBuffer
+                self._exgrpo = ExGRPOReplayBuffer(
+                    capacity=c.exgrpo_replay_size)
+            for _p, _comps, _rews in zip(prompts, completions, rewards):
+                _ent = trainer.exgrpo_group_entropy(_p, _comps)
+                self._exgrpo.add(_p, _comps, _rews, _ent)
+            print(f"  [ExGRPO] replay buffer: {len(self._exgrpo)} groups "
+                  f"(cap {c.exgrpo_replay_size}, "
+                  f"frac {c.exgrpo_replay_fraction})")
 
         # Run GRPO training steps
         import random as _rng
@@ -2119,10 +2170,25 @@ class InfiniteSelfPlayLoop:
         while step < c.grpo_max_steps:
             # Sample a batch of groups (batch_size=4 prompts per step)
             batch_size = min(4, len(prompts))
-            indices = _rng.sample(range(len(prompts)), batch_size)
+            # ExGRPO: replay_fraction of each update batch comes from the
+            # top-valued replay entries (correctness * entropy).  The
+            # replayed groups go through train_step unchanged — same
+            # group-relative advantage machinery (mixed-policy replay).
+            n_replay = 0
+            if c.use_exgrpo and self._exgrpo is not None and len(self._exgrpo):
+                n_replay = min(
+                    int(round(batch_size * c.exgrpo_replay_fraction)),
+                    len(self._exgrpo))
+            indices = _rng.sample(range(len(prompts)),
+                                  max(batch_size - n_replay, 0))
             batch_prompts = [prompts[i] for i in indices]
             batch_comps = [completions[i] for i in indices]
             batch_rewards = [rewards[i] for i in indices]
+            if n_replay:
+                for e in self._exgrpo.sample(n_replay, rng=_rng):
+                    batch_prompts.append(e["prompt"])
+                    batch_comps.append(e["completions"])
+                    batch_rewards.append(e["rewards"])
 
             with oom_guard(c.device, label="grpo_step") as safe:
                 stats = trainer.train_step(batch_prompts, batch_comps, batch_rewards)
@@ -2471,6 +2537,7 @@ def main():
                         choices=["fused", "bnb", "lion", "muon", "muon_sf",
                                  "muon_sf_plain", "flash_adamw", "flash_lion",
                                  "forge", "sf_normuon", "amuse", "mona",
+                                 "samuon_lite",
                                  "cpu_offload", "badam", "fira_nlrq"],
                         help="Finetune optimizer (V10 default: muon_sf, 2.39x vs AdamW)")
     parser.add_argument("--self-play-mode", type=str, default="azr",
@@ -2583,11 +2650,32 @@ def main():
                              "embedding grafts onto a FRESH flux model "
                              "('auto' = ForgeLM_V2.safetensors when "
                              "present, '' disables)")
+    parser.add_argument("--flux-gen-channels", action="store_true",
+                        help="flux mode: enable gcell/gsyn/gsyn_deep/dnet "
+                             "generalizing channels on fresh models")
+    parser.add_argument("--flux-gen-live", type=float, default=0.0,
+                        help="flux mode: live generalizer write mass "
+                             "(0=off) - transfers recalled distributions "
+                             "into the gen channels every learned token")
+    parser.add_argument("--flux-gen-consolidate", type=float, default=0.0,
+                        help="flux mode: per-epoch consolidate_gen mass "
+                             "(0=off, ~1.0 full) - batch complement to "
+                             "live gen_live transfers")
     parser.add_argument("--grpo-algorithm", type=str, default="grpo",
                         choices=["grpo", "gtpo", "cispo", "sppo", "psppo",
                                  "evpo", "grpo_or"],
                         help="RL algorithm (grpo=default, gtpo=no-ref-model, "
                              "cispo=MiniMax detached clip)")
+    parser.add_argument("--use-exgrpo", action="store_true",
+                        help="ExGRPO experience replay (ICLR'26): persist "
+                             "rollout groups scored by correctness*entropy "
+                             "and mix top-valued entries into each update "
+                             "batch")
+    parser.add_argument("--exgrpo-replay-size", type=int, default=512,
+                        help="ExGRPO buffer capacity in rollout groups")
+    parser.add_argument("--exgrpo-replay-fraction", type=float, default=0.25,
+                        help="Fraction of each GRPO update batch drawn from "
+                             "top-valued ExGRPO replay entries")
 
     # ── V10 ForgeEngine inference features ──
     parser.add_argument("--no-forge-engine", action="store_true",
@@ -2596,7 +2684,7 @@ def main():
                         help="KV cache strategy for self-play generation (V10 default: spectral)")
     parser.add_argument("--decoding", type=str, default="mtp_selfspec",
                         choices=["standard", "speculative", "medusa", "dspark",
-                                 "eagle3", "mtp_selfspec"],
+                                 "eagle3", "mtp_selfspec", "specbound"],
                         help="Decoding strategy (V10 default: mtp_selfspec)")
     parser.add_argument("--quantize", type=str, default=None,
                         choices=[None, "int8", "int4", "fp8", "w8a8", "nvfp4"],
@@ -2741,12 +2829,18 @@ def main():
         flux_eval_web_n=args.flux_eval_web_n,
         flux_dict_file=args.flux_dict_file,
         flux_teacher_embed=args.flux_teacher_embed,
+        flux_gen_channels=args.flux_gen_channels,
+        flux_gen_live=args.flux_gen_live,
+        flux_gen_consolidate=args.flux_gen_consolidate,
         grpo_max_steps=args.grpo_steps,
         grpo_lr=args.grpo_lr,
         grpo_group_size=args.grpo_group_size,
         grpo_kl_coeff=args.grpo_kl,
         grpo_clip_range=args.grpo_clip,
         grpo_rl_algorithm=args.grpo_algorithm,
+        use_exgrpo=args.use_exgrpo,
+        exgrpo_replay_size=args.exgrpo_replay_size,
+        exgrpo_replay_fraction=args.exgrpo_replay_fraction,
         status_dir=args.status_dir,
         live_status=not args.no_live_status,
         debug_round=args.debug_round,

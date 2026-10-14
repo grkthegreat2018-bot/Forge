@@ -29,6 +29,13 @@ if HAS_TRITON:
 
 class _PredictMixin:
 
+    def _esc_alpha(self, u: float) -> float:
+        """Escape pseudo-mass for a count cell.  ``ppm_escape_c``
+        (PPM method C) substitutes the cell's distinct-follower count
+        ``u`` for the constant ``alpha`` - data-derived escape mass."""
+        return float(u) if self.config.ppm_escape_c else \
+            self.config.alpha
+
     def _channel_prob(self, ch: str, x: int, keys: dict[int, int],
                       votes: dict[int, float] | None,
                       denom: float,
@@ -128,9 +135,50 @@ class _PredictMixin:
                 return self._uni_p(x, denom), False
             cell = self._tables[best_k].get(keys[best_k]) or {}
             conf = btot / (btot + c.backoff_kappa)
+            a_b = self._esc_alpha(len(cell))
             return conf * (cell.get(x, 0.0)
-                           + c.alpha * self._uni_p(x, denom)) \
-                / (btot + c.alpha), True
+                           + a_b * self._uni_p(x, denom)) \
+                / (btot + a_b), True
+        if ch in ("gcell", "gsyn", "gsd", "dnet"):
+            # fuzzy lift channels: real probs so hedge can punish them.
+            # prob = exp(channel log-softmax at x) - one readout row.
+            # Context features memoized per position (_pfq) so gcell +
+            # gsyn + gsd + dnet share one build.
+            memo = getattr(self, "_pfq", None)
+            if memo is None or memo[0] != self._count:
+                fx = self._gcell_feats(self._c, self._c2,
+                                       self._count - 1)
+                gk = self._gsyn_keys(fx)
+                gc = self._gcell_code_from_feats(fx)
+                memo = (self._count, gc, gk)
+                self._pfq = memo
+            _cnt, gc, gk = memo
+            if ch == "gcell":
+                num = den = 0.0
+                for cc, dist in self._gcell_neighbors(gc):
+                    cell = self._gc.get(cc)
+                    if cell:
+                        w_ = c.gcell_neighbor_decay ** dist
+                        num += w_ * cell.get(x, 0.0)
+                        den += w_ * self._gct.get(cc, 0.0)
+                if den <= 0:
+                    return self._uni_p(x, denom), False
+                return (num + c.alpha * self._uni_p(x, denom) * den) \
+                    / (den + c.alpha), True
+            if ch == "gsyn":
+                if float(self._S.norm()) < 1e-8:
+                    return self._uni_p(x, denom), False
+                return float(math.exp(
+                    float(self._gsyn_logits(gk)[x]))), True
+            if ch == "gsd":
+                if self._Wd2 is None or float(self._Wd2.norm()) < 1e-8:
+                    return self._uni_p(x, denom), False
+                return float(math.exp(
+                    float(self._gsd_logits(gk)[x]))), True
+            if not any(float(s_.norm()) > 1e-8 for s_ in self._DS):
+                return self._uni_p(x, denom), False
+            return float(math.exp(
+                float(self._dnet_logits(gk)[x]))), True
         if ch.startswith("p"):
             # sparse-tap channel "p<j>" - gapped-context cell
             j = int(ch[1:])
@@ -140,8 +188,9 @@ class _PredictMixin:
             if not cell:
                 return self._uni_p(x, denom), False
             tot = self._ptots[taps].get(key, 0.0)
-            return (cell.get(x, 0.0) + c.alpha
-                    * self._uni_p(x, denom)) / (tot + c.alpha), tot > 0
+            a_c = self._esc_alpha(len(cell))
+            return (cell.get(x, 0.0) + a_c
+                    * self._uni_p(x, denom)) / (tot + a_c), tot > 0
         if ch.startswith("g"):
             # class-order channel "g<k>" - contiguous suffix over byte
             # classes (coarse context - generalizes on novel text)
@@ -151,8 +200,9 @@ class _PredictMixin:
             if not cell:
                 return self._uni_p(x, denom), False
             tot = self._gtots[k].get(key, 0.0)
-            return (cell.get(x, 0.0) + c.alpha
-                    * self._uni_p(x, denom)) / (tot + c.alpha), tot > 0
+            a_c = self._esc_alpha(len(cell))
+            return (cell.get(x, 0.0) + a_c
+                    * self._uni_p(x, denom)) / (tot + a_c), tot > 0
         if ch.startswith("w"):
             # word-order channel "w<j>" - key over last-w word hashes +
             # partial-word bucket (ring-scan derived, no state)
@@ -162,8 +212,9 @@ class _PredictMixin:
             if not cell:
                 return self._uni_p(x, denom), False
             tot = self._wtots[j].get(key, 0.0)
-            return (cell.get(x, 0.0) + c.alpha
-                    * self._uni_p(x, denom)) / (tot + c.alpha), tot > 0
+            a_c = self._esc_alpha(len(cell))
+            return (cell.get(x, 0.0) + a_c
+                    * self._uni_p(x, denom)) / (tot + a_c), tot > 0
         if ch.startswith("h"):
             # hybrid channel "h<j>" - key over a (offset, is_raw)
             # pattern mixing byte classes and raw bytes
@@ -173,8 +224,9 @@ class _PredictMixin:
             if not cell:
                 return self._uni_p(x, denom), False
             tot = self._htots[j].get(key, 0.0)
-            return (cell.get(x, 0.0) + c.alpha
-                    * self._uni_p(x, denom)) / (tot + c.alpha), tot > 0
+            a_c = self._esc_alpha(len(cell))
+            return (cell.get(x, 0.0) + a_c
+                    * self._uni_p(x, denom)) / (tot + a_c), tot > 0
         # order channel "o<k>"
         k = int(ch[1:])
         key = keys.get(k, -1)
@@ -182,8 +234,9 @@ class _PredictMixin:
         if not cell:
             return self._uni_p(x, denom), False
         tot = self._totals[k].get(key, 0.0)
-        return (cell.get(x, 0.0) + c.alpha * self._uni_p(x, denom)) \
-            / (tot + c.alpha), tot > 0
+        a_c = self._esc_alpha(len(cell))
+        return (cell.get(x, 0.0) + a_c * self._uni_p(x, denom)) \
+            / (tot + a_c), tot > 0
 
     def _deep_votes(self, end: int) -> dict[int, float]:
         """Seed-match + backward extension -> successor votes.
@@ -254,7 +307,7 @@ class _PredictMixin:
         c = self.config
         if not c.use_knn or self._knn_cur == 0:
             return {}
-        q = self._knn_fp_of(self._c).to(self._knn_fp.dtype)
+        q = self._knn_fp_ctx(self._count - 1).to(self._knn_fp.dtype)
         # scan only the live ring prefix (bucketed) - the padded tail
         # is pos=-1 anyway, so slicing is exact, just cheaper
         b = self._knn_rows()
@@ -273,14 +326,28 @@ class _PredictMixin:
         top = torch.topk(sims, kk)
         votes: dict[int, float] = {}
         hit_rows: list[int] = []
+        K = int(c.knn_span)
         for s, i in zip(top.values.tolist(), top.indices.tolist()):
             if s <= c.knn_min_sim:
                 break
             hit_rows.append(i)
-            t = int(self._knn_succ[i])
-            if t >= 0:
-                votes[t] = votes.get(t, 0.0) + max(s, 0.0) \
-                    ** c.knn_gamma
+            w0 = max(s, 0.0) ** c.knn_gamma
+            if K > 0:
+                # span voting: tokens within +/-K of the matched
+                # stream position vote (passage->answer extraction)
+                p = int(self._knn_pos[i])
+                for j in range(-K, K + 1):
+                    pj = p + j
+                    if pj < 0 or pj >= self._count:
+                        continue
+                    t = int(self._ring[pj % c.ring_capacity])
+                    if 0 <= t < self.vocab_size:
+                        votes[t] = votes.get(t, 0.0) + w0 * (
+                            c.knn_span_decay ** abs(j))
+            else:
+                t = int(self._knn_succ[i])
+                if t >= 0:
+                    votes[t] = votes.get(t, 0.0) + w0
         if hit_rows:
             # retrieval utility (feeds knn_utility_evict)
             self._knn_hits.index_add_(
@@ -409,7 +476,9 @@ class _PredictMixin:
         return torch.topk(x, k).indices
 
     @torch._dynamo.disable
-    def _knn_votes_dev(self, kb: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _knn_votes_dev(self, kb: int,
+                       end: torch.Tensor | None = None
+                       ) -> tuple[torch.Tensor, torch.Tensor]:
         """Top-k fingerprint-similar past contexts vote their stored
         successors - approximate-match episodic memory.  Only the live
         ring prefix is scanned (bucketed - static shape inside a
@@ -417,9 +486,9 @@ class _PredictMixin:
         dynamo-disabled for the same topk-tie reason as _topk_dev."""
         c = self.config
         V = self.vocab_size
-        qk = self._c @ self._Pcsem
-        qkn = qk.norm()
-        qk = (qk / (qkn + 1e-8)).to(self._knn_fp.dtype)
+        qk = self._knn_fp_ctx(
+            self._count - 1 if end is None else end
+        ).to(self._knn_fp.dtype)
         ksims = (self._knn_fp[:kb] @ qk).float()
         ksims = torch.where(
             self._knn_pos[:kb] >= 0, ksims,
@@ -432,6 +501,27 @@ class _PredictMixin:
         self._knn_hits.index_add_(
             0, top.indices, keep.to(torch.int32))
         wv = (top.values.clamp(min=0.0) ** c.knn_gamma) * keep
+        if c.knn_span > 0 and getattr(self, "_ringg", None) is not None:
+            # span voting: neighbours retrieve CONTEXTS - every token
+            # within +/-K stream positions of a match votes, so the
+            # answer needn't be the direct successor (extractive QA:
+            # retrieve the passage, read off the entity).  end bounds
+            # the span to observed positions; all device ops.
+            K = int(c.knn_span)
+            pos = self._knn_pos.index_select(0, top.indices).long()
+            offs = torch.arange(-K, K + 1, device=self._dev)
+            pj = pos[:, None] + offs[None, :]
+            hi = (end.reshape(-1)[-1] if end is not None
+                  else pos.new_full((), self._count - 1))
+            live = (pj >= 0) & (pj <= hi)
+            pj = pj.clamp(min=0) % c.ring_capacity
+            toks = self._ringg.index_select(
+                0, pj.reshape(-1)).long().clamp(0, V - 1)
+            dw = (float(c.knn_span_decay)
+                  ** offs.abs().float())[None, :]
+            wij = wv[:, None] * dw * live
+            kv = _scatter_sum(toks.reshape(-1), wij.reshape(-1), V)
+            return kv, kv.sum()
         ksucc = self._knn_succ.index_select(
             0, top.indices).long().clamp(0, V - 1)
         # deterministic accumulation - neighbours can share a
@@ -442,7 +532,9 @@ class _PredictMixin:
 
     @torch._dynamo.disable
     def _knn_reward_dev(self, kb: int, fp_store: torch.Tensor,
-                        x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                        x: torch.Tensor,
+                        end: torch.Tensor | None = None
+                        ) -> tuple[torch.Tensor, torch.Tensor]:
         """Step-side knn reward scan: returns (kvt, kvx) fp64 scalars -
         total neighbour weight and the weight voting for token x.
         dynamo-disabled: same topk-tie hazard as _knn_votes_dev - a
@@ -456,6 +548,23 @@ class _PredictMixin:
         ktop = torch.topk(sims, min(c.knn_k, kb))
         kkeep = ktop.values > c.knn_min_sim
         kwv = (ktop.values.clamp(min=0.0) ** c.knn_gamma) * kkeep
+        if c.knn_span > 0 and getattr(self, "_ringg", None) is not None:
+            K = int(c.knn_span)
+            pos = self._knn_pos.index_select(0, ktop.indices).long()
+            offs = torch.arange(-K, K + 1, device=self._dev)
+            pj = pos[:, None] + offs[None, :]
+            hi = (end.reshape(-1)[-1] if end is not None
+                  else pos.new_full((), self._count - 1))
+            live = (pj >= 0) & (pj <= hi)
+            pj = pj.clamp(min=0) % c.ring_capacity
+            toks = self._ringg.index_select(
+                0, pj.reshape(-1)).long().reshape(pj.shape)
+            dw = (float(c.knn_span_decay)
+                  ** offs.abs().float())[None, :]
+            wij = kwv[:, None] * dw * live
+            kvt = wij.sum().double()
+            kvx = (wij * (toks == x)).sum().double()
+            return kvt, kvx
         ksucc = self._knn_succ.index_select(
             0, ktop.indices).long().clamp(0, self.vocab_size - 1)
         kvt = kwv.sum().double()
@@ -532,10 +641,25 @@ class _PredictMixin:
         rows_t = gt.ttoks[gt._ordx, oslot]             # [O, M]
         rows_c = gt.tcnt[gt._ordx, oslot]              # [O, M]
         tots = gt.ttot[gt._ordx, oslot]                # [O]
+        # adaptive-read flag for the NEXT step: dominant follower share
+        # on any evidenced order cell - same cells the order channel
+        # already gathered, so the flag costs ~4 kernels
+        share = rows_c.max(dim=1).values / tots.clamp(min=1e-9)
         # warm flag = any order cell has real evidence this context -
         # feeds cond_hedge regime routing AND the host sparse-tap lift
-        # gate (sparse votes are thin-context fallback only)
-        warm_any = (hit & (tots > c.thin_tot)).any()
+        # gate (sparse votes are thin-context fallback only).  With
+        # evidence_share>0 the mass must CONCENTRATE: a huge diffuse
+        # cell (shared '... A:' trigram holding thousands of answers)
+        # is not warmth - thin-context channels stay in charge there.
+        if c.thin_share > 0:
+            warm_any = (hit & (tots > c.thin_tot)
+                        & (share >= c.thin_share)).any()
+        elif c.evidence_share > 0:
+            warm_any = (hit & (tots * share.clamp(min=0.0)
+                              ** c.evidence_share
+                              > c.thin_tot)).any()
+        else:
+            warm_any = (hit & (tots > c.thin_tot)).any()
         self._dthin_g.copy_(warm_any.reshape(1).long())
         if c.cond_hedge:
             self._regime_g.fill_(warm_any.long())
@@ -543,24 +667,64 @@ class _PredictMixin:
                 0, self._regime_g.view(1)).squeeze(0)
         else:
             wrow = self._wg
-        # adaptive-read flag for the NEXT step: dominant follower share
-        # on any evidenced order cell - same cells the order channel
-        # already gathered, so the flag costs ~4 kernels
-        share = rows_c.max(dim=1).values / tots.clamp(min=1e-9)
         conf_ok = hit & (tots >= c.adaptive_read_min_tot) \
             & (share >= c.adaptive_read_conf)
         self._dconf_g.copy_(conf_ok.any().reshape(1).long())
         wo = wrow[:O].float()[:, None]             # [O,1]
         if c.evidence_lift:
             # effective weight = hedge prior + evidence confidence -
-            # KN-style interpolation; a massive cell speaks for itself
-            wo = wo + (tots / (tots + c.backoff_kappa))[:, None]
+            # KN-style interpolation; a massive cell speaks for
+            # itself.  backoff_order_sharp > 0 shrinks the kappa for
+            # longer contexts (specific hits need less mass)
+            if c.backoff_order_sharp > 0:
+                # cached device tensor: torch.as_tensor(list) inside
+                # this function does an H2D copy, which is illegal
+                # during CUDA-graph capture - the warmup calls build
+                # it eagerly so replay/capture always hits the cache
+                kkey = (c.backoff_kappa, c.backoff_order_sharp,
+                        tuple(c.orders))
+                if getattr(self, "_kap_key", None) != kkey:
+                    o_min = min(c.orders)
+                    self._kap_o = c.backoff_kappa * (
+                        torch.as_tensor(
+                            [o_min / k for k in c.orders],
+                            dtype=torch.float32, device=self._dev)
+                        ** c.backoff_order_sharp)
+                    self._kap_key = kkey
+                kap = self._kap_o
+            else:
+                kap = c.backoff_kappa
+            eff = tots
+            if c.evidence_share > 0:
+                # effective mass concentrates on the mode: a diffuse
+                # mega-cell's mass no longer buys free confidence
+                eff = tots * (share.clamp(min=0.0)
+                              ** c.evidence_share)
+            wo = wo + (eff / (eff + kap))[:, None]
         tok_l = rows_t.long().clamp(0, V - 1)
         row_live = (rows_t >= 0) & (rows_t < V) & hit[:, None]
-        p = (rows_c + c.alpha * uni_pv[tok_l]) \
-            / (tots[:, None] + c.alpha)
+        if c.ppm_escape_c:
+            # method-C escape: pseudo-mass = distinct followers per cell
+            a_o = row_live.sum(dim=1).clamp(min=1e-9)[:, None].float()
+        else:
+            a_o = c.alpha              # python float - no H2D in graph
+        p = (rows_c + a_o * uni_pv[tok_l]) \
+            / (tots[:, None] + a_o)
         contrib = wo * (torch.log(p.clamp(min=1e-12))
                         - log_uni[tok_l])
+        if c.ppm_excl:
+            # PPM exclusion: a token counted at a deeper evidenced order
+            # is masked out of shallower orders' votes.  Owner index =
+            # the deepest live order holding the token - one amax
+            # scatter (static shapes; mask-indexing's nonzero() D2H
+            # sync is illegal under CUDA-graph capture).
+            ordx = torch.arange(O, device=self._dev)[:, None].long()
+            src = torch.where(row_live, ordx.expand_as(tok_l),
+                              tok_l.new_full(tok_l.shape, -1))
+            claimed = tok_l.new_full((V,), -1)
+            claimed.scatter_reduce_(0, tok_l.reshape(-1),
+                                    src.reshape(-1), reduce="amax")
+            row_live = row_live & (claimed[tok_l] <= ordx)
         contrib = torch.where(row_live, contrib,
                               torch.zeros((), device=self._dev))
         # deterministic accumulation - a token can appear in several
@@ -590,11 +754,20 @@ class _PredictMixin:
                 0, frow.reshape(1)).squeeze(0)
             tot_k = gt.ttot.view(-1).index_select(
                 0, frow.reshape(1)).squeeze(0)
-            conf = tot_k / (tot_k + c.backoff_kappa)
+            eff_k = tot_k
+            if c.evidence_share > 0:
+                eff_k = tot_k * (
+                    (rc_k.max() / tot_k.clamp(min=1e-9))
+                    .clamp(min=0.0) ** c.evidence_share)
+            conf = eff_k / (eff_k + c.backoff_kappa)
             tl = rt_k.long().clamp(min=0)
             rl = rt_k >= 0
-            p_b = conf * (rc_k + c.alpha * uni_pv[tl]) \
-                / (tot_k + c.alpha)
+            a_b = (rl.sum().clamp(min=1e-9).float()
+                   if c.ppm_escape_c
+                   else c.alpha)         # python float - no H2D in
+                                         # graph capture
+            p_b = conf * (rc_k + a_b * uni_pv[tl]) \
+                / (tot_k + a_b)
             wb = wrow[self._chix["backoff"]].float()
             if c.evidence_lift:
                 wb = wb + conf
@@ -652,17 +825,33 @@ class _PredictMixin:
         # topic: cosine readout on top candidates (norms from _An)
         cn = self._c.norm()
         wt = wrow_b[self._chix["topic"]].float()
-        cand = self._topk_dev(logits, min(256, V))
-        a = self._A[cand]
-        an = self._An.index_select(0, cand)
-        cos = (a @ self._c) / (an * cn + 1e-8)
-        d_top = torch.where(
-            cn > 1e-8, wt * c.topic_beta * cos,
-            torch.zeros((), device=self._dev))
-        logits[cand] += d_top
-        if cap is not None:
-            cap["topic"] = torch.zeros(
-                V, device=self._dev).scatter(0, cand, d_top)
+        if c.topic_full:
+            # 2-hop association over ALL of vocab: _A[t] = contexts
+            # where t appeared vs the content window query - the
+            # semantic bridge (question entity -> answer entity) that
+            # successor-only channels can't reach.  One [V,192] matvec.
+            xq = self._knn_ctx_feat(end)
+            xn = xq.norm()
+            cos_f = (self._A @ xq) / (self._An * xn + 1e-8)
+            cos_f = torch.where(self._An > 1e-8, cos_f,
+                                torch.zeros((), device=self._dev))
+            d_top = torch.where(xn > 1e-8, wt * c.topic_beta * cos_f,
+                                torch.zeros((), device=self._dev))
+            logits = logits + d_top
+            if cap is not None:
+                cap["topic"] = d_top
+        else:
+            cand = self._topk_dev(logits, min(256, V))
+            a = self._A[cand]
+            an = self._An.index_select(0, cand)
+            cos = (a @ self._c) / (an * cn + 1e-8)
+            d_top = torch.where(
+                cn > 1e-8, wt * c.topic_beta * cos,
+                torch.zeros((), device=self._dev))
+            logits[cand] += d_top
+            if cap is not None:
+                cap["topic"] = torch.zeros(
+                    V, device=self._dev).scatter(0, cand, d_top)
 
         # sem + csem share _Ac = A @ Pcsem (rank-1 maintained): JL
         # projection preserves cosine direction, so both channels score
@@ -709,7 +898,7 @@ class _PredictMixin:
 
         wc = wrow_b[self._chix["csem"]].float() * float(c.use_csem)
         d_csem = torch.where(
-            cf.squeeze() & cok & (rn > 1e-8),
+            cf.squeeze() & cok & (rn > 1e-8) & torch.isfinite(rn),
             wc * c.csem_beta * csims,
             torch.zeros((), device=self._dev))
         logits += d_csem
@@ -820,7 +1009,7 @@ class _PredictMixin:
             self._probes_fast(end)
         kb = self._knn_rows()
         if self.config.use_knn and kb > 0:
-            kv, kvt = self._knn_votes_dev(kb)
+            kv, kvt = self._knn_votes_dev(kb, end=end)
         else:
             # uniform tensor signature - see _step_dev note
             kv = torch.zeros(self.vocab_size, dtype=torch.float32,
@@ -829,6 +1018,212 @@ class _PredictMixin:
                               device=self._dev)
         return self._logits_fast(end, slot, found, live_k,
                                  cok, dok, dk, kv=kv, kvt=kvt)
+
+    # ---------------- channel-evidence capture (open readout) ---------
+
+    def _cap_cell_np(self, cell, tot, wj, ev_mul, denom):
+        """Per-cell sparse lift values (mirrors _sparse_lift_vec_dev's
+        acc) -> (idx int64[np], v fp64[np])."""
+        c = self.config
+        if c.evidence_lift:
+            wj += ev_mul * tot / (tot + c.backoff_kappa)
+        idx = np.fromiter(cell.keys(), dtype=np.int64,
+                          count=len(cell))
+        cnt = np.fromiter(cell.values(), dtype=np.float64,
+                          count=len(cell))
+        uni = self._uni[idx]
+        a_c = self._esc_alpha(len(cell))
+        p = (cnt + a_c * (uni + c.uni_alpha) / denom) / (tot + a_c)
+        v = wj * (np.log(np.maximum(p, 1e-12))
+                  - (np.log(uni + c.uni_alpha) - math.log(denom)))
+        return idx, v
+
+    def _cap_sparse_split(self, warm: int):
+        """Per-channel sparse-lift vectors -> (lv[V], flv[V], per{ch:
+        (v,idx)}).  Same math as the production merged apply, split so
+        each channel's evidence is inspectable (head/knob readout)."""
+        c = self.config
+        V = self.vocab_size
+        end = self._count - 1
+        denom = self._total + c.uni_alpha * self.vocab_size
+        wsrc = self._wR[warm] if c.cond_hedge else self._w
+        lv = np.zeros(V, dtype=np.float64)
+        flv = np.zeros(V, dtype=np.float64)
+        per = {}
+
+        def put(ch, cell, tot, wj, fuzzy=False):
+            idx, v = self._cap_cell_np(cell, tot, wj, 1.0, denom)
+            per[ch] = v, idx
+            np.add.at(flv if fuzzy else lv, idx, v)
+
+        if c.sparse_taps and not (c.sparse_thin_only and warm):
+            for j, taps in enumerate(c.sparse_taps):
+                wj = float(wsrc[self._chix[f"p{j}"]])
+                if wj <= 1e-4:
+                    continue
+                key = self._gap_key(taps, end)
+                if key is None:
+                    continue
+                cell = self._ptabs[taps].get(key)
+                if cell:
+                    put(f"p{j}", cell, self._ptots[taps].get(key, 0.0),
+                        wj)
+        if c.class_orders and not (c.class_thin_only and warm):
+            for k in c.class_orders:
+                wk = float(wsrc[self._chix[f"g{k}"]])
+                if wk <= 1e-4:
+                    continue
+                key = self._class_key(k, end)
+                if key is None:
+                    continue
+                cell = self._gtabs[k].get(key)
+                if cell:
+                    tot = self._gtots[k].get(key, 0.0)
+                    if tot >= c.class_min_tot:
+                        put(f"g{k}", cell, tot, wk)
+        if c.word_orders and not (c.word_thin_only and warm):
+            for j, w in enumerate(c.word_orders):
+                wj = float(wsrc[self._chix[f"w{j}"]])
+                if wj <= 1e-4:
+                    continue
+                key = self._word_key(w, end)
+                if key is None:
+                    continue
+                cell = self._wtabs[j].get(key)
+                if cell:
+                    put(f"w{j}", cell, self._wtots[j].get(key, 0.0),
+                        wj)
+        if c.hybrid_taps and not (c.hybrid_thin_only and warm):
+            for j, pat in enumerate(c.hybrid_taps):
+                wj = float(wsrc[self._chix[f"h{j}"]])
+                if wj <= 1e-4:
+                    continue
+                key = self._hybrid_key(pat, end)
+                if key is None:
+                    continue
+                cell = self._htabs[j].get(key)
+                if cell:
+                    put(f"h{j}", cell, self._htots[j].get(key, 0.0),
+                        wj)
+        if c.gcell and not (c.gcell_thin and warm):
+            code = self._gcell_code(self._c, self._c2, end)
+            w_rel = len(self.channels) * float(
+                wsrc[self._chix["gcell"]])
+            gc_v, gc_i = [], []
+            for cc, dist in self._gcell_neighbors(code):
+                cell = self._gc.get(cc)
+                if cell:
+                    db = self._gen_bias * c.gcell_neighbor_decay ** dist
+                    idx, v = self._cap_cell_np(
+                        cell, self._gct.get(cc, 0.0),
+                        float(c.gcell_w) * w_rel * db, db, denom)
+                    gc_v.append(v)
+                    gc_i.append(idx)
+                    np.add.at(flv, idx, v)
+            if gc_v:
+                per["gcell"] = (np.concatenate(gc_v),
+                                np.concatenate(gc_i))
+        return lv, flv, per
+
+    def predict_cap(self):
+        """(logits[V], cap, warm) — the open channel readout.
+
+        ``cap`` records every channel's additive lift under its name
+        (dense [V] tensor or sparse dict via ``cap['_sparse_raw']``),
+        plus ``cap['_sparse_stats']`` per-channel summary stats.  This
+        is the evidence surface a KnobHead routes — all weights-derived,
+        zero learned parameters.  On cuda_primary models this forces
+        the eager capture path (CUDA graphs can't emit cap)."""
+        V = self.vocab_size
+        end = torch.tensor(self._count - 1, dtype=torch.int64,
+                           device=self._dev)
+        if not self._gpu:
+            cap: dict = {}
+            lg_np = self._predict(cap)
+            lg = torch.as_tensor(np.asarray(lg_np), dtype=torch.float32,
+                                 device=self._dev)
+            keys = self._keys_at(end.item()) if end.item() >= 0 else {}
+            warm = self._regime_now(keys)
+            return lg, cap, warm
+        slot, found, _ev, live_k, cok, dok, dk, _pk = \
+            self._probes_at(end)
+        kb = self._knn_rows()
+        if self.config.use_knn and kb > 0:
+            kv, kvt = self._knn_votes_dev(kb, end=end)
+        else:
+            kv = torch.zeros(V, dtype=torch.float32, device=self._dev)
+            kvt = torch.zeros((), dtype=torch.float32,
+                              device=self._dev)
+        cap = {}
+        lg = self._logits_dev(end, slot, found, live_k, cok, dok, dk,
+                              kv=kv, kvt=kvt, cap=cap)
+        warm = int(self._dthin_g.item())
+
+        lv, flv, per = self._cap_sparse_split(warm)
+        cap["_sparse_stats"] = {
+            ch: (float(v.max()) if v.size else 0.0,
+                 math.log1p(float((v > 0).sum())),
+                 math.log1p(float(np.exp(np.clip(v, None, 20)).sum())))
+            for ch, (v, _idx) in per.items()}
+        cap["_sparse_raw"] = per
+        nz = np.nonzero(lv)[0]
+        if nz.size:
+            lg.index_add_(
+                0, torch.from_numpy(nz).to(self._dev, torch.int64),
+                torch.from_numpy(lv[nz]).to(self._dev, torch.float32))
+        # production _masked(): fuzzy lifts restricted to topk support
+        # union topm
+        c = self.config
+        fuzzy_on = (c.gcell or c.gsyn or c.gsyn_deep or c.dnet)
+        sup_idx = (torch.topk(lg, min(c.lift_topk, lg.numel())).indices
+                   if (c.lift_topk > 0 and fuzzy_on) else None)
+
+        def _masked(v):
+            if sup_idx is None:
+                return v
+            keep = torch.zeros(v.numel(), dtype=torch.bool,
+                               device=self._dev)
+            keep[sup_idx] = True
+            if c.lift_topm > 0:
+                keep[torch.topk(v, min(c.lift_topm, v.numel())
+                                ).indices] = True
+            return torch.where(keep, v, v.new_zeros(()))
+
+        nz = np.nonzero(flv)[0]
+        if nz.size:
+            _ws = self._wR[warm] if c.cond_hedge else self._w
+            _fc = c.lift_clip * min(
+                len(self.channels) * float(_ws[self._chix["gcell"]]),
+                1.0)
+            flv = np.clip(flv, -_fc, _fc)
+            ft = torch.zeros(lg.numel(), dtype=torch.float32,
+                             device=self._dev)
+            ft.index_add_(
+                0, torch.from_numpy(nz).to(self._dev, torch.int64),
+                torch.from_numpy(flv[nz]).to(self._dev, torch.float32))
+            lg.add_(_masked(ft))
+
+        for name, fn in (("gsyn", self._gsyn_lift_vec),
+                         ("gsyn_deep", self._gsd_lift_vec),
+                         ("dnet", self._dnet_lift_vec)):
+            vec = fn(warm)
+            if vec is not None:
+                cap[name] = vec
+                lg = lg + _masked(vec)
+        return lg, cap, warm
+
+    def attach_head(self, head) -> None:
+        """Attach a controller head (e.g. KnobHead).  Afterwards every
+        ``_predict`` — engine generate, eval, teach probes — routes
+        through ``head.remix(lg, cap, self)``; the head remixes the
+        channel distributions read off the weight tables.  Attaching
+        disables the CUDA-graph predict path (cap can't cross graph
+        boundaries) until ``detach_head``."""
+        self._head = head
+        self._pgraph = None            # drop any captured predict graph
+
+    def detach_head(self) -> None:
+        self._head = None
 
     def _sparse_lift_channels_dev(self, warm: int,
                                   gc_code: int | None = None
@@ -853,8 +1248,9 @@ class _PredictMixin:
             if c.evidence_lift:
                 wj += tot / (tot + c.backoff_kappa)
             for t, cnt in cell.items():
-                p = (cnt + c.alpha * self._uni_p(t, denom)) \
-                    / (tot + c.alpha)
+                a_c = self._esc_alpha(len(cell))
+                p = (cnt + a_c * self._uni_p(t, denom)) \
+                    / (tot + a_c)
                 into[t] = into.get(t, 0.0) + wj * (
                     math.log(max(p, 1e-12))
                     - (math.log(self._uni[t] + c.uni_alpha)
@@ -924,6 +1320,108 @@ class _PredictMixin:
                         * c.gcell_neighbor_decay ** dist)
         return out
 
+    def _sparse_lift_vec_dev(self, warm: int,
+                             gc_code: int | None = None
+                             ) -> np.ndarray | None:
+        """Vectorized merge of ``_sparse_lift_channels_dev`` for the hot
+        decode path - same per-cell math evaluated with fp64 numpy
+        gathers instead of per-follower Python loops (hot cells carry
+        thousands of followers; the dict walk dominated decode).
+        ``explain()`` keeps the dict version for per-channel splits."""
+        c = self.config
+        sparse_ok = c.sparse_taps and not (c.sparse_thin_only and warm)
+        class_ok = c.class_orders and not (c.class_thin_only and warm)
+        word_ok = c.word_orders and not (c.word_thin_only and warm)
+        hybrid_ok = c.hybrid_taps and not (c.hybrid_thin_only and warm)
+        gcell_ok = c.gcell and not (c.gcell_thin and warm)
+        if not (sparse_ok or class_ok or word_ok or hybrid_ok
+                or gcell_ok):
+            return None
+        end = self._count - 1
+        denom = self._total + c.uni_alpha * self.vocab_size
+        wsrc = self._wR[warm] if c.cond_hedge else self._w
+        lift = np.zeros(self.vocab_size, dtype=np.float64)
+        # fuzzy channels accumulate separately: candidate-restricted
+        # (lift_topk/lift_topm) - they rerank support, not inject mass
+        flift = np.zeros(self.vocab_size, dtype=np.float64)
+
+        def acc(cell, tot, wj, into=lift, ev_mul=1.0):
+            if c.evidence_lift:
+                wj += ev_mul * tot / (tot + c.backoff_kappa)
+            idx = np.fromiter(cell.keys(), dtype=np.int64,
+                              count=len(cell))
+            cnt = np.fromiter(cell.values(), dtype=np.float64,
+                              count=len(cell))
+            uni = self._uni[idx]
+            a_c = self._esc_alpha(len(cell))
+            p = (cnt + a_c * (uni + c.uni_alpha) / denom) \
+                / (tot + a_c)
+            into[idx] += wj * (np.log(np.maximum(p, 1e-12))
+                               - (np.log(uni + c.uni_alpha)
+                                  - math.log(denom)))
+
+        if sparse_ok:
+            for j, taps in enumerate(c.sparse_taps):
+                wj = float(wsrc[self._chix[f"p{j}"]])
+                if wj <= 1e-4:
+                    continue
+                key = self._gap_key(taps, end)
+                if key is None:
+                    continue
+                cell = self._ptabs[taps].get(key)
+                if cell:
+                    acc(cell, self._ptots[taps].get(key, 0.0), wj)
+        if class_ok:
+            for k in c.class_orders:
+                wk = float(wsrc[self._chix[f"g{k}"]])
+                if wk <= 1e-4:
+                    continue
+                key = self._class_key(k, end)
+                if key is None:
+                    continue
+                cell = self._gtabs[k].get(key)
+                if cell:
+                    tot = self._gtots[k].get(key, 0.0)
+                    if tot >= c.class_min_tot:
+                        acc(cell, tot, wk)
+        if word_ok:
+            for j, w in enumerate(c.word_orders):
+                wj = float(wsrc[self._chix[f"w{j}"]])
+                if wj <= 1e-4:
+                    continue
+                key = self._word_key(w, end)
+                if key is None:
+                    continue
+                cell = self._wtabs[j].get(key)
+                if cell:
+                    acc(cell, self._wtots[j].get(key, 0.0), wj)
+        if hybrid_ok:
+            for j, pat in enumerate(c.hybrid_taps):
+                wj = float(wsrc[self._chix[f"h{j}"]])
+                if wj <= 1e-4:
+                    continue
+                key = self._hybrid_key(pat, end)
+                if key is None:
+                    continue
+                cell = self._htabs[j].get(key)
+                if cell:
+                    acc(cell, self._htots[j].get(key, 0.0), wj)
+        if gcell_ok:
+            code = gc_code if gc_code is not None else \
+                self._gcell_code(self._c, self._c2, end)
+            w_rel = len(self.channels) * float(
+                wsrc[self._chix["gcell"]])
+            for cc, dist in self._gcell_neighbors(code):
+                cell = self._gc.get(cc)
+                if cell:
+                    # CPU parity: ev term scales with gen_bias*decay
+                    # too - (w + ev) * gen_bias * decay, not w*g*d + ev
+                    db = self._gen_bias * c.gcell_neighbor_decay ** dist
+                    acc(cell, self._gct.get(cc, 0.0),
+                        float(c.gcell_w) * w_rel * db,
+                        into=flift, ev_mul=db)
+        return lift, flift
+
     def _gsyn_lift_vec(self, warm: int,
                        q: torch.Tensor | None = None
                        ) -> torch.Tensor | None:
@@ -939,7 +1437,62 @@ class _PredictMixin:
         lp = self._gsyn_logits(q)
         base = self._log_uni_num - math.log(
             self._total + c.uni_alpha * self.vocab_size)
-        return float(c.gsyn_w) * self._gen_bias * (lp - base)
+        # hedge-arbitrated: w_rel = weight relative to the uniform
+        # channel share (1.0 at init, sinks below it when the channel
+        # loses) - replaces the fixed-weight bypass that made harmful
+        # channels unpunishable
+        wsrc = self._wR[warm] if c.cond_hedge else self._w
+        w_rel = len(self.channels) * float(wsrc[self._chix["gsyn"]])
+        # hard cap scaled by the channel's hedged weight: a muted
+        # channel (w_rel<<1) stays a whisper even when its bulk-trained
+        # dense state over-shoots (measured lp = -400K on cuda_primary
+        # bulk) - +-lift_clip*w_rel caps damage to what the weight
+        # actually earned.
+        cap_eff = c.lift_clip * min(w_rel, 1.0)
+        return (float(c.gsyn_w) * w_rel * self._gen_bias
+                * (lp - base)).clamp(-cap_eff, cap_eff)
+
+    def _gsd_lift_vec(self, warm: int,
+                      q: torch.Tensor | None = None
+                      ) -> torch.Tensor | None:
+        """[V] dense lift for the gsyn_deep (TTT-MLP) channel, or None
+        when gated off.  Same additive-logit form as _gsyn_lift_vec -
+        the two channels share key space but carry separate weights."""
+        c = self.config
+        if not c.gsyn_deep or (c.gsyn_deep_thin and warm):
+            return None
+        if q is None:
+            q = self._gsyn_keys(self._gcell_feats(
+                self._c, self._c2, self._count - 1))
+        lp = self._gsd_logits(q)
+        base = self._log_uni_num - math.log(
+            self._total + c.uni_alpha * self.vocab_size)
+        wsrc = self._wR[warm] if c.cond_hedge else self._w
+        w_rel = len(self.channels) * float(wsrc[self._chix["gsd"]])
+        cap_eff = c.lift_clip * min(w_rel, 1.0)
+        return (float(c.gsyn_deep_w) * w_rel * self._gen_bias
+                * (lp - base)).clamp(-cap_eff, cap_eff)
+
+    def _dnet_lift_vec(self, warm: int,
+                       q: torch.Tensor | None = None
+                       ) -> torch.Tensor | None:
+        """[V] dense lift for the dnet iterated-memory channel, or
+        None when gated off.  Same contract as the gsyn lifts - the
+        stack's final-layer readout scores candidate fingerprints."""
+        c = self.config
+        if not c.dnet or (c.dnet_thin and warm):
+            return None
+        if q is None:
+            q = self._gsyn_keys(self._gcell_feats(
+                self._c, self._c2, self._count - 1))
+        lp = self._dnet_logits(q)
+        base = self._log_uni_num - math.log(
+            self._total + c.uni_alpha * self.vocab_size)
+        wsrc = self._wR[warm] if c.cond_hedge else self._w
+        w_rel = len(self.channels) * float(wsrc[self._chix["dnet"]])
+        cap_eff = c.lift_clip * min(w_rel, 1.0)
+        return (float(c.dnet_w) * w_rel * self._gen_bias
+                * (lp - base)).clamp(-cap_eff, cap_eff)
 
     def _apply_sparse_lift_dev(self, row: torch.Tensor,
                                warm: int,
@@ -953,20 +1506,57 @@ class _PredictMixin:
         thin-only gates let the host channels vote.  Applied
         post-``uni_escape`` here vs in-mixture on CPU - a <=(1-eps)
         magnitude divergence, logits renormalize downstream anyway."""
-        lift: dict[int, float] = {}
-        for d in self._sparse_lift_channels_dev(
-                warm, gc_code=gc_code).values():
-            for t, v in d.items():
-                lift[t] = lift.get(t, 0.0) + v
-        if lift:
-            idx = torch.tensor(list(lift), dtype=torch.int64,
+        c = self.config
+        fuzzy_on = (c.gcell or c.gsyn or c.gsyn_deep or c.dnet)
+        sup_idx = None
+        if c.lift_topk > 0 and fuzzy_on:
+            # candidate support = top-k of the pre-lift row: fuzzy
+            # channels rerank these (plus their own top-m proposals)
+            sup_idx = torch.topk(
+                row, min(c.lift_topk, row.numel())).indices
+
+        def _masked(v):
+            """Restrict a fuzzy [V] lift to support ∪ its top-m."""
+            if sup_idx is None:
+                return v
+            keep = torch.zeros(v.numel(), dtype=torch.bool,
                                device=self._dev)
-            row.index_add_(0, idx, torch.tensor(
-                list(lift.values()), dtype=torch.float32,
-                device=self._dev))
+            keep[sup_idx] = True
+            if c.lift_topm > 0:
+                keep[torch.topk(v, min(c.lift_topm, v.numel())
+                                ).indices] = True
+            return torch.where(keep, v, v.new_zeros(()))
+
+        res = self._sparse_lift_vec_dev(warm, gc_code=gc_code)
+        if res is not None:
+            lv, flv = res
+            nz = np.nonzero(lv)[0]
+            if nz.size:
+                row.index_add_(0, torch.from_numpy(nz).to(
+                    self._dev, torch.int64), torch.from_numpy(
+                    lv[nz]).to(self._dev, torch.float32))
+            nz = np.nonzero(flv)[0]
+            if nz.size:
+                _ws = self._wR[warm] if c.cond_hedge else self._w
+                _fc = c.lift_clip * min(
+                    len(self.channels) * float(
+                        _ws[self._chix["gcell"]]), 1.0)
+                flv = np.clip(flv, -_fc, _fc)
+                ft = torch.zeros(row.numel(), dtype=torch.float32,
+                                 device=self._dev)
+                ft.index_add_(0, torch.from_numpy(nz).to(
+                    self._dev, torch.int64), torch.from_numpy(
+                    flv[nz]).to(self._dev, torch.float32))
+                row.add_(_masked(ft))
         gl = self._gsyn_lift_vec(warm, q=gsyn_q)
         if gl is not None:
-            row.add_(gl)
+            row.add_(_masked(gl))
+        gd = self._gsd_lift_vec(warm, q=gsyn_q)
+        if gd is not None:
+            row.add_(_masked(gd))
+        dn = self._dnet_lift_vec(warm, q=gsyn_q)
+        if dn is not None:
+            row.add_(_masked(dn))
 
     def _predict_gpu(self) -> torch.Tensor:
         """Standalone predict (no learn) - CUDA-graph captured like
@@ -975,6 +1565,11 @@ class _PredictMixin:
         Eager fallback while warming or when graphs are disabled
         (clone workers).  Measured ~16x vs the eager pass (5.9ms ->
         0.37ms at V=512)."""
+        if self._head is not None:
+            # knob head attached: route through the channel-evidence
+            # capture path — CUDA graphs can't emit cap
+            lg, cap, warm = self.predict_cap()
+            return self._head.remix(lg, cap, self, warm)
         self._bend.fill_(self._count - 1)
         if not getattr(self, "_use_cuda_graph", True):
             lg = self._predict_dev(self._bend)
@@ -989,7 +1584,8 @@ class _PredictMixin:
                     if (self.config.sparse_taps or self.config.class_orders
                             or self.config.word_orders
                             or self.config.hybrid_taps
-                            or self.config.gcell or self.config.gsyn):
+                            or self.config.gcell or self.config.gsyn
+                            or self.config.gsyn_deep or self.config.dnet):
                         self._apply_sparse_lift_dev(
                             lg, int(self._dthin_g.item()))
                     return lg
@@ -1008,7 +1604,8 @@ class _PredictMixin:
         if (self.config.sparse_taps or self.config.class_orders
                 or self.config.word_orders
                 or self.config.hybrid_taps or self.config.gcell
-                or self.config.gsyn):
+                or self.config.gsyn or self.config.gsyn_deep
+                or self.config.dnet):
             self._apply_sparse_lift_dev(
                 lg, int(self._dthin_g.item()))
         return lg
@@ -1141,6 +1738,8 @@ class _PredictMixin:
         (dict[int, float] or [V] tensor) for explain()."""
         if self._gpu:
             return self._predict_gpu()
+        if self._head is not None and cap is None:
+            cap = {}            # head needs channel evidence
         c = self.config
         end = self._count - 1
         keys = self._keys_at(end) if end >= self._ep_start else {}
@@ -1170,8 +1769,16 @@ class _PredictMixin:
                 cd = cap.setdefault(ch, {})
                 cd[t] = cd.get(t, 0.0) + dv
 
-        # order channels
-        for k in c.orders:
+        # order channels - with backoff_order_sharp the effective
+        # kappa shrinks with order length (long-context hits are more
+        # specific -> less evidence needed for confidence)
+        o_min = min(c.orders) if c.orders else 1
+        # PPM exclusion walks deepest-first so a token already counted
+        # at order k' is masked out of every shallower order's votes.
+        ord_iter = (sorted(c.orders, reverse=True) if c.ppm_excl
+                    else c.orders)
+        excluded: set[int] = set()
+        for k in ord_iter:
             key = keys.get(k)
             if key is None:
                 continue
@@ -1181,11 +1788,25 @@ class _PredictMixin:
             tot = self._totals[k].get(key, 0.0)
             wk = w[f"o{k}"]
             if c.evidence_lift:
-                wk += tot / (tot + c.backoff_kappa)
+                kap = (c.backoff_kappa * (o_min / k)
+                       ** c.backoff_order_sharp
+                       if c.backoff_order_sharp > 0
+                       else c.backoff_kappa)
+                eff = (tot * (max(cell.values()) / tot)
+                       ** c.evidence_share
+                       if c.evidence_share > 0 else tot)
+                wk += eff / (eff + kap)
+            a_cell = float(len(cell)) if c.ppm_escape_c else c.alpha
             for t, cnt in cell.items():
-                p = (cnt + c.alpha * self._uni_p(t, denom)) / (tot + c.alpha)
+                if c.ppm_excl and t in excluded:
+                    continue             # deeper order already
+                                         # explains this token
+                p = (cnt + a_cell * self._uni_p(t, denom)) \
+                    / (tot + a_cell)
                 acc(t, wk * (math.log(max(p, 1e-12)) - log_uni(t)),
                     f"o{k}")
+            if c.ppm_excl:
+                excluded.update(cell)
 
         # sparse-tap channels "p<j>": gapped-suffix keys skip single
         # corrupted/novel positions that break every contiguous key.
@@ -1207,8 +1828,9 @@ class _PredictMixin:
             if c.evidence_lift:
                 wj += tot / (tot + c.backoff_kappa)
             for t, cnt in cell.items():
-                p = (cnt + c.alpha * self._uni_p(t, denom)) \
-                    / (tot + c.alpha)
+                a_c = self._esc_alpha(len(cell))
+                p = (cnt + a_c * self._uni_p(t, denom)) \
+                    / (tot + a_c)
                 acc(t, wj * (math.log(max(p, 1e-12)) - log_uni(t)),
                     f"p{j}")
 
@@ -1234,8 +1856,9 @@ class _PredictMixin:
             if c.evidence_lift:
                 wk += tot / (tot + c.backoff_kappa)
             for t, cnt in cell.items():
-                p = (cnt + c.alpha * self._uni_p(t, denom)) \
-                    / (tot + c.alpha)
+                a_c = self._esc_alpha(len(cell))
+                p = (cnt + a_c * self._uni_p(t, denom)) \
+                    / (tot + a_c)
                 acc(t, wk * (math.log(max(p, 1e-12)) - log_uni(t)),
                     f"g{k}")
 
@@ -1259,8 +1882,9 @@ class _PredictMixin:
             if c.evidence_lift:
                 wj += tot / (tot + c.backoff_kappa)
             for t, cnt in cell.items():
-                p = (cnt + c.alpha * self._uni_p(t, denom)) \
-                    / (tot + c.alpha)
+                a_c = self._esc_alpha(len(cell))
+                p = (cnt + a_c * self._uni_p(t, denom)) \
+                    / (tot + a_c)
                 acc(t, wj * (math.log(max(p, 1e-12)) - log_uni(t)),
                     f"w{j}")
 
@@ -1283,32 +1907,81 @@ class _PredictMixin:
             if c.evidence_lift:
                 wj += tot / (tot + c.backoff_kappa)
             for t, cnt in cell.items():
-                p = (cnt + c.alpha * self._uni_p(t, denom)) \
-                    / (tot + c.alpha)
+                a_c = self._esc_alpha(len(cell))
+                p = (cnt + a_c * self._uni_p(t, denom)) \
+                    / (tot + a_c)
                 acc(t, wj * (math.log(max(p, 1e-12)) - log_uni(t)),
                     f"h{j}")
 
+        # candidate support for fuzzy lift channels: top-k of the
+        # evidence-accumulated logits BEFORE fuzzy votes - they rerank
+        # supported candidates plus their own top-m proposals instead
+        # of injecting mass across the vocab (the measured cause of
+        # the ablation regression)
+        sup = None
+        if c.lift_topk > 0 and (c.gcell or c.gsyn or c.gsyn_deep
+                                or c.dnet):
+            base_now = logits.clone()
+            for t, v in lift.items():
+                base_now[t] += v
+            sup = set(torch.topk(
+                base_now, min(c.lift_topk, base_now.numel())
+            ).indices.tolist())
+
+        def _keep_mask(vec):
+            """sup ∪ top-m of this lift vector, as a bool mask."""
+            keep = torch.zeros(vec.numel(), dtype=torch.bool,
+                               device=vec.device)
+            keep[torch.as_tensor(list(sup), dtype=torch.int64,
+                                 device=vec.device)] = True
+            if c.lift_topm > 0:
+                keep[torch.topk(
+                    vec, min(c.lift_topm, vec.numel())).indices] = True
+            return keep
+
         # learned-key cell channel "gcell": SimHash of the context
         # fingerprint -> sparse succ-score cell - generalizes where no
-        # verbatim key exists.  Fixed weight (bypass), thin-gated.
+        # verbatim key exists.  Hedge-arbitrated + candidate-restricted.
         if c.gcell and (not c.gcell_thin
                         or self._regime_now(keys) == 0):
             code = self._gcell_code(self._c, self._c2, end)
+            wg0 = float(c.gcell_w) * (len(self.channels)
+                                      * float(w_src[
+                                          self._chix["gcell"]]))
             for cc, dist in self._gcell_neighbors(code):
                 cell = self._gc.get(cc)
                 if not cell:
                     continue
                 tot = self._gct.get(cc, 0.0)
-                wg = float(c.gcell_w)
+                wg = wg0
                 if c.evidence_lift:
                     wg += tot / (tot + c.backoff_kappa)
                 wg *= (self._gen_bias
                        * c.gcell_neighbor_decay ** dist)
-                for t, sc in cell.items():
-                    p = (sc + c.alpha * self._uni_p(t, denom)) \
-                        / (tot + c.alpha)
-                    acc(t, wg * (math.log(max(p, 1e-12))
-                                 - log_uni(t)), "gcell")
+                a_g = self._esc_alpha(len(cell))
+                lc = c.lift_clip * min(
+                    len(self.channels) * float(w_src[
+                        self._chix["gcell"]]), 1.0)
+                if sup is None:
+                    for t, sc in cell.items():
+                        p = (sc + a_g * self._uni_p(t, denom)) \
+                            / (tot + a_g)
+                        dv = wg * (math.log(max(p, 1e-12))
+                                   - log_uni(t))
+                        acc(t, min(max(dv, -lc), lc), "gcell")
+                else:
+                    dvs = []
+                    for t, sc in cell.items():
+                        p = (sc + a_g * self._uni_p(t, denom)) \
+                            / (tot + a_g)
+                        dvs.append((t, min(max(
+                            wg * (math.log(max(p, 1e-12))
+                                  - log_uni(t)), -lc), lc)))
+                    keep = sup | {t for t, _ in sorted(
+                        dvs, key=lambda e: -e[1])[:c.lift_topm]}
+                    for t, dv in dvs:
+                        if t in keep:
+                            acc(t, dv, "gcell")
 
         # backoff channel: longest-evidenced order's distribution,
         # confidence-discounted - one arm instead of O probes
@@ -1320,11 +1993,16 @@ class _PredictMixin:
                     best_k, bkey, btot = k, key, t
             if best_k >= 0:
                 cell = self._tables[best_k].get(bkey) or {}
-                conf = btot / (btot + c.backoff_kappa)
+                eff_b = (btot * (max(cell.values()) / btot)
+                         ** c.evidence_share
+                         if c.evidence_share > 0 and cell
+                         else btot)
+                conf = eff_b / (eff_b + c.backoff_kappa)
                 wb = w["backoff"] + (conf if c.evidence_lift else 0.0)
+                a_b = self._esc_alpha(len(cell))
                 for t, cnt in cell.items():
-                    p = conf * (cnt + c.alpha * self._uni_p(t, denom)) \
-                        / (btot + c.alpha)
+                    p = conf * (cnt + a_b * self._uni_p(t, denom)) \
+                        / (btot + a_b)
                     acc(t, wb * (math.log(max(p, 1e-12)) - log_uni(t)),
                         "backoff")
 
@@ -1345,8 +2023,9 @@ class _PredictMixin:
             vt = sum(votes.values())
             wd = w["deep"] + tb + (vt / (vt + c.backoff_kappa)
                                    if c.evidence_lift else 0.0)
+            a_d = self._esc_alpha(len(votes))
             for t, v in votes.items():
-                p = (v + c.alpha * self._uni_p(t, denom)) / (vt + c.alpha)
+                p = (v + a_d * self._uni_p(t, denom)) / (vt + a_d)
                 acc(t, wd * (math.log(max(p, 1e-12)) - log_uni(t)),
                     "deep")
 
@@ -1358,9 +2037,10 @@ class _PredictMixin:
                 wk = w["knn"] + tb
                 if c.evidence_lift:
                     wk += vt / (vt + c.backoff_kappa)
+                a_k = self._esc_alpha(len(kvotes))
                 for t, v in kvotes.items():
-                    p = (v + c.alpha * self._uni_p(t, denom)) \
-                        / (vt + c.alpha)
+                    p = (v + a_k * self._uni_p(t, denom)) \
+                        / (vt + a_k)
                     acc(t, wk * (math.log(max(p, 1e-12)) - log_uni(t)),
                         "knn")
 
@@ -1389,8 +2069,26 @@ class _PredictMixin:
                     cd = cap.setdefault(ch, {})
                     cd[t] = cd.get(t, 0.0) + s
 
-        # topic channel: cosine readout on candidates only
-        if lift:
+        # topic channel: cosine readout on candidates only - or, with
+        # topic_full, the 2-hop association over all of vocab
+        if c.topic_full:
+            xq = self._knn_ctx_feat(end)
+            xn = float(xq.norm())
+            if xn > 1e-8:
+                an = (self._An
+                      if getattr(self, "_An", None) is not None
+                      else self._A.float().norm(dim=1))
+                sims = (self._A.float() @ xq) / (an * xn + 1e-8)
+                sims = torch.where(an > 1e-8, sims,
+                                   torch.zeros_like(sims))
+                wt_f = (w["topic"] + tb) * c.topic_beta
+                logits += (wt_f * sims).float().cpu().numpy()
+                if cap is not None:
+                    tk = torch.topk(
+                        sims.abs(), min(16, sims.numel())).indices
+                    cap["topic"] = {t: wt_f * float(sims[t])
+                                    for t in tk.tolist()}
+        elif lift:
             cn = float(self._c.norm())
             if cn > 1e-8:
                 _add_cosine(self._c, cn,
@@ -1446,12 +2144,47 @@ class _PredictMixin:
                      or self._regime_now(keys) == 0)):
             gq = self._gsyn_keys(
                 self._gcell_feats(self._c, self._c2, end))
-            gl = (float(c.gsyn_w) * self._gen_bias
+            gl = (float(c.gsyn_w) * (len(self.channels)
+                  * float(w_src[self._chix["gsyn"]])) * self._gen_bias
                   * (self._gsyn_logits(gq)
                      - (self._log_uni_num - log_denom))).float()
             if cap is not None:
                 cap["gsyn"] = gl
-            logits = logits + gl
+            logits = logits + (gl if sup is None
+                               else gl * _keep_mask(gl))
+
+        # nonlinear memory channel (gsyn_deep): the MLP counterpart to
+        # gsyn's linear table - same key/readout contract, separate
+        # theta, separate gate so ablations isolate it cleanly
+        if (c.gsyn_deep
+                and (not c.gsyn_deep_thin
+                     or self._regime_now(keys) == 0)):
+            gdq = self._gsyn_keys(
+                self._gcell_feats(self._c, self._c2, end))
+            gdl = (float(c.gsyn_deep_w) * (len(self.channels)
+                   * float(w_src[self._chix["gsd"]])) * self._gen_bias
+                   * (self._gsd_logits(gdq)
+                      - (self._log_uni_num - log_denom))).float()
+            if cap is not None:
+                cap["gsyn_deep"] = gdl
+            logits = logits + (gdl if sup is None
+                               else gdl * _keep_mask(gdl))
+
+        # iterated-memory channel (dnet): the stacked delta-rule
+        # "mini-transformer" - final-layer readout votes, thin-gated
+        if (c.dnet
+                and (not c.dnet_thin
+                     or self._regime_now(keys) == 0)):
+            dnq = self._gsyn_keys(
+                self._gcell_feats(self._c, self._c2, end))
+            dnl = (float(c.dnet_w) * (len(self.channels)
+                   * float(w_src[self._chix["dnet"]])) * self._gen_bias
+                   * (self._dnet_logits(dnq)
+                      - (self._log_uni_num - log_denom))).float()
+            if cap is not None:
+                cap["dnet"] = dnl
+            logits = logits + (dnl if sup is None
+                               else dnl * _keep_mask(dnl))
 
         # recency channel: additive boost for recently seen tokens
         wr = w["recency"]
@@ -1495,9 +2228,10 @@ class _PredictMixin:
                 for t, cnt in cell.items():
                     votes2[t] = votes2.get(t, 0.0) + wk * cnt / tot
             if w2 > 0.0:
+                a_2 = self._esc_alpha(len(votes2))
                 for t, m in votes2.items():
-                    p2 = (m / w2 + c.alpha * self._uni_p(t, denom)) \
-                        / (1.0 + c.alpha)
+                    p2 = (m / w2 + a_2 * self._uni_p(t, denom)) \
+                        / (1.0 + a_2)
                     acc(t, c.rollout_w * (
                         math.log(p2 + 1e-12) - log_uni(t)), "rollout")
 
@@ -1514,6 +2248,13 @@ class _PredictMixin:
             logits = torch.log(
                 (1.0 - c.uni_escape) * torch.softmax(logits, -1)
                 + c.uni_escape * uni_pv)
+        if self._head is not None:
+            if cap is None:
+                cap = {}
+            logits = self._head.remix(
+                logits if torch.is_tensor(logits)
+                else torch.as_tensor(np.asarray(logits)),
+                cap, self, warm=self._regime)
         return logits
 
     # -- public API ------------------------------------------------------
@@ -1600,7 +2341,7 @@ class _PredictMixin:
             self._probes_at(end)
         kb = self._knn_rows()
         if c.use_knn and kb > 0:
-            kv, kvt = self._knn_votes_dev(kb)
+            kv, kvt = self._knn_votes_dev(kb, end=end)
         else:
             kv = torch.zeros(V, dtype=torch.float32, device=self._dev)
             kvt = torch.zeros((), dtype=torch.float32,
@@ -1625,6 +2366,14 @@ class _PredictMixin:
         if gl is not None:
             cap["gsyn"] = gl
             logits = logits + gl
+        gd = self._gsd_lift_vec(warm)
+        if gd is not None:
+            cap["gsyn_deep"] = gd
+            logits = logits + gd
+        dn = self._dnet_lift_vec(warm)
+        if dn is not None:
+            cap["dnet"] = dn
+            logits = logits + dn
         self._knn_hits.copy_(hits0)
         cells = self._explain_cells_gpu(slot, found, live_k)
         rep = self._explain_report(logits, cap, cells, top_k)
@@ -1837,8 +2586,7 @@ class _PredictMixin:
         kb = self._knn_rows()
         if not self.config.use_knn or kb <= 0:
             return []
-        qk = self._c @ self._Pcsem
-        qk = qk / (qk.norm() + 1e-8)
+        qk = self._knn_fp_ctx(self._count - 1)
         sims = self._knn_fp[:kb].float() @ qk.float()
         sims = torch.where(self._knn_pos[:kb] >= 0, sims,
                            torch.full_like(sims, -1e9))

@@ -13,8 +13,8 @@ import torch
 import torch.nn as nn
 
 from .helpers import (_HASH_P, _MASK64, _MIX1, _MIX2,
-                      _load_teacher_embedding, _mix64, _s64,
-                      _scatter_sum)
+                      _group_totals, _load_teacher_embedding, _mix64,
+                      _s64, _scatter_sum)
 from .config import FluxConfig
 from .journal import FluxJournal
 from .tables import _GPUCellTables
@@ -252,11 +252,23 @@ class _StateMixin:
 
         1 = warm (some order table holds tot > thin_tot for this
         context's suffix key), 0 = thin (no order evidence - retrieval/
-        semantic channels are the only signal)."""
-        tt = self.config.thin_tot
+        semantic channels are the only signal).  With evidence_share>0
+        the mass must concentrate - a huge diffuse cell is not warmth."""
+        c = self.config
+        tt = c.thin_tot
         for k, key in keys.items():
-            if self._totals.get(k, {}).get(key, 0.0) > tt:
-                return 1
+            tot = self._totals.get(k, {}).get(key, 0.0)
+            if tot <= tt:
+                continue
+            cell = self._tables[k].get(key) or {}
+            top_sh = (max(cell.values()) / tot) if cell else 0.0
+            if c.thin_share > 0:
+                if top_sh < c.thin_share:
+                    continue
+            elif c.evidence_share > 0:
+                if cell and (tot * top_sh ** c.evidence_share) <= tt:
+                    continue
+            return 1
         return 0
 
     def _recent_lift_z(self, span: int, decay: float,
@@ -324,10 +336,90 @@ class _StateMixin:
         self._c2.copy_(self._bigram_vector(ids)
                        * (1.0 - self.config.topic_decay))
 
+    def _fp_mu(self) -> torch.Tensor:
+        """Unit mean-prose direction: the unigram-weighted mean token
+        feature, i.e. E[_c] under stationarity.  Uses _unig (device
+        counts, CUDA-graph capture safe) or the host _uni array."""
+        uni = (self._unig if getattr(self, "_unig", None) is not None
+               else torch.as_tensor(self._uni, dtype=torch.float32,
+                                    device=self._dev))
+        mu = self._R.float().T @ uni
+        return mu / mu.norm().clamp(min=1e-8)
+
     def _knn_fp_of(self, cvec: torch.Tensor) -> torch.Tensor:
-        """Unit-normalized context fingerprint of a context vector."""
-        fp = cvec.float() @ self._Pcsem
-        return fp / (fp.norm() + 1e-8)
+        """Unit-normalized context fingerprint of a context vector.
+        knn_residual>0 removes the shared mean-prose direction first
+        (dim-agnostic: cvec may be [d] or [n,d])."""
+        x = cvec.float()
+        beta = self.config.knn_residual
+        if beta > 0:
+            mu = self._fp_mu()
+            x = x - beta * (x @ mu)[..., None] * mu
+        fp = x @ self._Pcsem
+        return fp / (fp.norm(dim=-1, keepdim=True) + 1e-8)
+
+    def _knn_tok_w(self, toks: torch.Tensor) -> torch.Tensor:
+        """idf-style rarity weight per token: log(1 + N/(cnt+alpha)).
+        Derived from _unig/_tot (device) or _uni (host) - journaled
+        counts, no extra state.  Capture-safe on the GPU path."""
+        c = self.config
+        if getattr(self, "_unig", None) is not None:
+            u = self._unig.index_select(0, toks)
+            # _tot_g is only refreshed at block end in _ingest_bulk -
+            # _unig is updated earlier in the same pass, so its sum is
+            # the freshest in-flight total (and == _tot_g elsewhere)
+            tot = self._unig.sum()
+        else:
+            u = torch.as_tensor(self._uni, dtype=torch.float32,
+                                device=self._dev)[toks]
+            tot = float(self._total)
+        return torch.log1p(
+            tot.float().clamp(min=1.0) / (u.float() + c.uni_alpha))
+
+    def _knn_ctx_feat(self, end) -> torch.Tensor:
+        """Raw (pre-projection) context feature for fingerprinting and
+        the topic_full association readout.  knn_window>0: (idf-)bag
+        of features over the last W ring tokens, residualized against
+        the mean-prose direction.  0: the _c EMA (legacy)."""
+        c = self.config
+        W = int(c.knn_window)
+        if W <= 0:
+            return self._c
+        dev = self._dev
+        e = (end if torch.is_tensor(end)
+             else torch.as_tensor(end, device=dev))
+        idx = (e.reshape(-1)[-1] - W + 1
+               + torch.arange(W, device=dev)).clamp(min=0)
+        if getattr(self, "_ringg", None) is not None:
+            toks = self._ringg.index_select(
+                0, idx % c.ring_capacity).long()
+        else:
+            toks = torch.as_tensor(
+                [self._ring[int(i) % c.ring_capacity]
+                 for i in idx.tolist()],
+                dtype=torch.long, device=dev)
+        toks = toks.clamp(0, self.vocab_size - 1)
+        rows = self._R.index_select(0, toks).float()
+        if c.knn_idf:
+            w = self._knn_tok_w(toks)
+            x = (rows * w[:, None]).sum(0) / w.sum().clamp(min=1e-8)
+        else:
+            x = rows.mean(0)
+        beta = c.knn_residual
+        if beta > 0:
+            mu = self._fp_mu()
+            x = x - beta * (x @ mu)[..., None] * mu
+        return x
+
+    def _knn_fp_ctx(self, end) -> torch.Tensor:
+        """Fingerprint of the context ending at stream index ``end`` -
+        the _knn_ctx_feat feature projected to csem_dim."""
+        c = self.config
+        if int(c.knn_window) <= 0:
+            return self._knn_fp_of(self._c)
+        x = self._knn_ctx_feat(end)
+        fp = x @ self._Pcsem
+        return fp / (fp.norm(dim=-1, keepdim=True) + 1e-8)
 
     # -- gcell: learned-key (SimHash) cell channel -------------------------
 
@@ -520,8 +612,23 @@ class _StateMixin:
         pre-state snapshot covers undo, so the factor-ring copies
         (per-token D2H syncs) are skipped."""
         c = self.config
-        v = self._R[x].float()
-        v_err = v - self._S @ k                       # [d]
+        Rm = self._Reff if self._Reff is not None else self._R
+        self._gsyn_write_vec(k, Rm[x].float(), s, journal=journal)
+
+    def _gsyn_write_vec(self, k: torch.Tensor, v: torch.Tensor,
+                        s: float, journal: bool = True) -> None:
+        """``_gsyn_write`` with an explicit target vector (a blended
+        feature mix instead of a single token row) - consolidation and
+        recall-weighted writes use this."""
+        c = self.config
+        v = v.float()
+        k = k.float()
+        if not (bool(torch.isfinite(v).all())
+                and bool(torch.isfinite(k).all())):
+            return                     # never write non-finite state
+        if not math.isfinite(float(s)):
+            s = 1.0                    # non-finite surprise = maximal
+        v_err = v - self._S @ k               # [d]
         coeff = float(c.gsyn_beta) * float(s)
         coeff_s = float(c.gsyn_slow_beta) * float(s)
         if journal:
@@ -541,7 +648,8 @@ class _StateMixin:
             self._Ss.mul_(c.gsyn_slow_decay).add_(outer, alpha=coeff_s)
 
     def _gsyn_chunk(self, k: torch.Tensor, xs: torch.Tensor,
-                    s: torch.Tensor, block: int = 64) -> None:
+                    s: torch.Tensor, block: int = 64,
+                    v: torch.Tensor | None = None) -> None:
         """Bulk delta-rule update: exact chunked form of the per-token
         recurrence  S <- g*S + b*s_i*(v_i - S@k_i) x k_i  (WY rep).
 
@@ -563,10 +671,18 @@ class _StateMixin:
         if gam <= 0.0:
             # non-decaying-zero edge config: sequential fallback
             for i in range(int(k.shape[0])):
-                self._gsyn_write(k[i], int(xs[i]),
-                                 float(s[i]), journal=False)
+                if v is not None:
+                    self._gsyn_write_vec(k[i], v[i],
+                                         float(s[i]), journal=False)
+                else:
+                    self._gsyn_write(k[i], int(xs[i]),
+                                     float(s[i]), journal=False)
             return
-        v_all = self._R[xs.long()].float()                  # [m, d]
+        if v is not None:
+            v_all = v.float()                             # [m, d] soft targets
+        else:
+            Rm = self._Reff if self._Reff is not None else self._R
+            v_all = Rm[xs.long()].float()                 # [m, d]
         beta = float(c.gsyn_beta)
         # larger blocks amortize the triangular solve (algebraically
         # exact at any size); cap so the normalized-error scaling
@@ -575,7 +691,14 @@ class _StateMixin:
                   if gam < 1.0 else int(k.shape[0]))
         bs = max(1, min(int(getattr(c, "gsyn_chunk", 256)),
                         bs_cap, int(k.shape[0])))
-        s_f = s.float()
+        # non-finite guards: a poisoned s/k/v must not write NaN into
+        # S - one NaN entry destroys the dense matrix permanently
+        # (decay never removes NaN).  s NaN -> maximal (R60
+        # convention); non-finite k/v rows zeroed -> their outer
+        # products degenerate to no-ops.
+        s_f = torch.nan_to_num(s.float(), nan=1.0)
+        k = torch.nan_to_num(k.float(), nan=0.0)
+        v_all = torch.nan_to_num(v_all, nan=0.0)
         for b0 in range(0, int(k.shape[0]), bs):
             kb = k[b0:b0 + bs].double()                     # [nb, dk]
             vb = v_all[b0:b0 + bs].double()                 # [nb, d]
@@ -615,13 +738,567 @@ class _StateMixin:
         if c.gsyn_slow_decay > 0:
             o = o + self._Ss @ q
         o = o / o.norm().clamp(min=1e-8)
-        a = (self._R.float() @ o) * c.gsyn_temp       # [V]
-        return torch.log_softmax(a.float(), dim=-1)
+        Rm = self._Reff if self._Reff is not None else self._R
+        a = (Rm.float() @ o) * c.gsyn_temp            # [V]
+        # a poisoned S/Rl must not NaN the whole mixture - degrade to
+        # the uniform prior instead (channel effectively abstains)
+        a = torch.nan_to_num(a.float(), nan=0.0)
+        return torch.log_softmax(a, dim=-1)
+
+    # -- deep memory (gsyn_deep): TTT-MLP / Titans-style channel -------
+    # theta maps the same normalized context key k that linear gsyn
+    # uses onto the expected next-token fingerprint, via a 2-layer
+    # MLP.  The nonlinearity is the point: a rank-1-updated matrix can
+    # only store additive key->value associations; an MLP learns
+    # nonlinear maps, which is what lets test-time training generalize
+    # past retrieval.  Gradients are computed explicitly (no autograd)
+    # so the update is fully inspectable; undo is whole-state snapshots
+    # since a gradient step has no closed-form inverse.
+
+    def _gsd_params(self) -> tuple:
+        """theta + momentum buffers, in canonical order."""
+        return (self._Wd1, self._Sb1, self._Wd2, self._Sb2,
+                self._Sm1, self._Smb1, self._Sm2, self._Smb2)
+
+    def _gsd_snap(self) -> tuple:
+        """CPU clones of theta + momentum - the undo payload."""
+        return tuple(t.detach().cpu().clone()
+                     for t in self._gsd_params())
+
+    def _gsd_restore(self, snap: tuple) -> None:
+        for t, s in zip(self._gsd_params(), snap):
+            t.copy_(s.to(t.device))
+
+    def _gsd_journal(self) -> None:
+        """Snapshot theta before the first mutation of the current
+        undo scope: "bc" block payload (bulk), session dict (eager
+        ingest/consolidate), else a standalone ("gd", snap) entry."""
+        blk = self._blk_active
+        if blk is not None:
+            if "gsd" not in blk:
+                blk["gsd"] = self._gsd_snap()
+        elif self._gsd_session is not None:
+            self._gsd_session.setdefault("snap", self._gsd_snap())
+        else:
+            self._jadd(("gd", self._gsd_snap()))
+
+    def _gsd_flush(self) -> None:
+        """Close a deep-memory undo session: one ("gd", snap) entry
+        covering the whole span - mirrors _rl_flush."""
+        sess, self._gsd_session = self._gsd_session, None
+        snap = sess.get("snap") if sess else None
+        if snap is not None:
+            self._jadd(("gd", snap))
+
+    def _gsd_forward(self, k: torch.Tensor) -> tuple:
+        """Explicit forward: z = Wd1@k + Sb1; h = relu(z); o = Wd2@h
+        + Sb2.  Returns (z, h, o) so callers/probes can inspect each
+        stage.  k [..., gsyn_dim] -> o [..., topic_dim]."""
+        z = k.float() @ self._Wd1.T + self._Sb1
+        h = torch.relu(z)
+        return z, h, h @ self._Wd2.T + self._Sb2
+
+    def _gsd_write(self, k: torch.Tensor, x: int, s: float,
+                   journal: bool = True) -> None:
+        """One online step toward the token's feature row."""
+        Rm = self._Reff if self._Reff is not None else self._R
+        self._gsd_write_vec(k, Rm[x].float(), s, journal=journal)
+
+    def _gsd_write_vec(self, k: torch.Tensor, v: torch.Tensor,
+                       s: float, journal: bool = True) -> None:
+        """Single TTT-style gradient step on ||f_theta(k) - v||^2:
+        theta <- decay*theta - lr*s*(mu*M + grad), M = momentum.
+        Explicit grads keep the update inspectable; journal= snapshots
+        theta once per undo scope."""
+        c = self.config
+        if not c.gsyn_deep:
+            return
+        v = v.float()
+        k = k.float()
+        if not (bool(torch.isfinite(v).all())
+                and bool(torch.isfinite(k).all())):
+            return                     # never write non-finite state
+        if not math.isfinite(float(s)):
+            s = 1.0                    # non-finite surprise = maximal
+        if journal:
+            self._gsd_journal()
+        z, h, o = self._gsd_forward(k)
+        err = o - v                                       # [d]
+        dW2 = torch.outer(err, h)                         # [d,h]
+        dh = (self._Wd2.T @ err) * (z > 0).float()        # [h]
+        grads = (torch.outer(dh, k), dh, dW2, err)
+        self._gsd_step(grads, float(s), gam=float(c.gsyn_deep_decay))
+
+    def _gsd_step(self, grads: tuple, s: float,
+                  gam: float = 1.0) -> None:
+        """Shared optimizer update: clip global grad norm, momentum
+        accumulate, decayed SGD step.  grads = (Wd1, Sb1, Wd2, Sb2)."""
+        c = self.config
+        ps = self._gsd_params()
+        tot = float(torch.sqrt(sum((g * g).sum() for g in grads)))
+        if not math.isfinite(tot):
+            return                     # poisoned grad - skip update
+        scale = min(1.0, float(c.gsyn_deep_clip) / max(tot, 1e-12))
+        mu, lr = float(c.gsyn_deep_momentum), float(c.gsyn_deep_lr)
+        # decay applies to theta but not momentum - the forget gate
+        # shrinks stored knowledge, not the optimizer's velocity
+        for p in ps[:4]:
+            p.mul_(gam)
+        for m, p, g in zip(ps[4:], ps[:4], grads):
+            m.mul_(mu).add_(g, alpha=scale)
+            p.add_(m, alpha=-lr * s)
+
+    def _gsd_chunk(self, k: torch.Tensor, xs: torch.Tensor,
+                   s: torch.Tensor, v: torch.Tensor | None = None
+                   ) -> None:
+        """Bulk deep-memory update: one batched gradient step per
+        gsyn_deep_chunk positions (LaCT-style large-chunk online
+        update).  Not the exact sequential recurrence - per-sample
+        errors are computed against the chunk-entry theta, then the
+        mean surprise-weighted gradient is applied once; the
+        pre-state snapshot covers undo either way."""
+        c = self.config
+        if not c.gsyn_deep or k.shape[0] == 0:
+            return
+        if v is not None:
+            v_all = v.float()
+        else:
+            Rm = self._Reff if self._Reff is not None else self._R
+            v_all = Rm[xs.long()].float()
+        s_f = torch.nan_to_num(s.float(), nan=1.0)
+        k = torch.nan_to_num(k.float(), nan=0.0)
+        v_all = torch.nan_to_num(v_all, nan=0.0)
+        bs = max(1, int(c.gsyn_deep_chunk))
+        for b0 in range(0, int(k.shape[0]), bs):
+            kb = k[b0:b0 + bs]                              # [nb, dk]
+            vb = v_all[b0:b0 + bs]                          # [nb, d]
+            sb = s_f[b0:b0 + bs]                            # [nb]
+            sw = sb.sum().clamp(min=1e-8)
+            if b0 == 0:
+                self._gsd_journal()   # covers the whole chunk call
+            z, h, o = self._gsd_forward(kb)
+            err = (o - vb) * (sb / sw)[:, None]             # [nb, d]
+            dW2 = err.T @ h                                 # [d, h]
+            db2 = err.sum(0)
+            dh = (err @ self._Wd2) * (z > 0).float()        # [nb, h]
+            dW1 = dh.T @ kb                                 # [h, dk]
+            db1 = dh.sum(0)
+            self._gsd_step((dW1, db1, dW2, db2), sw,
+                           gam=float(c.gsyn_deep_decay) ** int(kb.shape[0]))
+
+    def _gsd_logits(self, q: torch.Tensor) -> torch.Tensor:
+        """[V] channel readout: softmax(_Reff @ normalize(f_theta(q))
+        * temp) as log-probs - same contract as _gsyn_logits."""
+        c = self.config
+        _, _, o = self._gsd_forward(q)
+        o = o / o.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        Rm = self._Reff if self._Reff is not None else self._R
+        a = (Rm.float() @ o) * c.gsyn_deep_temp             # [V]
+        a = torch.nan_to_num(a.float(), nan=0.0)
+        return torch.log_softmax(a, dim=-1)
+
+    def probe_gsyn_deep(self, top: int = 8) -> dict:
+        """Dissection probe for the deep channel: key vector, hidden
+        activations (relu stats), output fingerprint, top predicted
+        tokens, param/momentum norms, cumulative state delta from the
+        seeded init.  Read-only - journal untouched."""
+        c = self.config
+        if not c.gsyn_deep:
+            return {"enabled": False}
+        q = self._gsyn_keys(self._gcell_feats(
+            self._c, self._c2, self._count - 1))
+        z, h, o = self._gsd_forward(q)
+        lp = self._gsd_logits(q)
+        topv, topi = lp.topk(min(top, lp.shape[0]))
+        ps = self._gsd_params()
+        hd = int(c.gsyn_deep_hidden)
+        gd = torch.Generator().manual_seed(c.seed ^ 0x6CE13)
+        w0 = (torch.randn(hd, c.gsyn_dim, generator=gd)
+              / math.sqrt(c.gsyn_dim)).float().to(self._dev)
+        return {
+            "enabled": True,
+            "key_norm": float(q.norm()),
+            "hidden": {"mean": float(h.mean()),
+                       "max": float(h.max()),
+                       "frac_active": float((z > 0).float().mean())},
+            "out_norm": float(o.norm()),
+            "top_tokens": [(int(t), float(v))
+                           for t, v in zip(topi.tolist(),
+                                           topv.tolist())],
+            "param_norms": {"Wd1": float(self._Wd1.norm()),
+                            "Wd2": float(self._Wd2.norm())},
+            "mom_norms": {"Sm1": float(self._Sm1.norm()),
+                          "Sm2": float(self._Sm2.norm())},
+            "theta_drift": float((self._Wd1 - w0).norm()),
+        }
+
+    # -- iterated memory (dnet): stacked gated delta-rule layers ------
+    # The "transformer that learns online": every layer is the same
+    # delta-rule associative memory as gsyn's _S, but STACKED - layer
+    # l's input is relu(o_{l-1}), so a layer's readout addresses the
+    # next layer's memory.  Content routing through depth is what
+    # single-step channels cannot express.  Write gate is content-
+    # dependent (sigmoid projection of the layer input) so routing is
+    # nonlinear; inter-layer relu breaks odd symmetry.
+
+    def _dnet_snap(self) -> tuple:
+        """CPU clones of all layer states - the undo payload."""
+        return tuple(s.detach().cpu().clone() for s in self._DS)
+
+    def _dnet_restore(self, snap: tuple) -> None:
+        for s, sv in zip(self._DS, snap):
+            s.copy_(sv.to(s.device))
+
+    def _dnet_journal(self) -> None:
+        """Snapshot layer states before the first mutation of the
+        current undo scope - same routing as _gsd_journal."""
+        blk = self._blk_active
+        if blk is not None:
+            if "dnet" not in blk:
+                blk["dnet"] = self._dnet_snap()
+        elif self._dnet_session is not None:
+            self._dnet_session.setdefault("snap", self._dnet_snap())
+        else:
+            self._jadd(("dn", self._dnet_snap()))
+
+    def _dnet_flush(self) -> None:
+        """Close a dnet undo session - one ("dn", snap) entry."""
+        sess, self._dnet_session = self._dnet_session, None
+        snap = sess.get("snap") if sess else None
+        if snap is not None:
+            self._jadd(("dn", snap))
+
+    def _dnet_layers_fwd(self, u1: torch.Tensor,
+                         write: bool = False,
+                         v: torch.Tensor | None = None,
+                         s: float = 0.0,
+                         journal: bool = True) -> torch.Tensor:
+        """Run the stack.  write=False = pure readout (predict-time);
+        write=True performs the gated delta update per layer toward
+        target ``v`` at strength ``s`` and returns the final readout.
+        Every layer predicts the SAME fingerprint target from its own
+        input - layer l learns the map from layer l-1's recall."""
+        c = self.config
+        u = u1.float()
+        for l in range(len(self._DS)):
+            k = u @ self._Dk[l].float()                      # [dk]
+            k = k / k.norm().clamp(min=1e-8)
+            o = self._DS[l] @ k                              # [dv]
+            if write:
+                if journal:
+                    self._dnet_journal()
+                    journal = False        # once per token
+                gate = torch.sigmoid(u @ self._Db[l])        # scalar
+                beta = (float(c.dnet_beta) * float(s)
+                        * float(gate))
+                self._DS[l].mul_(c.dnet_decay).add_(
+                    torch.outer(v - o, k), alpha=beta)
+                o = self._DS[l] @ k        # post-write readout
+            u = torch.relu(o) if c.dnet_relu else o
+        return o
+
+    def _dnet_step(self, u1: torch.Tensor, x: int, s: float,
+                   journal: bool = True) -> None:
+        """One token's online update toward the token fingerprint."""
+        Rm = self._Reff if self._Reff is not None else self._R
+        self._dnet_write_vec(u1, Rm[x].float(), s,
+                             journal=journal)
+
+    def _dnet_write_vec(self, u1: torch.Tensor, v: torch.Tensor,
+                        s: float, journal: bool = True) -> None:
+        """``_dnet_step`` with an explicit fingerprint target
+        (consolidation soft targets)."""
+        c = self.config
+        if not c.dnet:
+            return
+        v = v.float()
+        u1 = u1.float()
+        if not (bool(torch.isfinite(v).all())
+                and bool(torch.isfinite(u1).all())):
+            return                     # never write non-finite state
+        if not math.isfinite(float(s)):
+            s = 1.0
+        self._dnet_layers_fwd(u1, write=True, v=v, s=s,
+                              journal=journal)
+
+    def _dnet_chunk(self, ks: torch.Tensor, xs: torch.Tensor,
+                    s: torch.Tensor, v: torch.Tensor | None = None
+                    ) -> None:
+        """Bulk update.  ``dnet_chunk <= 0`` = exact sequential per-
+        position stack steps.  Default = LaCT-style sub-chunks (same
+        convention as _gsd_chunk): within each sub-chunk, per-position
+        keys/gates/readouts are computed in one batch against the
+        chunk-ENTRY states, then each layer takes one aggregated gated
+        delta write.  Position i's contribution is pre-weighted by
+        decay**(n-1-i) so the aggregate matches the sequential form
+        up to the intra-chunk state evolution (the documented
+        approximation).  Undo via the caller's block/session snapshot,
+        journaled once per call."""
+        c = self.config
+        if not c.dnet or ks.shape[0] == 0:
+            return
+        if v is None:
+            Rm = self._Reff if self._Reff is not None else self._R
+            v = Rm[xs.long()].float()
+        s_f = torch.nan_to_num(s.float(), nan=1.0)
+        ks = torch.nan_to_num(ks.float(), nan=0.0)
+        v = torch.nan_to_num(v.float(), nan=0.0)
+        bs = int(c.dnet_chunk)
+        if bs <= 0:                          # exact sequential path
+            for i in range(int(ks.shape[0])):
+                self._dnet_write_vec(ks[i], v[i], float(s_f[i]),
+                                     journal=(i == 0))
+            return
+        # Chunkwise delta rule (exact - the WY/triangular form of the
+        # sequential recurrence, one solve per layer per sub-chunk).
+        # Positions 1..nb in a sub-chunk: write i sees state after
+        # writes <i, so with e_i = v_i - S_{i-1}k_i the errors obey
+        #   e_i = v_i - d^{i-1}S_0k_i - sum_{j<i} d^{i-1-j} b_j (k_j.k_i) e_j
+        # => (I + L)e = v - D where L[i,j] = d^{i-1-j} b_j k_j.k_i (j<i),
+        # D_i = d^{i-1} S_0k_i.  Forward-substitute (unit-lower-tri),
+        # then S <- d^nb S_0 + sum_i d^{nb-i} b_i e_i k_i^T.  Layer l+1's
+        # input needs each position's POST-write readout:
+        #   o_post_i = S_i k_i = d(v_i - e_i) + b_i e_i   (k unit-norm).
+        # Cross-layer dependency stays exact because o_post is the
+        # closed-form per-position output, not a batch approximation.
+        self._dnet_journal()                 # covers the whole call
+        c = self.config
+        decay = float(c.dnet_decay)
+        dev, dt = ks.device, ks.dtype
+        idx = torch.arange(bs, device=dev)
+        for b0 in range(0, int(ks.shape[0]), bs):
+            u = ks[b0:b0 + bs]                       # [nb, du]
+            vb = v[b0:b0 + bs]                       # [nb, dv]
+            sb = s_f[b0:b0 + bs]                     # [nb]
+            nb = int(u.shape[0])
+            ii = idx[:nb]
+            for l in range(len(self._DS)):
+                k = u @ self._Dk[l].float()              # [nb, dk]
+                k = k / k.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                beta = float(c.dnet_beta) * sb * torch.sigmoid(
+                    u @ self._Db[l])                     # [nb]
+                kk = k @ k.T                             # [nb, nb]
+                diff = (ii[1:, None] - ii[None, :nb - 1] - 1)
+                L = torch.zeros(nb, nb, device=dev, dtype=dt)
+                L[1:, :nb - 1] = (decay ** diff.clamp(min=0)) \
+                    * beta[:nb - 1][None, :] * kk[1:, :nb - 1]
+                L = torch.tril(L, diagonal=-1)
+                D = (k @ self._DS[l].T) * (
+                    decay ** ii.to(dt))[:, None]   # d^{i}, i=0..nb-1
+                e = torch.linalg.solve_triangular(
+                    L + torch.eye(nb, device=dev, dtype=dt),
+                    vb - D, upper=False)                 # [nb, dv]
+                wpos = decay ** torch.arange(
+                    nb - 1, -1, -1, device=dev, dtype=dt)
+                self._DS[l].mul_(decay ** nb).add_(
+                    (e * (beta * wpos)[:, None]).T @ k)  # [dv, dk]
+                o_post = decay * (vb - e) + beta[:, None] * e
+                u = torch.relu(o_post) if c.dnet_relu else o_post
+
+    def _dnet_logits(self, q: torch.Tensor) -> torch.Tensor:
+        """[V] channel readout: softmax(_Reff @ normalize(o_L)
+        * temp) as log-probs - same contract as _gsyn_logits."""
+        c = self.config
+        o = self._dnet_layers_fwd(q, write=False)
+        o = o / o.norm().clamp(min=1e-8)
+        Rm = self._Reff if self._Reff is not None else self._R
+        a = (Rm.float() @ o) * c.dnet_temp                  # [V]
+        a = torch.nan_to_num(a.float(), nan=0.0)
+        return torch.log_softmax(a, dim=-1)
+
+    def probe_dnet(self, top: int = 8) -> dict:
+        """Dissection probe: per-layer state norms, input/gate stats,
+        final readout, top tokens.  Read-only."""
+        c = self.config
+        if not c.dnet:
+            return {"enabled": False}
+        q = self._gsyn_keys(self._gcell_feats(
+            self._c, self._c2, self._count - 1))
+        u = q.float()
+        layer_stats = []
+        for l in range(len(self._DS)):
+            k = u @ self._Dk[l].float()
+            k = k / k.norm().clamp(min=1e-8)
+            o = self._DS[l] @ k
+            layer_stats.append({
+                "S_norm": float(self._DS[l].norm()),
+                "key_norm": float(k.norm()),
+                "read_norm": float(o.norm()),
+                "gate": float(torch.sigmoid(u @ self._Db[l])),
+            })
+            u = torch.relu(o) if c.dnet_relu else o
+        lp = self._dnet_logits(q)
+        topv, topi = lp.topk(min(top, lp.shape[0]))
+        return {
+            "enabled": True,
+            "layers": layer_stats,
+            "out_norm": float(o.norm()),
+            "top_tokens": [(int(t), float(v_))
+                           for t, v_ in zip(topi.tolist(),
+                                            topv.tolist())],
+        }
 
     def _knn_live(self) -> int:
         """Bank rows actually written - the ring wraps at capacity so
         a hot bank is fully live."""
         return min(int(self._knn_cur), self.config.knn_capacity)
+
+    # -- live features (r_live): the no-SFT feature learner ------------
+    # _R rows are the model's entire feature space - a teacher graft or
+    # distill_gen would inject lexical structure offline; instead the
+    # stream provides it: R[x] EMAs toward the normalized pre-x context
+    # sketch, so tokens seen in similar contexts converge to similar
+    # rows (a co-occurrence embedding written by the same surprise-
+    # gated machinery as every other channel).  Seeded bipolar rows are
+    # the init; r_eta is the knob; nothing is trained.
+
+    def _rl_write(self, x, cvec: torch.Tensor, s: float) -> None:
+        """One live-feature step: R[x] <- (1-e)*R[x] + e*u where
+        u = cvec/|cvec|*sqrt(d) (pre-x context sketch at the _R-row
+        norm convention) and e = r_eta*s.  ``cvec`` must be the PRE-x
+        context - callers pass self._c before _push/_step_dev advances
+        it (the fused path reconstructs it by inverting the EMA).
+        First-touch rows snapshot into the active undo sink: the open
+        "bc" block's "rl" dict, the ingest/teach session dict, else a
+        per-token ("rL", tok, row) entry via _jadd."""
+        c = self.config
+        eta = float(c.r_eta) * float(s)
+        cv = cvec.float()
+        if (eta <= 0.0 or self._Rl is None
+                or not math.isfinite(eta)
+                or not bool(torch.isfinite(cv).all())):
+            return
+        eta = min(eta, 1.0)      # an EMA rate > 1 is never meaningful
+        u = cv / cv.norm().clamp(min=1e-8) * (c.topic_dim ** 0.5)
+        xr = (x if torch.is_tensor(x)
+              else torch.tensor(x)).reshape(1).long().to(self._dev)
+        old = self._Rl.index_select(0, xr).squeeze(0)
+        # a pre-corrupt row would re-seed NaN into every future write;
+        # heal to zero so the EMA can rebuild from the next observation
+        old = torch.nan_to_num(old, nan=0.0, posinf=0.0, neginf=0.0)
+        blk = self._blk_active
+        if blk is not None:
+            blk.setdefault("rl", {}).setdefault(
+                int(xr[0]), old.detach().cpu().clone())
+        elif self._rl_session is not None:
+            self._rl_session.setdefault(
+                int(xr[0]), old.detach().cpu().clone())
+        else:
+            self._jadd(("rL", int(xr[0]),
+                        old.detach().cpu().clone()))
+        self._Rl.index_copy_(
+            0, xr, ((1.0 - eta) * old + eta * u).unsqueeze(0))
+        self._Reff.index_copy_(
+            0, xr,
+            (self._R.index_select(0, xr).float()
+             + self._Rl.index_select(0, xr)))
+
+    def _rl_bulk(self, xs: torch.Tensor, cprev: torch.Tensor,
+                 s: torch.Tensor) -> None:
+        """Chunked live-feature update for _ingest_bulk: grouped
+        residual add of eta*s_i*(u_i - R[x_i]) per position -
+        approximates the sequential EMA (duplicate rows share the
+        pre-chunk row, same class as the blk["deltas"] grouping)."""
+        c = self.config
+        # NaN s -> 0 (skip): clamp alone propagates NaN into _Rl rows
+        w = torch.nan_to_num(
+            float(c.r_eta) * s.float(), nan=0.0).clamp(0.0, 1.0)
+        if self._Rl is None or not bool((w > 0).any()):
+            return
+        u = cprev.float() / cprev.float().norm(
+            dim=1, keepdim=True).clamp(min=1e-8) * (c.topic_dim ** 0.5)
+        # default nan_to_num maps +-inf to +-3.4e38 - still finite, so it
+        # silently overflows a stored row to inf and the NEXT touch makes
+        # inf-inf -> NaN.  Zero any non-finite component instead.
+        u = torch.nan_to_num(u, nan=0.0, posinf=0.0, neginf=0.0)
+        xl = xs.reshape(-1).long()
+        blk = self._blk_active
+        uq = torch.unique(xl)
+        rows = self._Rl.index_select(0, uq).cpu()
+        if blk is not None:
+            sink = blk.setdefault("rl", {})
+            for t, row in zip(uq.tolist(), rows):
+                sink.setdefault(t, row.clone())
+        elif self._rl_session is not None:
+            for t, row in zip(uq.tolist(), rows):
+                self._rl_session.setdefault(t, row.clone())
+        else:
+            for t, row in zip(uq.tolist(), rows):
+                self._jadd(("rL", t, row.clone()))
+        resid = w[:, None] * (u - self._Rl.index_select(0, xl))
+        # already-corrupt _Rl rows produce non-finite residuals; drop
+        # them so the corruption can neither spread nor re-seed itself
+        resid = torch.nan_to_num(resid, nan=0.0, posinf=0.0,
+                                 neginf=0.0)
+        u2, tot = _group_totals(xl, resid)          # deterministic add
+        self._Rl.index_copy_(0, u2,
+                             self._Rl.index_select(0, u2) + tot)
+        self._Reff.index_copy_(
+            0, u2, self._R.index_select(0, u2).float()
+            + self._Rl.index_select(0, u2))
+
+    def _rl_flush(self) -> None:
+        """Close a live-feature write session: emit one ("rB", rows)
+        entry covering every first-touched row (whole-span undo)."""
+        sess, self._rl_session = self._rl_session, None
+        if sess:
+            self._jadd(("rB", sess))
+
+    # -- live generalizer "gen head" (R68) ------------------------------
+    # consolidate_gen's per-position transfer, extracted so the learn
+    # paths can run it inline: the order cells' recalled successor
+    # multiset -> the gen channels.  The head holds NO weights of its
+    # own - it routes mass between existing stores, strength
+    # gen_live*conf, conf = the deepest order's evidence confidence.
+
+    def _genlive_write(self, votes: dict[int, float], conf: float,
+                       code: int | None, k: torch.Tensor | None,
+                       cvec: torch.Tensor | None) -> int:
+        """One recall->gen transfer at the current context.
+
+        ``votes`` = {follower: count} aggregated over evidenced order
+        cells; ``conf`` = max_k tot/(tot+backoff_kappa) over the
+        contributing cells; ``code``/``k``/``cvec`` = the context's
+        gcell SimHash code, gsyn key, and raw context sketch (any may
+        be None when its channel family is off).  Writes:
+          - gcell: per-follower delta writes at s_i*share (host cells)
+          - gsyn/gsd/dnet: blended soft target sum(share*Rm[t]) at s_i
+          - _Rl: per-follower row EMA at s_i*share
+        Journaled by the underlying write paths (G/GS/gs/gd/dn/rL/rB)
+        - revert_tag/revert_writes undoes transfers exactly."""
+        c = self.config
+        if not votes or conf <= 0.0 or c.gen_live <= 0.0:
+            return 0
+        top = sorted(votes.items(), key=lambda kv: -kv[1])[
+            : int(c.gen_live_topm)]
+        tot_v = sum(w_ for _, w_ in top)
+        if tot_v <= 0:
+            return 0
+        s_i = float(c.gen_live) * float(conf)
+        n = 0
+        if code is not None and c.gcell:
+            for t, w_ in top:
+                self._gcell_write(code, t, s_i * w_ / tot_v)
+                n += 1
+        if k is not None and (c.gsyn or c.gsyn_deep or c.dnet):
+            Rm = self._Reff if self._Reff is not None else self._R
+            ids = torch.tensor([t for t, _ in top], dtype=torch.long,
+                               device=self._dev)
+            wv = torch.tensor([w_ / tot_v for _, w_ in top],
+                              dtype=torch.float32, device=self._dev)
+            vt = (Rm[ids].float() * wv[:, None]).sum(0)
+            if c.gsyn:
+                self._gsyn_write_vec(k, vt, s_i)
+            if c.gsyn_deep:
+                self._gsd_write_vec(k, vt, s_i)
+            if c.dnet:
+                self._dnet_write_vec(k, vt, s_i)
+            n += 1
+        if cvec is not None and c.r_live:
+            for t, w_ in top:
+                self._rl_write(t, cvec, s_i * w_ / tot_v)
+                n += 1
+        return n
 
     def _knn_rows(self) -> int:
         """Bank rows worth scanning - the live ring prefix rounded up
@@ -661,7 +1338,7 @@ class _StateMixin:
         else:
             slot = self._knn_cur % c.knn_capacity
         if fp is None:
-            fp = self._knn_fp_of(self._c)
+            fp = self._knn_fp_ctx(self._count - 1)
         prev_pos = int(self._knn_pos[slot])
         if journal:
             if self._gpu:
@@ -922,8 +1599,12 @@ class _StateMixin:
             cur = (self._csem_rows[s].float() if prev is not None
                    else torch.zeros(c.csem_dim, device=self._dev))
             lr_eff = c.csem_lr * scale
-            self._csem_rows[s] = (cur * (1.0 - lr_eff)
-                                  + ax.half() * lr_eff).half()
+            upd = cur * (1.0 - lr_eff) + ax * lr_eff
+            # fp16 range guard: _A magnitudes can exceed 65504; rescale
+            # direction-preservingly so .half() cannot produce inf
+            upd = torch.nan_to_num(upd)
+            upd = upd * (6e4 / upd.abs().max().clamp(min=6e4))
+            self._csem_rows[s] = upd.half()
             if journal:
                 self.journal.append(
                     ("s", int(pk[0]), s,

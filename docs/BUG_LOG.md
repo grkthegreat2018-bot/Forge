@@ -669,3 +669,165 @@ even though those are exactly what the loop should be sharpening.
   concise rewards).
 - Tokenizer check: rendered examples now encode ids 518/519/531/532/539
   (previously literal text).
+
+## 2026-10-08 — Continuation-forward causal mask + prefill-logits VRAM spike + decode-capture corruption (Hermes-3/llama31_8b)
+
+### Symptom
+"VRAM spikes when prompting, response corrupted" during the Hermes-3 8B
+(`llama31_8b`) Local_To_Chub bring-up: every 2nd+ chat request sharing the
+>=32-token prefix key (same card/system prompt each turn) generated corrupted
+text; ~512MB bf16 transient VRAM spike on every prefill; corrupted
+continuations after max_new_tokens cutoffs (finish_sentence=True default);
+ghost context on prefix-cache hits for hybrid models; cross-request state
+leakage.
+
+### Root Causes
+1. **SDPA is_causal top-left on continuation forwards (CRITICAL)** —
+   `GroupedQueryAttention` called `flash_attention(is_causal=True)` whenever
+   T>1, even with a non-empty past_kv. PyTorch SDPA anchors the causal mask
+   TOP-LEFT on non-square (T<S) shapes, so a T>1 continuation forward
+   (prefix-cache suffix, chunked prefill chunk>=2, spec verify) masked out
+   the ENTIRE cached prefix (verified empirically T=3,S=7). Every chat
+   message after the first hit the >=32-token prefix key and generated
+   corrupted text. Same defect in `fused_qk_norm_rope_cache.py`.
+   File: `forge/model/layers.py` (~L348), `forge/engine/attention/fused_qk_norm_rope_cache.py` (~L295)
+
+2. **Full [1,T,V] prefill logits** — every DecodingStrategy prefilled via
+   `model(ids, use_cache=True)` without `logits_last_only` (only the last
+   position is ever read): ~512MB bf16 transient at 4k tokens / V=128256.
+   File: `forge/engine/decoding.py` (x7 sites), `forge/engine/prefix_cache.py` (suffix forward)
+
+3. **_finish_to_stop re-fed the last emitted token** — the decode loop
+   already consumed it into past_kv; re-feeding appended a duplicate KV
+   position and corrupted the <=32-token continuation tail. Fired whenever
+   output hit max_new_tokens without EOS (finish_sentence=True default).
+   File: `forge/engine/engine_generation.py` (~L1953)
+
+4. **Prefix cache stored end-of-generation KV under a prompt-only key** —
+   `cache_prompt_prefix` sliced `model._forge_last_kv` (prompt+generated).
+   Tuple entries slice fine, but dict recurrent (mamba/SSM) entries can't be
+   sliced, so generated tokens leaked into a prompt-keyed entry -> ghost
+   context on hybrid-model hits.
+   File: `forge/engine/prefix_cache.py` (~L263)
+
+5. **Stale decode captures across requests** — `_forge_last_kv` was never
+   cleared; strategies that don't set it (NGram/ExternalDraft/Medusa/DSpark/
+   Eagle3/MTPSelfSpec/SelfSpecSparse) left the previous request's KV visible
+   to `_cache_prompt_prefix` and `_finish_to_stop` (poisoned entries /
+   continued a different sequence).
+   File: `forge/engine/engine_generation.py` (~L301)
+
+### Resolution
+1. Explicit bottom-right `_causal_mask(T, total_len, total_len-T)` whenever
+   total_len > T; `is_causal=True` only for the square (total_len == T)
+   case. Applied in layers.py and fused_qk_norm_rope_cache.py.
+2. `logits_last_only=True` on every prefill-only / last-position-only
+   forward: decoding.py x7, prefix_cache.py suffix, kv/cacheblend.py x2,
+   prefill/__init__.py x3, engine_generation.py.
+3. Decode loops stash `_forge_last_logits` alongside `_forge_last_kv`
+   (decoding.py x3, engine_generation._decode_tokens); `_finish_to_stop`
+   uses them (zero extra forwards), falls back to `_prefill(output_ids)`
+   when absent — never re-feeds the last token.
+4. `_forge_prefill_kv` captured at the prompt boundary (StandardDecoding,
+   engine `_prefill`, prefix-cache hit path); `cache_prompt_prefix` prefers
+   it, so stored dict state is at the true boundary.
+5. `_generate_impl` clears `_forge_last_kv`/`_forge_last_logits`/
+   `_forge_prefill_kv` at request start.
+
+### Known remaining issues (confirmed by audit, logged — outside this path)
+- Spec strategies (NGram/ExternalDraft/MTP/SelfSpecSparse) never roll back
+  KV on reject -> corrupt past_kv (decoding.py:338/446); `uno.py`/`dspark.py`
+  dormant/broken paths (singular kwarg TypeError, no snapshot/restore).
+- Triton conv patch (triton_conv.py:194-218) ignores `_conv_state_prefix`
+  on T>1 continuations (hybrid models only).
+- beacon/anchor/metakv compaction + RoPE offset drift (past_len recomputed
+  from compacted cache len; only when a non-rotorquant strategy selected).
+- Per-token torch.cat KV append: O(T) transient per decode step; the real
+  per-layer `presents` cache is unbudgeted (rotorquant strategy object is
+  instantiated but never wired into the model's forward).
+
+### Files Modified
+- `forge/model/layers.py`,
+  `forge/engine/attention/fused_qk_norm_rope_cache.py`,
+  `forge/engine/decoding.py`, `forge/engine/prefix_cache.py`,
+  `forge/engine/kv/cacheblend.py`, `forge/engine/prefill/__init__.py`,
+  `forge/engine/engine_generation.py`
+- `tests/unit/test_forge_engine_fixes.py` — regression tests
+- `scripts/test_hermes_w4_generate.py` — real-model verify harness
+
+### Verification
+- `pytest tests/unit/test_forge_engine_fixes.py tests/unit/test_llama31_w4.py
+  tests/unit/test_rd14_speedup.py tests/unit/test_engine_concurrency_fixes.py
+  tests/unit/test_replay_ssm.py tests/unit/test_r60_kv.py` — all pass
+  (145, incl. 9 new regression tests).
+- TestContinuationForwardCausalMask (cpu+cuda parametrized): continuation
+  logits match single-pass prefill <1e-4 on both devices.
+- Real-model: `scripts/test_hermes_w4_generate.py` on RTX 5070 12GB —
+  Hermes-3 8B loads W4 (~5.6 GiB resident); prefix-cache HIT output equals
+  no-cache reference; peak transient ~0.5-0.8 GiB (was GBs at long prompts).
+
+---
+
+## 2026-10-08 - VRAM growth to limit + empty/garbled output on Chub path
+
+### Symptom
+"context still grows mem to limit. model still horrid in output,
+nonsensical" - through Local_To_Chub (Kobold mode): VRAM climbed ~1.5 GB
+across ~10 requests until the server OOM'd and went unreachable; responses
+returned content:null or pseudo-German word salad with mojibake.
+
+### Root causes
+1. Kobold routing wrapped transcripts in a ChatML user turn.
+   chub_forge_proxy.kobold_to_chat sent Chub's pre-formatted transcript
+   (card + User:/Char: history, no native markers) as one user message to
+   /v1/chat/completions. Verified in-process: on that wrapped prompt
+   Hermes-3 argmaxes token 128001 end_of_text (logit 21.0) at step 0 -
+   the model sees a completed document, not a conversation, and ends the
+   turn. Every marker-free Kobold prompt took this path -> empty output
+   (temp 0) or word salad (temp 2, what Chub's preset sent). LM Studio's
+   Kobold mode sent the prompt raw; wrapping was a regression.
+   File: Local_To_Chub/chub_forge_proxy.py (handle_kobold)
+
+2. Prefix-cache slices pinned whole KV buffers.
+   _slice_past_kv returned seq-axis views; a 32-token LearnedPrefixCache
+   entry shared storage with the full prompt+generation KV (~1 GB at 8k
+   ctx). Up to 256 entries -> VRAM grew to limit -> server crash
+   ("Cannot reach ForgeAI" in proxy.log).
+   File: forge/engine/prefix_cache.py (_slice_past_kv)
+
+3. SemanticKVAnchors stored raw captured_kv per anchor.
+   Up to 3 anchors/save x 16 retained x full request KV, write-only in
+   production (nothing reads kv_state back).
+   File: forge/engine/engine_generation.py (~L354)
+
+4. Decode captures retained request KV between requests.
+   _forge_last_kv/_forge_last_logits/_forge_prefill_kv stayed set until
+   the NEXT request cleared them - one full prompt+gen KV (~1 GB) pinned
+   while idle.
+   File: forge/engine/engine_generation.py (_generate_impl, generate_stream)
+
+### Resolution
+1. Local_To_Chub Kobold endpoint now always routes to /v1/completions
+   (raw continuation - matches LM Studio behavior) and forwards Chub's
+   stop_sequence merged into payload stop.
+2. _slice_past_kv clones tuple slices and dict tensor values - entries
+   own ~4 MB instead of pinning GBs.
+3. save_anchor called with kv_state=None (anchor positions kept for
+   future reuse without pinning KV).
+4. _generate_impl clears the three capture attrs after
+   _cache_prompt_prefix; generate_stream clears them in its finally.
+
+### Files modified
+- forge/engine/prefix_cache.py, forge/engine/engine_generation.py
+- Local_To_Chub/chub_forge_proxy.py
+- tests/unit/test_forge_engine_fixes.py (+3 regression tests)
+
+### Verification
+- Server /v1/completions replay of the Chub transcript prompt:
+  VRAM flat across 7 requests (7.9 GB +- 15 MB; was +1.5 GB/10 req).
+- Proxy /api/v1/generate end-to-end: coherent in-character continuation.
+- 40/40 tests in test_forge_engine_fixes.py pass.
+- NOT a context-overflow issue: failing prompt was ~524 tokens; the model
+  genuinely emits EOS on user-turn-wrapped transcripts.
+- Note: temp=2.0 (Chub preset value observed in proxy.log) still produces
+  degraded sampling by design - user-side sampler choice, not a bug.

@@ -75,6 +75,8 @@ def _s64(v: int) -> int:
 
 _MIX1 = _s64(0x9E3779B97F4A7C15)
 _MIX2 = _s64(0xBF58476D1CE4E5B9)
+_MIX1U = np.uint64(0x9E3779B97F4A7C15)
+_MIX2U = np.uint64(0xBF58476D1CE4E5B9)
 
 
 def _mix64(x: torch.Tensor) -> torch.Tensor:
@@ -84,6 +86,22 @@ def _mix64(x: torch.Tensor) -> torch.Tensor:
     x = (x ^ (x >> 29)) * _MIX2
     x = x ^ (x >> 32)
     return torch.where(x == 0, torch.ones_like(x), x)
+
+
+def _mix64_np(x: np.ndarray) -> np.ndarray:
+    """Vectorized SplitMix64 on a uint64 array (bloom index hashing -
+    the device path wraps int64, this one stays unsigned)."""
+    x = (x + _MIX1U) * _MIX2U
+    x = (x ^ (x >> np.uint64(29))) * _MIX2U
+    return x ^ (x >> np.uint64(32))
+
+
+def _mix64_py(x: int) -> int:
+    """Scalar SplitMix64 on a python int (eager-path bloom hashing)."""
+    x = ((x + 0x9E3779B97F4A7C15) * 0xBF58476D1CE4E5B9) \
+        & 0xFFFFFFFFFFFFFFFF
+    x = ((x ^ (x >> 29)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    return x ^ (x >> 32)
 
 
 def _scatter_sum(keys: torch.Tensor, vals: torch.Tensor,
@@ -125,11 +143,25 @@ def _group_totals(keys: torch.Tensor,
     (keys, vals) inputs always produce identical totals - float atomic
     arrival order never enters.
     """
+    srt, order = _group_sort(keys)
+    return _group_apply(srt, order, keys, vals)
+
+
+def _group_sort(keys: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The sort half of _group_totals - hoistable when several value
+    tensors share the same keys (the EMA loop groups 4 tensors over
+    the same token ids)."""
+    return torch.sort(keys)
+
+
+def _group_apply(srt: torch.Tensor, order: torch.Tensor,
+                 keys: torch.Tensor,
+                 vals: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Group-sum ``vals`` under a presorted ``keys`` ordering."""
     if keys.numel() == 0:
         z = torch.zeros((0,) + vals.shape[1:], dtype=vals.dtype,
                         device=vals.device)
         return keys.clone(), z
-    srt, order = torch.sort(keys)
     v = vals[order]
     k = keys.numel()
     head = torch.ones(k, dtype=torch.bool, device=keys.device)
@@ -138,6 +170,46 @@ def _group_totals(keys: torch.Tensor,
     ends = torch.cat([starts[1:], starts.new_full((1,), k)])
     cum0 = torch.cat([torch.zeros_like(v[:1]), torch.cumsum(v, dim=0)])
     return srt[head], cum0[ends] - cum0[starts]
+
+
+def _group_prefix(keys: torch.Tensor, vals: torch.Tensor,
+                  keys2: torch.Tensor | None = None
+                  ) -> torch.Tensor:
+    """Exclusive in-group prefix sum of ``vals``, returned in ORIGINAL
+    position order.  Groups are equal ``keys`` (or ``(keys, keys2)``
+    pairs); within a group, cumsum runs in ascending position order.
+    Deterministic - stable sort + cumsum have fixed reduction order.
+
+    Bulk-ingest use: position i's prefix value = the mass earlier
+    positions in the same block already wrote under the same key -
+    the in-block evidence the eager path sees live.
+    """
+    n = keys.numel()
+    if n == 0:
+        return torch.zeros_like(vals)
+    if keys2 is None:
+        order = torch.argsort(keys, stable=True)
+        k1s = keys[order]
+        same = k1s[1:] == k1s[:-1]
+    else:
+        o1 = torch.argsort(keys2, stable=True)
+        order = o1[torch.argsort(keys[o1], stable=True)]
+        k1s = keys[order]
+        k2s = keys2[order]
+        same = (k1s[1:] == k1s[:-1]) & (k2s[1:] == k2s[:-1])
+    head = torch.ones(n, dtype=torch.bool, device=keys.device)
+    head[1:] = ~same
+    # exclusive in-group prefix = global exclusive prefix minus the
+    # prefix value at the group's first element
+    v = vals[order]
+    cum = torch.cumsum(v, dim=0)
+    exg = cum - v
+    gid = torch.cumsum(head.long(), dim=0) - 1
+    starts = head.nonzero().squeeze(1)
+    excl = exg - exg.index_select(0, starts.index_select(0, gid))
+    out = torch.empty_like(excl)
+    out[order] = excl
+    return out
 
 
 def _group_add(dst: torch.Tensor, keys: torch.Tensor,

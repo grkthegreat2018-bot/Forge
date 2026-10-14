@@ -4,7 +4,8 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from .helpers import _MIX1, _MIX2, _group_add, _mix64, _s64
+from .helpers import (_MIX1, _MIX2, _group_add, _group_prefix,
+                      _mix64, _s64)
 
 class _GPUCellTables:
     """orders -> open-addressed context-key -> follower-row tables,
@@ -189,9 +190,7 @@ class _GPUCellTables:
         has = match.any(dim=1)
         empty = rows_t == -1
         has_empty = empty.any(dim=1)
-        first_empty = empty.float().argmax(dim=1)
         rows_c = rc[slot]
-        min_col = rows_c.argmin(dim=1)
         # per-slot rank among distinct tokens so same-row writes in
         # this batch land on distinct columns (not all on first_empty)
         ord_ = torch.argsort(slot * (self.V + 1) + toks)
@@ -204,15 +203,28 @@ class _GPUCellTables:
         inv = torch.empty_like(ord_)
         inv[ord_] = torch.arange(ord_.numel(), device=self.dev)
         rank = (rank_g - rank_g[row_first])[inv]
+        # hole-safe free-column placement + overflow drop, same fix as
+        # add_multi: surplus in-batch followers must not collapse into
+        # one mislabeled column
+        free_cols = torch.argsort(
+            (~empty).to(torch.int8), dim=1, stable=True)
+        n_free = empty.sum(dim=1)
+        col_new = free_cols.gather(
+            1, rank.clamp(max=self.M - 1)[:, None]).squeeze(1)
+        fits = rank < n_free
+        rep = ~has & ~has_empty                  # full-row replaces
+        rep_rank = _group_prefix(slot, rep.float())
+        srt_cols = rows_c.argsort(dim=1)
+        col_rep = srt_cols.gather(
+            1, rep_rank.clamp(max=self.M - 1).long()[:, None]
+            ).squeeze(1)
         col = torch.where(
             has, match.float().argmax(dim=1),
-            torch.where(has_empty,
-                        (first_empty + rank).clamp(max=self.M - 1),
-                        min_col))
+            torch.where(rep, col_rep, col_new))
         # non-existing followers need their token id written into the
-        # chosen column (empty slot AND evict-min cases)
-        write_tok = ~has
-        vic = rows_c.gather(1, col[:, None]).squeeze(1)
+        # chosen column (empty slot AND evict-min cases); overflow
+        # newcomers past the row's free columns are dropped
+        write_tok = ~has & (rep | fits)
         rt[slot[write_tok], col[write_tok]] = \
             toks[write_tok].to(torch.int32)
         ev_c = write_tok & ~has_empty
@@ -221,8 +233,13 @@ class _GPUCellTables:
         # deterministic accumulation - duplicate (slot,col) cells or
         # repeated slots inside the batch would otherwise sum through
         # float atomics in kernel-arrival order
-        _group_add(rc.view(-1), flat, d)
-        _group_add(rt_tot, slot[ev_c], -vic[ev_c])
+        _group_add(rc.view(-1), flat,
+                   torch.where(has | write_tok, d,
+                               torch.zeros((), device=self.dev)))
+        # ttot = true sightings total: displaced followers' mass stays
+        # in the denominator (CPU dict parity) - dropping it inflated
+        # kept followers' probs on diffuse rows and swamped deeper
+        # orders at predict time
         _group_add(rt_tot, slot, d)
         self.tocc[oi][slot] = rt_tot[slot]
         return (new & ~evict).sum()
@@ -280,8 +297,6 @@ class _GPUCellTables:
         has = match.any(dim=1)
         empty = rows_t == -1
         has_empty = empty.any(dim=1)
-        first_empty = empty.float().argmax(dim=1)
-        min_col = rows_c.argmin(dim=1)
         # intra-(row,slot) rank over distinct tokens: positions sharing
         # a row with different followers must take different columns.
         # Rank must be PER-ROW - a global pair-rank offset makes
@@ -298,17 +313,33 @@ class _GPUCellTables:
         inv = torch.empty_like(ord_)
         inv[ord_] = torch.arange(ord_.numel(), device=dev)
         rank = rank_row[inv]
+        # free-column placement that skips holes left by reverted
+        # writes and DROPS overflow newcomers: the old
+        # (first_empty+rank).clamp(M-1) landed every surplus in-batch
+        # follower on column M-1, so one column absorbed hundreds of
+        # unrelated deltas under whichever token id landed last -
+        # the phantom mega-count followers (' Radio'-style) that
+        # swamped deeper orders on hot contexts
+        free_cols = torch.argsort(
+            (~empty).to(torch.int8), dim=1, stable=True)   # [B, M]
+        n_free = empty.sum(dim=1)
+        col_new = free_cols.gather(
+            1, rank.clamp(max=self.M - 1)[:, None]).squeeze(1)
+        fits = rank < n_free
+        rep = ~has & vf & ~has_empty             # full-row replaces
+        rep_rank = _group_prefix(row_ix, rep.float())
+        srt_cols = rows_c.argsort(dim=1)       # weakest col first
+        col_rep = srt_cols.gather(
+            1, rep_rank.clamp(max=self.M - 1).long()[:, None]
+            ).squeeze(1)
         col = torch.where(
             has, match.float().argmax(dim=1),
-            torch.where(has_empty,
-                        (first_empty + rank).clamp(max=self.M - 1),
-                        min_col))
-        write_tok = ~has & vf
+            torch.where(rep, col_rep, col_new))
+        write_tok = ~has & vf & (rep | fits)
         cell = row_ix * self.M + col
-        # column-evict victims (full row -> min column displaced):
+        # column-evict victims (full row -> weakest column displaced):
         # capture (cell, tok, cnt) BEFORE the write so undo restores
-        # exactly; ttot must also drop the displaced mass
-        rep = write_tok & ~has_empty
+        # exactly; displaced mass stays in ttot (true sightings)
         ttfl = self.ttoks.view(-1)
         tcfl = self.tcnt.view(-1)
         col_snap = (cell[rep],
@@ -318,10 +349,14 @@ class _GPUCellTables:
         tcv = self.tcnt.view(-1)
         ttv.index_copy_(
             0, cell[write_tok], tf[write_tok].to(torch.int32))
-        tcv[cell[write_tok & ~has_empty]] = 0.0
+        tcv[cell[rep]] = 0.0
         zv = torch.zeros((), device=dev)
-        _group_add(tcv, cell, torch.where(vf, df, zv))
-        _group_add(self.ttot.view(-1), row_ix[rep], -col_snap[2])
+        # dropped overflow followers (has_empty & ~fits) contribute no
+        # cell mass - their sighting still counts via ttot below
+        _group_add(tcv, cell,
+                   torch.where(vf & (has | write_tok), df, zv))
+        # ttot = true sightings total (see add()) - displaced follower
+        # mass is NOT subtracted; col_snap still restores tcnt on undo
         _group_add(self.ttot.view(-1), row_ix,
                    torch.where(vf, df, zv))
         oc = self.tocc.view(-1)
@@ -528,7 +563,6 @@ class _GPUCellTables:
         col = torch.where(has, match.float().argmax(dim=1),
                           torch.where(has_empty, first_empty, min_col))
         replace = (~has) & (~has_empty) & valid
-        vic_c = rows_c.gather(1, col[:, None]).squeeze(1)
         rt_flat = self.ttoks.view(self.O, -1)
         rc_flat = self.tcnt.view(self.O, -1)
         flat = slot * self.M + col
@@ -544,8 +578,8 @@ class _GPUCellTables:
             rc_flat[self._ordx, flat])
         rc_flat[self._ordx, flat] += torch.where(
             valid, d, torch.zeros((), device=self.dev))
-        self.ttot[self._ordx, slot] += torch.where(
-            replace, -vic_c, torch.zeros((), device=self.dev))
+        # ttot = true sightings total (see add()) - the displaced
+        # follower's mass stays in the denominator
         self.ttot[self._ordx, slot] += torch.where(
             valid, d, torch.zeros((), device=self.dev))
         self.tocc[self._ordx, slot] = self.ttot[self._ordx, slot]
@@ -691,6 +725,41 @@ class _GPUCellTables:
             m = (tt >= 0) & (cc != 0)
             out[k] = (kk[m], tt[m], cc[m])
         return out
+
+    def row_totals(self) -> dict:
+        """{k: (raw_keys_u64, tots_f32)} for live rows - persists the
+        honest sightings totals that follower triplets can't rebuild
+        (truncated followers' mass isn't in the cell dump)."""
+        out = {}
+        for k in self.orders:
+            oi = self.kidx[k]
+            nz = (self.tkeys[oi] != 0) & (self.ttot[oi] > 0)
+            out[k] = (np.asarray(self.traw[oi][nz].cpu().numpy(),
+                                 dtype=np.uint64),
+                      np.asarray(self.ttot[oi][nz].cpu().numpy(),
+                                 dtype=np.float32))
+        return out
+
+    def restore_totals(self, rt: dict) -> None:
+        """Re-apply ``row_totals`` after ``load_triplets`` - overwrites
+        the rebuilt kept-sum totals with the true sightings mass."""
+        dev = self.dev
+        for k in self.orders:
+            ent = rt.get(k, rt.get(str(k)))
+            if not ent:
+                continue
+            raws, tots = ent
+            if not len(raws):
+                continue
+            oi = self.kidx[k]
+            rk = torch.from_numpy(np.ascontiguousarray(
+                raws, dtype=np.int64)).to(dev)
+            tv = torch.from_numpy(np.ascontiguousarray(
+                tots, dtype=np.float32)).to(dev)
+            pk = _mix64(rk * _MIX1 + self._salt[oi])
+            slot, found = self._probe(self.tkeys[oi], pk)
+            self.ttot[oi][slot[found]] = tv[found]
+            self.tocc[oi][slot[found]] = tv[found]
 
     def load_triplets(self, tri: dict,
                       chunk: int = 2_000_000) -> None:

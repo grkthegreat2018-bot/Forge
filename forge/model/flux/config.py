@@ -80,6 +80,12 @@ class FluxConfig:
     # capacity guards (hard memory bound)
     max_cells_per_order: int = 150_000   # decay-halving sweep beyond this
     journal_cap: int = 200_000           # journaled writes kept for undo
+    journal_bytes: int = 1 << 30         # retained bulk-block payload
+                                         # budget (~1 GB); "bc" entries
+                                         # carry 50-200MB each, so the
+                                         # entry-count cap alone was
+                                         # blind to real memory. 0 =
+                                         # keep no bulk-undo payload.
     vec_delta_cap: int = 65_536          # fp16 topic deltas kept for undo
 
     # speed: during bulk ingest, skip deep-match + topic reads inside the
@@ -203,6 +209,12 @@ class FluxConfig:
     gcell_bits: int = 24          # SimHash width (<= 62)
     gcell_w: float = 0.5          # fixed channel lift weight
     gcell_thin: bool = True       # vote only in thin contexts
+    # absolute cap on any single fuzzy-channel logit lift (nats).
+    # Bulk-trained dense states (_S/_DS) can reach ~300x eager norms;
+    # uncapped, a hedged-down channel still injects +-kilohertz noise
+    # into thin contexts (measured -401K lp on cuda_primary bulk).
+    # ~12 nats: strong rerank, never a veto.
+    lift_clip: float = 12.0
     gcell_lr: float = 1.0         # delta-rule step scale
     gcell_max_cells: int = 1 << 20
     # SDM-style fuzzy read: probe cells whose codes sit within a
@@ -240,11 +252,142 @@ class FluxConfig:
     gsyn_slow_decay: float = 0.0
     gsyn_slow_beta: float = 0.1
 
+    # nonlinear memory channel "gsyn_deep": a tiny 2-layer MLP
+    # f_theta: k -> expected next-token fingerprint, trained ONLINE by
+    # surprise-scaled gradient steps (TTT-MLP / Titans-style test-time
+    # training - the memory is a learned function, not a table).  Kept
+    # fully separate from linear gsyn (_S stays the audit-friendly
+    # linear baseline): own weights, own lift weight, own thin gate,
+    # own journal entries.  theta = (Wd1 [h,dk], Sb1 [h], Wd2 [d,h],
+    # Sb2 [d]) + momentum buffers - ~2*(h*dk + h*d) params (~115K at
+    # defaults, <0.5MB fp32).  The MLP is what generalizes: unlike the
+    # rank-1 delta table it can represent nonlinear key->value maps,
+    # which is the TTT/Titans lever for composition beyond retrieval.
+    # Undo model: gradient steps aren't analytically invertible, so
+    # whole-theta pre-state snapshots - "gsd" payload inside "bc"
+    # blocks (bulk), one "gd" entry per ingest/consolidate session
+    # (eager paths), per-write "gd" entries only outside sessions.
+    # probe_gsyn_deep() exposes k/h/o readouts + param norms for
+    # dissection.
+    gsyn_deep: bool = False
+    gsyn_deep_hidden: int = 128     # MLP width
+    gsyn_deep_w: float = 0.5        # fixed channel lift weight
+    gsyn_deep_thin: bool = True     # vote only in thin contexts
+    gsyn_deep_lr: float = 0.02      # online step rate (x surprise)
+    gsyn_deep_momentum: float = 0.9 # heavy-ball momentum buffer
+    gsyn_deep_decay: float = 0.999  # per-token retention (forget gate)
+    gsyn_deep_temp: float = 4.0     # read softmax temperature
+    gsyn_deep_chunk: int = 64       # LaCT-style batch per grad step
+    gsyn_deep_clip: float = 4.0     # global grad-norm clip per update
+
+    # iterated memory channel "dnet": a small stack of gated delta-
+    # rule layers - the linear-attention/delta-net answer to "a
+    # transformer that doesn't bog down learning".  Each layer's
+    # recurrent state S_l [topic_dim, dnet_dk] is an online-trained
+    # associative memory (SAME substrate class as gsyn's _S); the
+    # stack gives what every single-step channel lacks: ITERATION.
+    # Layer-1 reads the stream key; layer-l's input is relu(o_{l-1})
+    # - "what the previous layer thinks follows" - so one layer's
+    # readout ADDRESSES the next layer's memory (content routing,
+    # the reasoning primitive attention gets from depth).  relu
+    # between layers is load-bearing: it breaks odd symmetry so
+    # antipodal keys are separable (linear layers provably can't).
+    # Memory cost: no KV cache, no optimizer state (delta rule is
+    # momentum-free) - 2 layers ~ 340KB total.  Params are seeded
+    # bipolar projections (knobs, never trained); state learns online
+    # by construction - learning IS inference here.
+    # Gates: content-dependent write gate beta_l = sigmoid(w_bl.u_l)
+    # * dnet_beta * surprise (GDN-style channel gating), scalar
+    # retention dnet_decay.  Undo: whole-state snapshots ("dn"
+    # entries + blk["dnet"]), session-scoped like gsyn_deep.
+    dnet: bool = False
+    dnet_layers: int = 2            # iteration depth of the stack
+    dnet_dk: int = 128              # per-layer state key width
+    dnet_decay: float = 0.999       # per-token retention gate
+    dnet_beta: float = 0.5          # write rate (x gate x surprise)
+    dnet_w: float = 0.5             # fixed channel lift weight
+    dnet_thin: bool = True          # vote only in thin contexts
+    dnet_temp: float = 4.0          # read softmax temperature
+    dnet_relu: bool = True          # inter-layer nonlinearity
+    dnet_chunk: int = 128           # bulk sub-chunk size (LaCT-style:
+                                    # per-position errors vs chunk-entry
+                                    # state, one aggregated write each;
+                                    # <=0 = exact sequential writes)
+
+    # live features "r_live": the no-SFT substitute for a teacher graft
+    # or distill_gen - _R[x] EMAs toward the normalized pre-x context
+    # sketch (_c/|_c|*sqrt(d)) at rate r_eta*s (surprise-scaled), so
+    # tokens seen in similar contexts converge to similar rows.  Every
+    # _R consumer upgrades together (gsyn readout and write targets,
+    # topic sketch, knn fingerprints, csem, gcell codes) - the gen
+    # channels generalize vocabulary with zero trained parameters:
+    # _R/_Wk/_Wq are seeded params, behavior tuned by knobs.  Undo is
+    # first-write-per-span: rows snapshot into the "bc" blk["rl"] dict
+    # (bulk), one ("rB", rows) entry per ingest/teach session (eager),
+    # or per-token ("rL", tok, row) entries (fused/forward steps).
+    # NOTE: cells written under earlier features remain addressed by
+    # their original keys - row drift is slow (eta*s per touch) and the
+    # channels' own delta rules error-correct around it.
+    r_live: bool = True
+    r_eta: float = 0.05           # EMA rate (scaled by token surprise)
+
+    # recall->gen writeback: surprise-scaled gen writes go quiet exactly
+    # when recall already covers the context (s ~ 0 means the order
+    # cells predicted it) - but those are precisely the associations
+    # the gen channels should absorb.  When the context is warm (some
+    # order cell totals > thin_tot), gen-channel writes (gcell/gsyn/
+    # r_live) use max(s, gen_recall) instead of s, so recall-proven
+    # knowledge reaches the generator at full strength.  0 = off.
+    # consolidate_gen() is the batch counterpart (ring sweep into gen).
+    gen_recall: float = 0.0
+
+    # live generalizer "gen head" (R68): consolidate_gen made
+    # incremental.  Every learned position whose order cells hold
+    # evidence transfers the cells' recalled successor DISTRIBUTION
+    # (top-gen_live_topm followers, share-weighted) into the gen
+    # channels - gcell cells, the gsyn/gsd/dnet delta states (blended
+    # soft-feature target), and the _Rl live rows.  Unlike gen_recall
+    # (floors the realized token's own write), the generalizer writes
+    # what recall *knows about the context* as a distribution -
+    # including followers that were not the observed token.  Unlike
+    # consolidate_gen (batch ring replay), it runs inside the learn
+    # path itself, so self-play apply_packets/ingest generalizes
+    # continuously - no post-pass needed.  The head owns no weights:
+    # it moves mass between existing stores.  Write strength =
+    # gen_live * conf with conf = max_k tot/(tot + backoff_kappa)
+    # on POST-write cell totals everywhere: eager/fused read the
+    # cell after its own write; _ingest_bulk re-reads the slot2
+    # post-write re-probe (same probe as the reward fix-up).
+    # 0 = off.
+    gen_live: float = 0.0
+    gen_live_topm: int = 4
+    gen_live_min_tot: float = -1.0   # <=0 -> thin_tot
+
     # "warm" threshold shared by the thin-only gates and cond_hedge
     # regime routing: an order cell needs tot > thin_tot to count as
     # real evidence.  0 = binary; 2.0 measured optimum (weak 1-2-count
     # cells are effectively thin - fallback experts still help there).
     thin_tot: float = 2.0
+    # concentration gate on warmth: when >0, a 'warm' context ALSO
+    # needs a cell whose top follower holds >= thin_share of its mass
+    # - i.e. some cell actually has a dominant answer.  Without it, a
+    # huge DIFFUSE cell (the shared '... A:' trigram holding thousands
+    # of different answers) counts as warm forever: thin_boost never
+    # fires and cond_hedge's thin row is never consulted at exactly
+    # the novel contexts it was built for.  0 = off (prior semantics).
+    thin_share: float = 0.0
+
+    # full-vocab topic association (2-hop bridge): the topic channel's
+    # cosine readout scores ALL of vocab instead of only the top
+    # candidates.  _A[t] rows = "contexts where t appeared", so
+    # cos(_A[t], query) is exactly the token<->context association
+    # knn's successor-only vote cannot express: a question about
+    # 'roman god of fire' lifts 'vulcan' because vulcan appeared in
+    # those contexts - no verbatim successor needed.  With knn_window
+    # + knn_residual the query is content-only, so ubiquitous tokens
+    # (rows ~= prose mean) auto-suppress.  Needs knn_window>0 for the
+    # windowed query; falls back to _c otherwise.
+    topic_full: bool = False
 
     # fixed weight bonus for retrieval/semantic channels (deep, knn,
     # topic, sem, csem) in thin contexts - they are the only signal
@@ -352,6 +495,44 @@ class FluxConfig:
     use_backoff: bool = True
     backoff_min_tot: float = 2.0
     backoff_kappa: float = 8.0      # confidence = tot / (tot + kappa)
+    # order-sharpened confidence: with backoff_order_sharp > 0 the
+    # effective kappa for an order-k channel scales as
+    #   kappa_k = backoff_kappa * (min_order / k) ** sharp
+    # so a longer-context cell needs less mass for the same
+    # confidence (a single-observation o64 hit is already a very
+    # specific context; a single o3 hit is not).  0 = flat kappa
+    # (default, preserves prior semantics); ~1 is the backoff-
+    # convention choice that makes one-shot verbatim recall win.
+    backoff_order_sharp: float = 0.0
+
+    # PPM method-C escape: replace the constant unigram pseudo-mass
+    # `alpha` with the cell's OWN evidence - the number of distinct
+    # followers u (Moffat method C: escape mass ~ u/(tot+u)).  Applies
+    # wherever a count cell backs off to unigram: p = (cnt + a*uni)
+    # / (tot + a) with a = u instead of a = alpha.  Cells with many
+    # distinct followers get more escape (appropriately skeptical of
+    # their argmax); single-follower cells get near-zero dilution.
+    # Method-A (constant alpha) is the weakest PPM escape - measured
+    # PAQ/PPM literature puts C/D clearly ahead.
+    ppm_escape_c: bool = False
+    # PPM exclusion (predict paths): a token already counted at a
+    # deeper evidenced order is excluded from shallower order-channel
+    # votes - the shallow cell's vote on that token is evidence the
+    # deeper cell already explains; counting it twice inflates warm-
+    # context dilution.  Classical PPM also applies it at write time
+    # (halves write cost) - that variant is not implemented here.
+    ppm_excl: bool = False
+
+    # candidate restriction for lift channels (gcell/gsyn/gsd/dnet):
+    # fuzzy lifts may only vote inside the top-`lift_topk` of the
+    # pre-lift logit row, plus each channel's own top-`lift_topm`
+    # self-proposals.  Lift channels RERANK evidence-supported
+    # candidates instead of injecting mass onto arbitrary tokens -
+    # unhedged smear over the vocab was the measured cause of the
+    # ablation regression (all-channels 0.28 vs recall-only 0.82).
+    # 0 disables (prior semantics).
+    lift_topk: int = 64
+    lift_topm: int = 8
 
     # evidence lift (interpolated-Kneser-Ney semantics): at predict time
     # an order/backoff channel's effective weight is w + tot/(tot+kappa)
@@ -359,6 +540,50 @@ class FluxConfig:
     # self-evidencing.  Without this, hedge collapse (weights -> floor)
     # makes injected/learned facts unreachable no matter their counts.
     evidence_lift: bool = True
+    # concentration-weighted evidence: when >0, an order/backoff cell's
+    # effective mass for the evidence_lift confidence term is
+    #   eff = tot * share_top ** evidence_share
+    # where share_top = max follower count / tot.  A huge but DIFFUSE
+    # cell (e.g. the shared '... A:' trigram holding thousands of
+    # different answers, top share ~3%) stops getting conf ~= 1 from
+    # raw mass alone - mass only counts when it concentrates on a
+    # mode.  Concentrated cells (unique question -> one answer) keep
+    # full confidence.  0 = off (prior semantics).
+    evidence_share: float = 0.0
+
+    # fixed-share diffusion (Koolen/Herbster): after each hedge update,
+    # w <- (1-d)w + d/C - a uniform-share floor that lets weights
+    # re-track fast after regime/domain switches.  AdaHedge is
+    # worst-case optimal but collapses to hedge_min and re-tracks
+    # slowly; a small d (1e-4..1e-2) is the classic switching-regime
+    # fix.  0 = off (pure AdaHedge).
+    hedge_share: float = 0.0
+
+    # discounted AdaHedge (arXiv 2402.02720): hmx <- lam*hmx + gap each
+    # step instead of monotone accumulation.  AdaHedge's eta = lnC/hmx
+    # decays permanently - after a hard stretch the lr can never grow
+    # back, so the router re-tracks a switched regime slowly.  lam<1
+    # forgets old mixability evidence -> eta adapts to the CURRENT
+    # regime difficulty.  1.0 = pure AdaHedge (default); 0.999..0.99
+    # is the useful band.  Complements hedge_share (share bounds the
+    # weight floor; discount bounds the lr floor).
+    hedge_discount: float = 1.0
+
+    # Bloom doorkeeper (R63-3): counting-Bloom admission gate in front
+    # of order/host cell creation.  A context key's first sighting sets
+    # bits instead of allocating a row; the row materializes on the
+    # bloom_admit-th sighting (>=2 enables; 0/1 = off).  Streams are
+    # hapax-heavy - most (order, context) keys never recur - so this
+    # cuts table growth, eviction churn, and journal volume
+    # proportionally, at the cost of losing an admitted key's first
+    # observation.  Applies to bulk ingest + eager/host-table writes;
+    # teach()/write_counts() bypass it (explicit supervision must not
+    # be swallowed).  Bloom counters are admission metadata, NOT
+    # journaled - revert restores cells exactly; stale bits only over-
+    # promote afterwards (benign).  Persisted in snapshots so resume
+    # keeps the same admission state.
+    bloom_admit: int = 0
+    bloom_bits: int = 1 << 22   # int16 counters per filter (8MB)
 
     # AdaHedge-style adaptive lr: eta_t = ln(C) / mix_cum where mix_cum
     # accumulates the per-token mixability gap (max reward - p_mix).
@@ -420,6 +645,50 @@ class FluxConfig:
     knn_gamma: float = 2.0           # vote weight = relu(sim)^gamma
     knn_min_sim: float = 0.05        # cosine floor for a vote to count
     knn_scan_min: int = 4096         # live-slice granularity (bucket)
+    # mean-direction residualization: the context EMA is dominated by a
+    # shared 'prose direction' (the unigram-weighted mean token feature,
+    # cos ~0.85 with every context) - measured: raw fingerprints are
+    # cos ~0.7-0.99 with ALL bank rows regardless of content, so top-k
+    # retrieval is noise.  knn_residual > 0 removes beta * projection
+    # onto u_hat = norm(uni-weighted mean _R row) before projection:
+    #   fp = norm( (c - beta*(c.u)u) @ Pcsem )
+    # Residual sims spread to ~[-0.05, 0.35] and content overlap
+    # actually ranks.  Derived from _uni/_R - no extra state; applies
+    # to writes AND reads symmetrically, so set BEFORE ingest (rows
+    # written under one scheme are incompatible with the other).
+    knn_residual: float = 0.0
+    # windowed fingerprint: when >0 the fingerprint is a bag-of-features
+    # over the last knn_window tokens (mean of _R rows, then the
+    # residual/projection above) instead of the topic_decay EMA.  The
+    # EMA's effective window is ~1/(1-decay) ~140 tokens, so a 15-token
+    # question is <15% of the sketch - measured: fingerprints match on
+    # FORMAT ('...? A:' positions), not content.  A W=16 window puts
+    # the question's content words at ~1/W of the feature mass each:
+    # 'roman god of fire' actually ranks evidence rows containing the
+    # same words.  0 = EMA (prior semantics); set BEFORE ingest (rows
+    # written under one scheme are incompatible with the other).
+    knn_window: int = 0
+    # idf-weighted fingerprint bag (tf-idf retrieval semantics): each
+    # window token's feature is weighted by log(1 + N/(cnt+alpha)) so
+    # rare content words ('vulcan', 'colne') dominate the fingerprint
+    # instead of format/function tokens ('who was the', 'A:') which
+    # share ~identical weights with every other row.  Without this the
+    # top-k is same-FORMAT rows (other 'Q:...? A:' positions voting
+    # THEIR answers); with it, evidence rows sharing the rare entity
+    # outrank.  Derived from _unig - no extra state.  Applies to
+    # writes AND reads symmetrically; set BEFORE ingest.
+    knn_idf: bool = False
+    # span voting (retrieve-passage -> extract-answer): when >0, a
+    # matched bank row votes not just its successor but EVERY token
+    # within +/- knn_span stream positions of the match, weighted by
+    # sim^gamma * knn_span_decay^|offset|.  Successor-only voting can
+    # never answer 'who wrote X' when the evidence writes 'X, a novel
+    # by Y' - the answer is NEAR the matched context, not after it.
+    # The ring holds every position (capacity 1M), so the span gather
+    # is a pure device index_select - capture safe.  0 = off (prior
+    # successor-only semantics).
+    knn_span: int = 0
+    knn_span_decay: float = 0.75   # per-position distance decay
 
     # triton fused kernels (CUDA-primary only): single-launch deep-vote
     # eval + fused V-tail logit assembly.  Eager torch fallbacks cover

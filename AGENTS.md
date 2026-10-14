@@ -9,7 +9,8 @@ unless the user explicitly overrides them for a specific task.
 - **Every new custom model version MUST be derived from the immediately
   preceding version**, carrying forward all prior keys/architecture as the
   baseline, then adding or replacing only what's new. Current chain:
-  `forgelm_v2` (Jamba base) → `forgelm_v12_jamba` (R37 keys).
+  `forgelm_v2` (Jamba base) → `forgelm_v12_jamba` (R37 keys) →
+  `forgelm_v13_gdn2` (R60: Gated DeltaNet-2 side-paths, KDA-superset).
 - **Port-first, train-second**: when introducing a new architecture key or
   attention variant, write the lossless checkpoint-conversion path
   (`XxxKey` class, identity/zero-init warm start, bit-exact load test)
@@ -163,7 +164,17 @@ Production code: `forge/` (was `research/`, migrated commit f1a7542)
 - `forge/engine/forge_engine.py` — ForgeEngine (inference engine; core init +
   8 mixins: engine_checkpoints, engine_activation, engine_generation,
   engine_diagnostics, engine_merging, engine_lora, engine_lifecycle,
-  engine_sessions; shared helpers in engine_common.py)
+  engine_sessions; shared helpers in engine_common.py).
+  R60-4: `engine_generation._maybe_compact_past_kv` is the live bridge
+  between the registered `kv_cache` strategy (beacon/anchor/metakv) and
+  the per-request `past_kv` — it compacts only `(k, v)` tuple entries
+  (dict SSM/conv state passes through), throttled to `compact_over`
+  watermark crossings + every 32 steps + once forced after prefill.
+  IMPORTANT invariant: any T>1 forward mid-sequence (chunked prefill,
+  spec verify) must see the committed conv/SSM left context —
+  `DoubleGatedConvLayer`/`MambaLayer`/`Mamba3Block` now read live
+  state/`past["conv_state"]` as the continuation prefix; do NOT add
+  T>1 decode-time paths that bypass this.
 - `forge/aux_models.py` — generic non-LLM inference runner
   (`load_aux_model(manifest, ckpt)`): safetensors + manifest-declared
   `mlp`/`module` archs, VRAM-aware CUDA/CPU pick, `layer{i}` key remap.
@@ -171,6 +182,30 @@ Production code: `forge/` (was `research/`, migrated commit f1a7542)
   numpy arrays (AdamW + cosine, input-norm folded into layer0 so exported
   nets take raw features), `export_aux_checkpoint` writes `layer{i}.*`
   safetensors via `save_checkpoint`. Used by Oposition's `neural/train.py`.
+- `forge/model/live.py` — LiveT live-training session wrapper
+  (`LiveConfig`, `LiveSession`, `livet_config`): journaled live learning
+  over ConfigurableResearchLLM. Live surfaces = GDN2 recurrent states
+  (per-sequence working memory, auto-update under use_cache) +
+  TitanMemory fast weights (persistent cross-sequence store, inner-loop
+  surprise-gated updates). Substrate (embed/attn/FFN/head/projections)
+  stays frozen — params are never written by ingest; only journaled
+  buffers move. `mark()`/`revert()`/`snapshot()`/`load()` give exact
+  undo; `eval_nll(use_live_state=)` measures without mutating.
+  Design doc: `docs/LIVET_DESIGN.md`; tests `tests/unit/test_livet.py`.
+  TitanMemory v2 (titan_memory_key.py): learned k/v/q/o projections +
+  buffer fast weights + momentum/forget inner loop; `update()` target
+  defaults to successor-token embedding (context→next-token store);
+  `LiveConfig.solver` selects gd/cg/solve (ridge-regularized dense
+  solve) inner loop. `session.attach_sparse(NGramMemory)` adds an
+  exact-suffix sidecar (forge/model/ngram_mem.py): per-order suffix-hash
+  successor counts -> gated logit lifts, journaled/reverted with the
+  live surface — measured +2 NLL verbatim recall over fuzzy keys alone;
+  hybrid (solve+ngram, all blocks) is the winning configuration.
+  `forge/model/ngram_mem.py` — NGramMemory exact-suffix sidecar
+  (the live-surface contract: update/lift/snapshot/restore/reset/gate);
+  R64 fixes: `.to(device)` on lift logits (CUDA inputs), +0.01 uniform
+  floor (novel successor in known suffix used to give -inf lift → inf
+  surprise → NaN fast weights; real-text-only bug).
 - `forge/model/flux/` — FluxLM (R52): sparse online associative-memory
   LM, NOT a transformer.  Package layout: `config.py` (FluxConfig),
   `helpers.py` (`_mix64`/`_s64`/`_scatter_sum`/teacher loader),
@@ -487,6 +522,86 @@ Production code: `forge/` (was `research/`, migrated commit f1a7542)
   `model._gen_bias`) is the recall↔gen runtime dial: scales both
   gcell and gsyn lift weights for the call, restored after; 0 =
   recall-only, >1 = lean generative.
+  R60b — `r_live` (default ON, `r_eta` knob): the no-SFT substitute
+  for `graft_teacher`/`distill_gen`.  Additive drift table
+  `_Rl [V,topic_dim]` — each learned token's row EMAs toward the
+  normalized PRE-x context sketch at rate `r_eta*s` (surprise-scaled
+  co-occurrence embedding).  `_R` stays the frozen seeded bipolar
+  matrix → `_c`/`_c2`/knn context-side EMAs keep bit-exact inverse
+  undo; vocab-facing reads use materialized `_Reff = _R + _Rl` (gsyn
+  logits + delta-rule targets; `teach` binds target rows too).
+  Undo: 'rL'/'rB'/'bc'["rl"] first-touch restores — 'rB'/'rL' are
+  revert boundaries (session-scoped, 'bc' class).  Snapshot key
+  'Rl'; `_Reff` re-derives on load.  Write sites: `_learn_token`,
+  `_bookkeep_fused` (inverts topic EMA for pre-x `_c`),
+  `_ingest_bulk` (`_rl_bulk`, deterministic `_group_totals`), teach.
+  `_R` dtype stays int8 — `_Rl` is the only live float table.
+  R60c — recall→gen (`gen_recall` knob + `consolidate_gen()`): the
+  recall side feeds the gen side.  Live: warm contexts (pre-write
+  order-cell tot > thin_tot) write gcell/gsyn/_Rl at
+  `max(surprise, gen_recall)` — recall-proven successors transfer
+  even when unsurprising; wired in `_learn_token` (probe hoisted
+  pre-write), `_bookkeep_fused` (`boff_thin` flag), `_ingest_bulk`
+  (tots_f/found_f).  Batch: `consolidate_gen(mass, top_m, min_tot,
+  tag)` replays on-ring positions (closed-form `_cprev_seq` seeded at
+  zero inside the episode), gathers each context's cross-order
+  successor distribution, writes top-m share-weighted followers into
+  gcell + gsyn (explicit `v=` targets in `_gsyn_chunk`) + `_Rl`.
+  One ws/we block; gsyn "gs" snapshot + "rB" session + per-cell "G"
+  — revert_tag restores bit-exactly.  `_ringg` host fallback added
+  for CPU `_gcell_feats_bulk`.  ~20s to basic topic competence
+  measured (21.7K-token corpus, CPU).
+  R60d — `gsyn_deep` (default OFF, 9 knobs): the nonlinear memory
+  channel — a 2-layer MLP f_theta(k)→expected _Reff row trained
+  ONLINE by surprise-scaled gradient steps (TTT-MLP/Titans: the
+  memory is a learned function, not a table).  ~115K params +
+  momentum buffers, <0.5MB; explicit no-autograd gradients, global
+  clip (`gsyn_deep_clip`), heavy-ball (`gsyn_deep_momentum`),
+  decay forget-gate (`gsyn_deep_decay`).  SEPARATE from linear
+  gsyn (own lift w/thin/temp/journal/explain/report/probe) so
+  ablations isolate it; `_gsd_chunk` = LaCT-style batched grad
+  steps in bulk/consolidate.  Undo = whole-theta snapshots
+  ("gd" entries + blk["gsd"] in "bc" blocks; `_gsd_session` flush
+  per ingest span).  NOTE: "gd" had to be added to revert_since's
+  boundary set — without it a rewind overshot into the previous
+  span's session snapshot (latent bug class for any future
+  span-scoped op).  `probe_gsyn_deep()` exposes k/h/o stats +
+  param norms + theta drift.  Proof: XOR-corner task — antipodal
+  keys → same target — linear gsyn 2/4 (chance, f(-u)=-f(u) is
+  structural) vs gsyn_deep 4/4.
+  R60e — `dnet` (default OFF, 8 knobs): the iterated-memory channel —
+  a stack of gated delta-rule layers, i.e. a linear-attention
+  "transformer" that learns online with no training loop, no KV
+  cache, no optimizer state (~0.34MB total for 2 layers).  Each
+  layer's S_l is the same delta-rule memory as gsyn; the STACK
+  supplies what single-step channels structurally lack: iterated
+  content routing (layer-l input = relu(o_{l-1}) — one layer's
+  readout addresses the next layer's memory; relu breaks the
+  odd-symmetry linear ceiling).  Content-gated writes
+  `sigmoid(w_b·u)·beta·s` (GDN-style), scalar decay.  Same journal/
+  revert/explain/probe/report parity as gsyn_deep ("dn" op +
+  blk["dnet"], in the boundary set).  Depth proof: antipodal task
+  1-layer=2/4 vs 2-layer=3/4.  Bulk writes are exact-sequential
+  (layer l needs l-1's CURRENT state — the WY chunk shortcut
+  doesn't lift; optimization path noted).
+  R60f — **fuzzy channels are now hedge members + candidate-
+  restricted**: `gcell`/`gsyn`/`gsd`/`dnet` sit at the tail of
+  `self.channels` (flag-gated).  Real probs in `_channel_prob`
+  (eager; `_pfq` memo per position) and `real_r` under
+  `bulk_channel_rewards` (bulk, post-block-state approximation);
+  abstain-neutral on the fused device step (`_fidx` filled with
+  uni_x).  All four lifts multiply by w_rel = C·w (relative to
+  uniform share — sinks when the channel loses; replaces the
+  fixed-weight bypass that made them unpunishable).  Knobs
+  `lift_topk=64`/`lift_topm=8` (0=off): fuzzy lifts vote only on
+  top-k of the pre-lift row + own top-m proposals —
+  `_sparse_lift_vec_dev` now returns (lift, flift); `_apply_sparse_
+  lift_dev` computes the support mask once per predict.  Load:
+  `wR` width mismatch replicates the global row.  Measured: grid
+  `@2K docs seen_qa` 0.28 → 0.84 (hedge alone carried it;
+  restriction = structural guarantee), `backoff_order_sharp=1`
+  → 0.98.  Eval harness: `.devin/eval_flux_quality.py` +
+  `eval_flux_grid.py`.
   R57 — gcell fuzzy read (SDM semantics, `gcell_read_radius`, default
   1): predict-time Hamming-ball probe over learned codes — similar
   contexts pool evidence, so generalization is a *read* of existing
@@ -577,6 +692,73 @@ Production code: `forge/` (was `research/`, migrated commit f1a7542)
   the v1 in-memory path (keeps journal).  Migration:
   `.devin/migrate_v2.py`; round-trip test `.devin/v2_roundtrip.py`
   (predict/A/S/epi/gc bit-parity cuda+cpu).
+  R68 — live generalizer "gen head" (`gen_live`, default OFF;
+  `gen_live_topm`, `gen_live_min_tot`): consolidate_gen made
+  incremental.  Every learned position whose order cells hold
+  evidence (post-write tot > min_tot) transfers the cells' recalled
+  successor DISTRIBUTION — top-M followers, share-weighted — into
+  the gen channels at strength `gen_live*conf` with
+  `conf = max_k tot/(tot+backoff_kappa)`: gcell per-follower cell
+  writes, gsyn/gsd/dnet blended soft targets
+  `sum(share*_Reff[t])`, and `_Rl` per-follower row EMAs.  The head
+  owns NO weights — it moves mass between existing stores
+  (`_genlive_write` in statemixin.py).  Unlike `gen_recall` (floors
+  the realized token's own write), it covers followers that were
+  not observed at the position, and unlike `gen_recall` it keeps
+  writing as cells converge (realized writes stall at s→0, conf
+  stays ~1).  All three learn paths read POST-write cells: eager
+  `_learn_token` reads `_tables`/`_totals` after the order write;
+  `_bookkeep_fused` re-probes post-step (`_fused_seq` batches one
+  post-row probe over all positions — consolidate_gen-class
+  approximation); `_ingest_bulk` reuses `slot2`/`found2` (the
+  reward fix-up's post-add_multi re-probe — pre-write probes made
+  first-pass bulk ingests transfer nothing; that was the GPU test
+  bug).  `_predict_only` skips it; thin contexts self-gate.  All
+  writes ride the existing journal ops — `revert_since` on stream
+  ingests restores `_gc`/`_gct`/`_Rl` bit-exact and `_S` to
+  fp16-factor precision.  Self-play: `--flux-gen-live` (implies
+  `--flux-gen-channels`), `--flux-gen-consolidate` batch complement.
+  Probe `.tmp/exp_gen_live.py`: mass +14-38% in gen stores, NLL
+  neutral on paraphrase frames (transfers stay distribution-
+  consistent — benefit is continuous consolidation, not noisy
+  writes).  Tests `test_gen_live_*` (6).
+- `forge/model/strata/` — STRATA (R60): FluxLM's successor as a
+  three-artifact format — WEIGHTS `.strata` (labeled CellBlocks of
+  packed 48B cells: tag32+meta+8×u32 followers+raw64, log-quantized
+  counts, 2-choice cuckoo hash, active/sealed/cold lifecycle,
+  per-block undo arenas, tag-scoped revert, memmap container IO),
+  PARAMS `.iq` (ParamSet — mixer/dense weights; seeded tensors stored
+  as {seed,shape} and regenerated), KNOBS `.cond` (KnobSet — scalar
+  gates/lifts/sampling with named overlays).  M0 = substrate;
+  **M1 `StrataLM` (model.py) DONE**: suffix-hash order channels
+  o3..o64 + uni/backoff/recency/fatigue, hedge geometric mixture,
+  surprise-gated writes, ingest/teach/observe/learn, forward→
+  (logits,None,None), generate+knobs, explain/audit/revert/snapshot —
+  CPU-eager reference, ~86 tok/s learn.  Design =
+  `docs/STRATA_M1_DESIGN.md`; further milestones (dense gsyn channel
+  should reuse FLUX's r_live live-feature pattern — params+knobs, no
+  distill).  Bench: `.tmp/bench_strata_step.py` — eager is
+  launch-bound dead (~28 tok/s); graph replay 585µs for 10
+  probes+dense; `pk_of` per-call salt alloc breaks capture; add() not
+  graphable → two-tier thin-write + deferred repair.  Tests:
+  `tests/unit/test_strata.py` (22) + `test_strata_m1.py` (25).
+- `forge/scrape_feed.py` + `scripts/scrape_feed.py` — R61: continuous
+  online scraper -> normalized doc feed.  Sources (`wiki-random` /
+  `wiki-all` resumable allpages cursor / `wiki-recent` / `wiki-search` /
+  `arxiv` / `wiktionary` / `urls` / `ddg`) -> Processor (persistent
+  sha1 dedupe `seen.txt`, min/max chars, injected filter_fn — CLI wires
+  `download_wikipedia.should_skip` + train_flux `--topic` scorer; wiki
+  keeps `raw` wikitext for the filter since should_skip keys on
+  {{disambig}} markup) -> ShardWriter (`feed_NNNNNN.jsonl.wip` ->
+  `.ready` rotation; the filesystem queue is the bus) -> sinks:
+  `--to shards` (corpus only), `--to api` (serialized POST
+  /engine/learn per shard, polls /engine/stats `info.learn` for
+  completion — the route is one-at-a-time), `--to model` (in-process
+  FluxLM ingest + snapshot, tag "<tag>:<source>" for revert).  Gotcha:
+  prop=extracts caps whole-article text at 1 page/request
+  (exlimit>1 needs exintro) — live full-text uses prop=revisions
+  wikitext (~20 pages/req) + local `wiki_to_text` cleaner.  All fetches
+  injectable; tests `tests/unit/test_scrape_feed.py` (16, offline).
 - `forge/self_play/flux_goals.py` — R53: source-grounded goal layer for
   flux-mode self-play.  `FluxTools` = budgeted cached executor for the
   model-facing tools (`wiki`/`dict`/`paper`/`web`, `parse_tool_call`
@@ -607,10 +789,11 @@ Production code: `forge/` (was `research/`, migrated commit f1a7542)
   *.wikipedia.org/wiktionary.org/etc; also MediaWiki REST paths need
   `_` for spaces (`+` 404s).  Tests: `tests/unit/test_flux_goals.py`.
 - `forge/engine/decoding.py` — Decoding strategies (standard, speculative
-  family, `dola` self-contrastive R50-2, `uno`; DRY n-gram penalty R50-1
-  in the shared `_sample_from_logits` chain + all `engine_generation`
-  paths, `dry_multiplier`/`dry_base`/`dry_allowed_length`/
-  `dry_penalty_last_n` params, 0=off)
+  family, `dola` self-contrastive R50-2, `uno`, `specbound` adaptive
+  early-exit self-speculation R60-5 — greedy bit-identical to standard;
+  DRY n-gram penalty R50-1 in the shared `_sample_from_logits` chain +
+  all `engine_generation` paths, `dry_multiplier`/`dry_base`/
+  `dry_allowed_length`/`dry_penalty_last_n` params, 0=off)
 - `forge/engine/gated.py` — ForgeGate three-probe gated generation
   (route/doom/convergence); `ForgeEngine.load_gate_probes()` +
   `generate_gated()`; probe bundle `research/checkpoints/gate_probes.pt`
@@ -697,10 +880,32 @@ Production code: `forge/` (was `research/`, migrated commit f1a7542)
   raw at equal accuracy — calibrated-style, not production-calibrated;
   validate on non-templated data before confidence gating.
 - `forge/keys/` — KeyStack architecture keys (25 canonical + `kda` R49-2
-  side-path: `use_kda` config flag, gate=0 bit-exact, KDAKey BI port).
+  side-path: `use_kda` config flag, gate=0 bit-exact, KDAKey BI port;
+  + `gdn2` R60-1: `use_gdn2` flag, Gated DeltaNet-2 erase/write gates,
+  collapses to KDA at warm start — mutually exclusive with `use_kda`).
   `forge/keys/safety.py` is the production `safe_apply`/rollback harness
   (used by pit/lerope/attn_residual/mhc keys `safe=True` paths).
-- `forge/quant/` — Quantization implementations
+- `forge/quant/` — Quantization implementations. `inference_quant.py`
+  `quantize_model_w4()` packs nn.Linear weights into torchao
+  `Int4TilePackedTo4dTensor` (W4A16, group=128, tinygemm kernel —
+  `aten::_convert_weight_to_int4pack` is CUDA-only, so each linear is
+  moved to GPU, quantized from bf16, then released; peak VRAM = packed
+  total + one layer). Wired into `from_checkpoint` via
+  `load_quantize="int4"` (engine_checkpoints `_load_quantized`): loads
+  bf16→meta→assign on CPU, per-module CUDA quantize, skips the
+  post-load auto-quant pass AND compile/graph features
+  (`_auto_activate_optimal` hard guards — torchao tensor subclasses
+  hang inductor, capture is fragile; guards also override caller flags).
+  Compatible features auto-enabled for packed pure-attention models:
+  learned prefix cache, adaptive+suffix spec decode, FASER, lookahead
+  gate, POD attention, hybrid prefill, hot prefix. Excluded: lossy
+  KV/attention pruners, RoPE replacers, P-EAGLE (needs trained draft),
+  arch-specific (quamba2/replay_ssm/MoE/triton_conv/fa4), extra weight
+  quant. `from_checkpoint` splits ActivationConfig-named kwargs into
+  `_user_activation_overrides` — forge_server flags:
+  `--load-quantize int4`, `--kv-tokens N` (caps KV prealloc).
+  Validated on Hermes-3-8B: ~11.5s load, ~7.6GB VRAM incl. KV,
+  ~34 tok/s, 28k-token KV budget. Tests: `tests/unit/test_llama31_w4.py`.
 - `forge/decoding/` — Decoding implementations
 - `forge/training/` — Training runners + optimizers; `training/data/`
   holds the dataset pipeline modules (`efficient_pipeline`,
@@ -712,7 +917,9 @@ Production code: `forge/` (was `research/`, migrated commit f1a7542)
   legacy `<|startofsegment|>`/`<|tool_call_start|>` markers are gone —
   they don't exist in the V2 tokenizer, so SFT was training a format
   inference never sees (fixed 2026-09-21; see BUG_LOG).
-- `forge/evolution/` — Evolutionary optimizer (ForgeEvolve); CLI: `python -m forge.evolution --domain <name> --steps <N>` (use `--list-domains` to see all domains). Domain specs + run/focus profiles live in `forge/evolution/configs/` (canonical; the legacy `tests/evolution/configs/` copy was removed — the tests/evolution harness scripts now point at the canonical dir).
+- `forge/evolution/` — Evolutionary optimizer (ForgeEvolve); CLI: `python -m forge.evolution --domain <name> --steps <N>` (use `--list-domains` to see all domains). Domain specs + run/focus profiles live in `forge/evolution/configs/` (canonical; the legacy `tests/evolution/configs/` copy was removed — the tests/evolution harness scripts now point at the canonical dir). `--fixate` pins a run to one domain: no cross-domain transfer, no refinement spawning, plateaus re-diversify in place (`_fixate_rediversify`); `run_evolve.py --fixate` additionally kills auto-discover/revisit/parallel waves. `forge/evolution/domains/livet_domains.py` — `MicroLiveLM` (R64): the micro live-format search domain; REAL evaluator (builds ConfigurableResearchLLM+LiveSession on CUDA, measures fact-recall live_gain, bs=1 decode tps, ingest tps, params, revert parity — not synthetic). Structural grid via `discrete_choices` (240 cells) + 9 continuous dims. Focus topic: `--focus micro_format`. Results: conv+titan+ngram substrate dominates the micro frontier (d64-class ~0.2-0.5M params, gain ~5, ~250tps); see scratchpad R64. `forge/evolution/domains/flux_domains.py` — `FluxTune` (R65): FluxLM self-tuning domain; builds real FluxLM (cuda_primary, graphs+compile_dev off — concurrent captures/poisoned RNG state crash threaded evals) and measures held-out NLL, 1-hop + 2-hop chain recall, pred/ingest/gen tps, memory_report+VRAM, argmax diversity; score = weighted log2 ratios vs production defaults (baseline anchors at 25). `forge/evolution/domains/meta_domains.py` — `EvolverTune` (R65): meta-evolution — candidates are ForgeEvolveConfig knobs scored by real inner ForgeEvolve runs on SyntheticDomain (progress vs random-floor + eval efficiency); fixated+warm_start=False inner runs isolate proposal quality. Both set `eval_thread_safe=False` (engine opt-out of `_threaded_eval` side-stream pools — added in engine.py `_gpu_batch_eval`). Categories/focus topics: `fluxlm`, `evolver`. DBs: `forge_evolve_flux.db`, `forge_evolve_meta.db`, `forge_evolve_meta_inner.db` (scratch). R66 proposal frontier (engine.py): proposals are submitted to a pending frontier every gen and popped for eval later — submission is decoupled from eval throughput (`_submitted` counter in logs; measured ~2.1K unique proposals/s on synthetic). `ForgeEvolveConfig.propose_mult` (proposals/gen = n_generators×propose_mult, multi-sample grouped-einsum forward in `BatchedGenerator`), `frontier_cap` (evict lowest surrogate-scored pending), `quick_ratio` (multi-fidelity: pop quick_ratio×, domain `quick_eval` ranks, top fraction promotes to full eval). Domains may set `cpu_eval_ok=False` to opt out of the `parallel_eval` CPU pool (FluxTune/EvolverTune do — GPU-bound/nested-CUDA). Dedup is one D2H transfer + vectorized round for all candidates (was per-candidate `.cpu()`, ~100x). FluxTune quick_eval: ~1/3 corpus, 200 held positions, no decode probe, quality+mem terms only (tps is wall-clock noise at that fidelity), ~3x cheaper, deterministic prod=25.0 anchor. FluxTune hop2 probe is real chain recall (`#V>` -> V_next, the hop-1 value becomes the hop-2 key — measures association chaining, baseline ~2.35 nats). R66b literature fixes (AlphaEvolve/FunSearch/pyribs/MEMES parity): dedup keys on the DECODED config (discrete-bin domains were re-evaluating identical configs under different param vectors); per-generator archive-conditioned contexts (60% UCB elite / 15% random cell / 15% two-elite blend / 10% best — was one shared elite for all generators); rank-shaped scores for trainer+evolve (OpenAI-ES centered-rank fitness shaping — -1e9 failure spikes no longer poison fitness_ema); explore emitters (first 20% of generators credited on rank-shaped novelty, MEMES-style); crossover emitter (`crossover_frac`, blends two elite encodings + jitter as direct proposals, generator_idx=-2); islands (`n_islands` deme archives — generator g feeds island g%K, weakest half import global elites every `island_migrate_gens`).
+- `forge/evolution/domains/mech_domains.py` — `MechSearch` (R67): mechanism discovery for the FluxLM/micro-format dev plan. 22-dim candidate space spanning the *mechanism surface*: attn_type (gqa/gta/gla), delta path (none/kda/gdn2), titan fast-weight rank compression (0/d2/d4), solver, ngram sidecar+orders, live_projections (bounded substrate drift), write_threshold (surprise admission gating), forget/surprise_cap/chunk — real eval builds ConfigurableResearchLLM+LiveSession on CUDA (live_gain, decode/ingest tps, params, revert parity; same scoreboard as MicroLiveLM). `quick_eval` tier + `gpu_pool_ok` (spawn workers; small eager models). Smoke: gla+live_proj+gate 49.36 ≥ R64 winner 49.33. Category `mech`.
+- `forge/evolution/engine.py` GPU eval pool (R66c): `gpu_eval_workers>1` spawns N `spawn`-context worker processes (`_gpu_worker_init`/`_gpu_eval`), each owning its own CUDA context + domain instance — evals share the device but never a context/graph/RNG. Opt-in ONLY for domains declaring `gpu_pool_ok=True` + `gpu_worker_kwargs()` (currently just `FluxTune`; quick tier routes through `quick_eval` inside workers). Worker exceptions → -1e9 fail-score; pool failure → serial `_gpu_batch_eval` fallback. VRAM rule of thumb on the 12GB 5070: workers x worst-case candidate VRAM (prod mem_preset ≈ 4.2GB) must fit — `gpu_eval_workers=2` measured ~1.8x eval throughput; 3 is risky. Cleaned up in `run()` finally alongside `cpu_pool`.
 - `forge/evolution/program_vm.py` + `domains/math_prog_domain.py` — `math_prog` / `MathProgDomain`: batched program-synthesis domain. Candidates ARE algorithms — fixed-length register-machine programs over a closed opcode table (15 total ops, protected div/mod/pow, no eval/IO/loops → nothing to scan; ISA is the sandbox). Decoded from generator `[0,1]^45` vectors (12 steps × op/a-addr/b-addr + 8 consts ±64 + out-sel). `run_programs` executes [B,T,R] register buffers fully vectorized on CUDA (~2700 programs/s; bench: `scripts/bench_math_prog.py`). Tasks randomized per eval: FUNC (match hidden f, held-out graded), GOAL ("A must equal T" — compose bounded consts; pinned via `goal_target`), GOAL_IO (constraint pairs incl. pinned `goal_inputs`+`goal_target`, oracle shifts `h(u)+(T-h(u0))` so held-out still forces real math), FIT (kind 3: approximate a pinned `target_fn` — e.g. tanh/sigmoid/log2/sin/rsqrt — graded by `fit_score`=-log10(max_err) + continuous proximity kernel; op whitelist via `ProgramSpec.op_ids`/`--ops cheap|cheapdiv` restricts the ISA to deployable ops). Anti-gaming: `heldout_exact`, `uses_inputs` (dependency-cone only — dead-end reads don't count), `const_cheat`, `degenerate` metrics → RewardGuard in `configs/domains/math_prog.json`. Batched path: `MathProgDomain.batch_evaluate` is auto-delegated by `BatchedEvaluator` (any domain defining `batch_evaluate` wins). Driver: `scripts/evolve_math_prog.py --target 794 [--inputs 12,7] | --fit tanh --ops cheapdiv`. Tests: `tests/unit/test_math_prog.py` (26).
 - `forge/self_play/` — Self-play + discovery (`infinite_loop.py` is the RSI
   loop; `live_status.py` writes live telemetry — status.json, heartbeat.json
@@ -815,6 +1022,9 @@ Config presets in `forge/config.py`:
 - `forgelm_v12_jamba` — R37 research preset derived from `forgelm_v2`
   (parent declared; Mamba-3, Kronecker embed, PIT, OutRo, ForgeHybrid — all
   zero/identity-init for lossless warm start).
+- `forgelm_v13_gdn2` — R60 preset derived from `forgelm_v12_jamba`;
+  adds `use_gdn2` (Gated DeltaNet-2 side-paths alongside each block,
+  gate=0 → bit-exact warm start; supersedes KDA — mutually exclusive).
 - `forgelm_tiny` — 4-layer tiny conv+attention model for fast tests
   (no checkpoint, config-only).
 - `gen_model_tiny` — tiny generator config for evolution experiments.
@@ -825,6 +1035,25 @@ Config presets in `forge/config.py`:
   be wrong). GQA 32Q/8KV, QK-norm, no QKV bias, RoPE 5M, 256K ctx, tied
   embed. Auto-detected by `_detect_config_from_header` on
   (vocab=151936, d_model=2560, n_layers=36).
+- `llama31_8b` — HF-compat preset for the Llama-3.1-8B family (e.g.
+  Hermes-3-Llama-3.1-8B lorablated/abliterated tunes; ChatML format).
+  GQA 32Q/8KV, no attn/MLP bias, SwiGLU 14336, RMSNorm eps 1e-5, RoPE
+  base 500K + llama3 frequency scaling (factor 8 over orig 8K ctx,
+  implemented in `forge/model/layers.py` + mirrored in
+  `loader._reset_non_persistent_buffers`), untied embed/head, vocab
+  128256, max_seq_len capped at 32768 for the 12GB card (native 131072).
+  EOS set includes 128000/128001/128040 (im_end). Auto-detected by
+  `_detect_config_from_header` (embed 128256x4096, q 4096x4096, kv
+  1024x4096). The server renders plain ChatML for `llama*` configs via
+  `render_messages_for_config` (no Jamba thinking prefix/`<think>`
+  block — see `qwen_adapter.py`).
+- `llama32_3b` — HF-compat preset for the Llama-3.2-3B family (e.g.
+  NousResearch/Hermes-3-Llama-3.2-3B; same ChatML + tool-call format as
+  the 8B). GQA 24Q/8KV head_dim=128, SwiGLU 8192, RoPE 500K + llama3
+  scaling factor 32 (3.2 scales 32x over the 8K base, vs 3.1's 8x),
+  TIED embed/lm_head (unlike 8B/70B), vocab 128256, ctx capped 32768.
+  ~3x faster decode than the 8B; first consumer is ForgeChat's
+  hermes3_3b catalog entry as the fast card-conversion/chat model.
 
 All legacy presets (`forgelm_v2_light`, `forgelm_v2_pro`, `forgelm_v12`,
 `forgelm_v10_1.2b`, `forgelm_v11_3b_vl`, `lfm25_tiny`, `lfm25_1.2b`, V3–V9)
