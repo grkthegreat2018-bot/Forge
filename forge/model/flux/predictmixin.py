@@ -676,11 +676,17 @@ class _PredictMixin:
             # content, not merely the format.
             e = end.reshape(-1)[-1]
             Dt = max(int(c.knn_drop_qa), 6)
-            s0 = self._ringg.index_select(
-                0, (e - 1).clamp(min=0).reshape(1)
-                % c.ring_capacity)[0].long()
-            s1 = self._ringg.index_select(
-                0, (e % c.ring_capacity).reshape(1))[0].long()
+            if getattr(self, "_qa_scaffold", None) is not None:
+                # canonical scaffold from attach_vocab - adoption no
+                # longer depends on the prompt ending in " A:", so
+                # paraphrased questions still read trained answers
+                s0, s1 = self._qa_scaffold
+            else:
+                s0 = self._ringg.index_select(
+                    0, (e - 1).clamp(min=0).reshape(1)
+                    % c.ring_capacity)[0].long()
+                s1 = self._ringg.index_select(
+                    0, (e % c.ring_capacity).reshape(1))[0].long()
             wi = pos[:, None] + torch.arange(
                 1, Dt + 1, device=self._dev)[None, :]
             wvld = (pos >= 0)[:, None] & (wi <= e - 2) & (wi >= 0)
@@ -2985,6 +2991,23 @@ class _PredictMixin:
         an external tokenizer reference.  Cheap; safe to call post-load."""
         self._vocab_str = [str(s) for s in itos]
         self._cls_masks = None
+        # canonical " A:" answer-scaffold pair for twin-question
+        # answer adoption: lets paraphrased prompts that do not end
+        # in the trained scaffold still read trained answers
+        self._qa_scaffold = None
+        try:
+            i0 = self._vocab_str.index(" A")
+            i1 = self._vocab_str.index(":")
+            if i0 < self.vocab_size and i1 < self.vocab_size:
+                # device scalars built here (eager) - as_tensor in the
+                # twin block would H2D inside graph capture
+                self._qa_scaffold = (
+                    torch.as_tensor(i0, dtype=torch.int64,
+                                    device=self._dev),
+                    torch.as_tensor(i1, dtype=torch.int64,
+                                    device=self._dev))
+        except ValueError:
+            pass
 
     def _atype_mask(self, kind: str):
         """V-bool device mask for an answer class, lazily built from
