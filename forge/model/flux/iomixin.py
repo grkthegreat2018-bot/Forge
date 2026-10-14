@@ -624,6 +624,8 @@ class _IOMixin:
                 model._seen_g[t] = p
             model._pos_g.fill_(model._count)
             model._ep_g.fill_(model._ep_start)
+            model._prompt_start = model._count
+            model._prompt_g.fill_(model._count)
             model._tot_g.fill_(float(model._total))
             model._wg = torch.from_numpy(
                 model._w.astype(np.float64)).to(model._dev)

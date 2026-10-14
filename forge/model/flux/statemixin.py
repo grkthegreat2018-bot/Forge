@@ -376,11 +376,15 @@ class _StateMixin:
         return torch.log1p(
             tot.float().clamp(min=1.0) / (u.float() + c.uni_alpha))
 
-    def _knn_ctx_feat(self, end) -> torch.Tensor:
+    def _knn_ctx_feat(self, end, episode: bool = False
+                      ) -> torch.Tensor:
         """Raw (pre-projection) context feature for fingerprinting and
         the topic_full association readout.  knn_window>0: (idf-)bag
         of features over the last W ring tokens, residualized against
-        the mean-prose direction.  0: the _c EMA (legacy)."""
+        the mean-prose direction.  episode=True: bag over the whole
+        current episode (prompt segment) instead - a fixed W window at
+        query time reaches past the question into the previous
+        generation's output.  0: the _c EMA (legacy)."""
         c = self.config
         W = int(c.knn_window)
         if W <= 0:
@@ -388,8 +392,18 @@ class _StateMixin:
         dev = self._dev
         e = (end if torch.is_tensor(end)
              else torch.as_tensor(end, device=dev))
-        idx = (e.reshape(-1)[-1] - W + 1
-               + torch.arange(W, device=dev)).clamp(min=0)
+        if episode and getattr(self, "_prompt_g", None) is not None:
+            e0 = self._prompt_g.reshape(-1)[-1]
+        elif episode:
+            e0 = torch.as_tensor(self._prompt_start, device=dev)
+        else:
+            e0 = (e.reshape(-1)[-1] - W + 1).clamp(min=0)
+        n = (e.reshape(-1)[-1] - e0 + 1).clamp(min=1, max=W)
+        eiv = e.reshape(-1)[-1]
+        idx = eiv - n + 1 + torch.arange(W, device=dev)
+        valid = idx <= eiv
+        idx = torch.where(valid, idx.clamp(min=0),
+                          idx.new_zeros(idx.shape))
         if getattr(self, "_ringg", None) is not None:
             toks = self._ringg.index_select(
                 0, idx % c.ring_capacity).long()
@@ -400,24 +414,30 @@ class _StateMixin:
                 dtype=torch.long, device=dev)
         toks = toks.clamp(0, self.vocab_size - 1)
         rows = self._R.index_select(0, toks).float()
+        vf = valid.float()
         if c.knn_idf:
-            w = self._knn_tok_w(toks)
+            w = self._knn_tok_w(toks) * vf
+            if c.knn_idf_pow != 1.0:
+                w = w ** float(c.knn_idf_pow)
             x = (rows * w[:, None]).sum(0) / w.sum().clamp(min=1e-8)
         else:
-            x = rows.mean(0)
+            x = (rows * vf[:, None]).sum(0) / vf.sum().clamp(min=1e-8)
         beta = c.knn_residual
         if beta > 0:
             mu = self._fp_mu()
             x = x - beta * (x @ mu)[..., None] * mu
         return x
 
-    def _knn_fp_ctx(self, end) -> torch.Tensor:
+    def _knn_fp_ctx(self, end, episode: bool = False
+                    ) -> torch.Tensor:
         """Fingerprint of the context ending at stream index ``end`` -
-        the _knn_ctx_feat feature projected to csem_dim."""
+        the _knn_ctx_feat feature projected to csem_dim.  episode=True
+        bags the current-episode tokens (the query prompt) rather than
+        a fixed W window."""
         c = self.config
         if int(c.knn_window) <= 0:
             return self._knn_fp_of(self._c)
-        x = self._knn_ctx_feat(end)
+        x = self._knn_ctx_feat(end, episode=episode)
         fp = x @ self._Pcsem
         return fp / (fp.norm(dim=-1, keepdim=True) + 1e-8)
 

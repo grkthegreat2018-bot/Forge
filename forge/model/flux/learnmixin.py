@@ -2364,6 +2364,8 @@ class _LearnMixin:
                     if c.knn_idf:
                         w_ = self._knn_tok_w(wt.reshape(-1)).reshape(
                             m_c, W)
+                        if c.knn_idf_pow != 1.0:
+                            w_ = w_ ** float(c.knn_idf_pow)
                         xw = (rw_ * w_[..., None]).sum(1) \
                             / w_.sum(1, keepdim=True).clamp(min=1e-8)
                     else:
@@ -3408,6 +3410,9 @@ class _LearnMixin:
         """Stream-train on token ids (instant, hot). Returns #tokens."""
         if isinstance(ids, torch.Tensor):
             ids = ids.reshape(-1).tolist()
+        self._prompt_start = self._count
+        if self._gpu:
+            self._prompt_g.fill_(self._count)
         prev_tag, prev_learn = self.tag, self.learning
         if tag is not None:
             self.tag = tag

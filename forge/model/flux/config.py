@@ -678,6 +678,14 @@ class FluxConfig:
     # outrank.  Derived from _unig - no extra state.  Applies to
     # writes AND reads symmetrically; set BEFORE ingest.
     knn_idf: bool = False
+    # exponent on the idf weight inside the fingerprint bag: >1 sharpens
+    # content words vs format/function words (format overlap is what
+    # pulls QA-shape neighbours ahead of answer-bearing evidence)
+    knn_idf_pow: float = 1.0
+    # query-side episode fingerprint: at predict time the last-W window
+    # reaches past the question into the previous generation's output -
+    # bag only the current-episode (prompt) tokens instead
+    knn_episode: bool = False
     # span voting (retrieve-passage -> extract-answer): when >0, a
     # matched bank row votes not just its successor but EVERY token
     # within +/- knn_span stream positions of the match, weighted by
@@ -689,6 +697,115 @@ class FluxConfig:
     # successor-only semantics).
     knn_span: int = 0
     knn_span_decay: float = 0.75   # per-position distance decay
+    # idf-focus for span votes: matched positions cluster at passage
+    # headers, often >8 tokens from the answer mention - weight each
+    # span token by idf^knn_span_idf so the rare entity dominates the
+    # neighbourhood vote.  0 = uniform span (prior semantics).
+    knn_span_idf: float = 0.0
+    # coverage rerank: a match only matters for extraction when the
+    # question's content words actually appear near it (the sentence
+    # defining the answer contains both).  For each top-k match,
+    # cover_j = fraction of query content-token idf present in the
+    # +/-knn_cover window; span votes scale by (1 + knn_cover_w*cover).
+    # 0 = off.
+    knn_cover: int = 0
+    knn_cover_w: float = 4.0
+    # rerank pool size when knn_cover is on: pool this many rows by raw
+    # sim, rerank by coverage, keep top knn_k.  Answer-bearing evidence
+    # ranks ~200-400 by sim (format twins occupy the top), so the pool
+    # must be much wider than the final k.
+    knn_pool: int = 512
+    # drop QA-line rows from retrieval: positions inside a "Q:... A:"
+    # line are followed by the same answer-scaffold token pair that
+    # ends the current prompt - they retrieve other questions' answers
+    # (format twins), not evidence.  Evidence prose never contains the
+    # scaffold.  0 = off.
+    knn_drop_qa: int = 0
+    # subtract query tokens from span votes: a passage match's window
+    # contains BOTH the question's shared words and the answer - the
+    # answer is the high-idf token the question does NOT contain.
+    # Without this, span votes re-emit the question's own content.
+    knn_subq: bool = False
+    # decode-time answer-slot lift: add knn_lift * log p_knn to the
+    # logits at every generate() step.  For seen questions the
+    # retrieval finds the exact line and votes the same answer recall
+    # does; for held questions it injects the extracted entity that the
+    # hedge mixture (trained for prose fluency) starves at 0.001.
+    knn_lift: float = 0.0
+    # lift only the first N generated tokens - the answer slot.  Later
+    # positions continue through the mixture (order cells complete the
+    # name/phrase around the injected entity).
+    knn_lift_steps: int = 4
+    # lift only when the mixture is unconfident: softmax(argmax) below
+    # this threshold means recall has nothing hot - inject retrieval;
+    # above it (seen questions) the recalled answer already wins.
+    # 0 = always lift.
+    knn_lift_conf: float = 0.0
+    # lift only in the THIN regime (_dthin_g==0): a warm deep-order
+    # cell means this exact context was trained - recall already owns
+    # the answer slot and retrieval must not override it.  1=thin-only.
+    knn_lift_thin: int = 1
+    # seen-question gate: when any order >= knn_lift_deep cell EXISTS
+    # at the prompt end, the question's exact suffix was trained -
+    # recall owns the answer; retrieval lift stays off.  0 disables.
+    knn_lift_deep: int = 8
+    # answer-type prior on the lifted votes: "who/where/name" questions
+    # restrict extraction to capitalized word-initial tokens, "when/how
+    # many/year" to digit tokens.  Needs attach_vocab(itos) - the model
+    # works on token ids otherwise.  0=off, 1=auto-classify the prompt.
+    knn_atype: int = 0
+    # per-row span dedup: a token counts at most once per retrieved
+    # row's span (max-position weight) - stops a repeated common word
+    # inside one span out-voting an entity spread across rows.
+    knn_dedup: int = 0
+    # min support: with knn_dedup, a candidate needs to appear in at
+    # least this many DISTINCT retrieved rows' spans - singleton
+    # entities from a single noisy match drop out of the vote.
+    knn_minsup: int = 1
+    # position clustering: true-passage rows retrieve at many adjacent
+    # stream positions while false positives scatter - reweight each
+    # row by 1 + knn_clus * (rows within knn_span of it).
+    knn_clus: float = 0.0
+    # content-anchored span vote: 0=off (row-centre distance decay),
+    # in (0,1] = proximity-decay base - each span token is weighted by
+    # knn_anchor^dist to the nearest question-content token inside the
+    # row's span.  The answer sits adjacent to the words that define
+    # it, not at the match point.
+    knn_anchor: float = 0.0
+    # unigram-count band for span-vote candidates: answers are
+    # mid-frequency entities; boilerplate and function words (the real
+    # vote thieves) sit above knn_tokmax, one-off typos below
+    # knn_tokmin.  0/inf = unbounded.
+    knn_tokmin: float = 0.0
+    knn_tokmax: float = 1e18
+    # spreading-activation extraction (replaces span voting when >0):
+    # score(t) = sum over positions p of [ring_p == t] * field[p],
+    # field = conv(content-indicator, knn_spread^|d| kernel).  Every
+    # token's occurrences vote by proximity to the question's content
+    # words CORPUS-WIDE - the answer is co-located with the question's
+    # rare words wherever they appear, not just in top-k spans.
+    knn_spread: float = 0.0
+    knn_spread_w: int = 32      # kernel radius in tokens
+    # score normalization: divide votes by (unig+1)^norm - mean field
+    # per occurrence (rare-and-associated beats common-and-everywhere);
+    # optionally multiply by idf^spread_idf to favour rare entities.
+    knn_spread_norm: float = 0.0
+    knn_spread_idf: float = 0.0
+    # per-position coverage amplification: field^pow before the
+    # occurrence scatter - positions near MANY distinct content tokens
+    # dominate positions near one, which is what separates the
+    # answer-bearing sentence from same-passage noise.
+    knn_spread_pow: float = 1.0
+    # supported-occurrence gate: a candidate needs >= this many
+    # occurrences at positions where field >= 0.3*max - one lucky
+    # co-occurrence can't make an answer, while 'was'-class common
+    # words then dilute under spread_norm.  0/1 = off.
+    knn_spread_minhit: int = 1
+    # twin-question answer adoption: retrieved rows inside a trained
+    # "Q:.. A:<ans>" line vote the tokens after their answer scaffold,
+    # weighted by knn_twin * sim - near-duplicate held questions read
+    # the matching trained answer directly (generalized recall).
+    knn_twin: float = 0.0
 
     # triton fused kernels (CUDA-primary only): single-launch deep-vote
     # eval + fused V-tail logit assembly.  Eager torch fallbacks cover

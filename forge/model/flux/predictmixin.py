@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
@@ -307,7 +308,9 @@ class _PredictMixin:
         c = self.config
         if not c.use_knn or self._knn_cur == 0:
             return {}
-        q = self._knn_fp_ctx(self._count - 1).to(self._knn_fp.dtype)
+        q = self._knn_fp_ctx(self._count - 1,
+                             episode=c.knn_episode
+                             ).to(self._knn_fp.dtype)
         # scan only the live ring prefix (bucketed) - the padded tail
         # is pos=-1 anyway, so slicing is exact, just cheaper
         b = self._knn_rows()
@@ -336,14 +339,70 @@ class _PredictMixin:
                 # span voting: tokens within +/-K of the matched
                 # stream position vote (passage->answer extraction)
                 p = int(self._knn_pos[i])
+                span_ids, span_w = [], []
                 for j in range(-K, K + 1):
                     pj = p + j
                     if pj < 0 or pj >= self._count:
                         continue
                     t = int(self._ring[pj % c.ring_capacity])
                     if 0 <= t < self.vocab_size:
-                        votes[t] = votes.get(t, 0.0) + w0 * (
-                            c.knn_span_decay ** abs(j))
+                        span_ids.append(t)
+                        span_w.append(c.knn_span_decay ** abs(j))
+                if c.knn_subq:
+                    Wq = int(c.knn_window) or 16
+                    q0 = (self._prompt_start if c.knn_episode
+                          else max(0, self._count - Wq))
+                    qset = {int(self._ring[q % c.ring_capacity])
+                            for q in range(q0,
+                                           min(self._count,
+                                               q0 + Wq))}
+                    span_w = [w if t not in qset else 0.0
+                              for t, w in zip(span_ids, span_w)]
+                if c.knn_span_idf > 0 and span_ids:
+                    iw = self._knn_tok_w(torch.as_tensor(
+                        span_ids, device=self._dev))
+                    iw = (iw / iw.mean().clamp(min=1e-6)
+                          ) ** float(c.knn_span_idf)
+                    span_w = [w * float(x)
+                              for w, x in zip(span_w, iw.tolist())]
+                if c.knn_cover > 0:
+                    R = int(c.knn_cover)
+                    W = int(c.knn_window) or 16
+                    qt = torch.as_tensor(
+                        [self._ring[q % c.ring_capacity] for q in
+                         range(max(0, self._count - W),
+                               self._count)],
+                        device=self._dev).long().clamp(
+                            0, self.vocab_size - 1)
+                    qw = self._knn_tok_w(qt)
+                    sel = qw.topk(min(8, int(qw.numel()))).indices
+                    ct, cw = qt[sel], qw[sel]
+                    cw_l, ct_l = cw.tolist(), ct.tolist()
+                    cov = 0.0
+                    for qj in range(-R, R + 1):
+                        pj2 = p + qj
+                        if 0 <= pj2 < self._count:
+                            t2 = int(
+                                self._ring[pj2 % c.ring_capacity])
+                            for ctk, cwk in zip(ct_l, cw_l):
+                                if t2 == ctk:
+                                    cov += cwk
+                    cover = cov / max(sum(cw_l), 1e-8)
+                    span_w = [w * (1.0 + float(c.knn_cover_w)
+                                   * cover) for w in span_w]
+                if c.knn_dedup:
+                    # a token counts at most its strongest position in
+                    # this row's span - support-counting across rows
+                    row_v: dict[int, float] = {}
+                    for t, w in zip(span_ids, span_w):
+                        ww = w0 * w
+                        if ww > row_v.get(t, 0.0):
+                            row_v[t] = ww
+                    for t, w in row_v.items():
+                        votes[t] = votes.get(t, 0.0) + w
+                else:
+                    for t, w in zip(span_ids, span_w):
+                        votes[t] = votes.get(t, 0.0) + w0 * w
             else:
                 t = int(self._knn_succ[i])
                 if t >= 0:
@@ -487,13 +546,48 @@ class _PredictMixin:
         c = self.config
         V = self.vocab_size
         qk = self._knn_fp_ctx(
-            self._count - 1 if end is None else end
+            self._count - 1 if end is None else end,
+            episode=c.knn_episode
         ).to(self._knn_fp.dtype)
         ksims = (self._knn_fp[:kb] @ qk).float()
         ksims = torch.where(
             self._knn_pos[:kb] >= 0, ksims,
             torch.full((), -1e9, device=self._dev))
-        top = torch.topk(ksims, min(c.knn_k, kb))
+        if (c.knn_drop_qa > 0 and end is not None
+                and getattr(self, "_ringg", None) is not None):
+            # mask rows sitting inside a "Q:... A:" line: their forward
+            # ring window contains the same answer-scaffold pair that
+            # ends the current prompt - they retrieve format-twin
+            # questions, not evidence
+            e = end.reshape(-1)[-1]
+            D = int(c.knn_drop_qa)
+            kp = self._knn_pos[:kb].long()
+            s0 = self._ringg.index_select(
+                0, (e - 1).clamp(min=0).reshape(1)
+                % c.ring_capacity)[0].long()
+            s1 = self._ringg.index_select(
+                0, (e % c.ring_capacity).reshape(1))[0].long()
+            wi = kp[:, None] + torch.arange(
+                1, D + 1, device=self._dev)[None, :]
+            wvld = (kp >= 0)[:, None] & (wi <= e - 2) & (wi >= 0)
+            wt = self._ringg.index_select(
+                0, (wi.clamp(min=0) % c.ring_capacity
+                    ).reshape(-1)).reshape(wi.shape).long()
+            isqa = ((wt[:, :-1] == s0) & (wt[:, 1:] == s1)
+                    & wvld[:, :-1]).any(1)
+            ksims = torch.where(isqa, torch.full_like(ksims, -1e9),
+                                ksims)
+        # two-stage retrieval: when coverage is on, pool 4x the rows by
+        # sim, rerank by query-content coverage, keep top knn_k - the
+        # answer-bearing passage ranks below format twins on raw sim
+        # but separates cleanly once coverage reweights it
+        ktop_n = min(c.knn_k, kb)
+        cover_on = (c.knn_cover > 0 and c.knn_span > 0
+                    and end is not None
+                    and getattr(self, "_ringg", None) is not None)
+        pool_n = min(max(int(c.knn_pool), ktop_n), kb) if cover_on \
+            else ktop_n
+        top = torch.topk(ksims, pool_n)
         keep = top.values > c.knn_min_sim
         # retrieval utility: neighbours that cleared the vote floor
         # earn hits (feeds knn_utility_evict scoring) - branchless,
@@ -501,14 +595,198 @@ class _PredictMixin:
         self._knn_hits.index_add_(
             0, top.indices, keep.to(torch.int32))
         wv = (top.values.clamp(min=0.0) ** c.knn_gamma) * keep
+        rows_i = top.indices                    # bank-row indices
+        pos = self._knn_pos.index_select(0, rows_i).long()
+        twin_votes = None
+        if (c.knn_twin > 0 and end is not None
+                and getattr(self, "_ringg", None) is not None):
+            # twin-question answer adoption: a pool row sitting inside
+            # a trained "Q:.. A:<ans>" line has the prompt's scaffold
+            # pair in its forward window - the tokens after it are ITS
+            # answer.  Near-duplicate held questions read the matching
+            # trained answer directly (generalized recall).
+            e = end.reshape(-1)[-1]
+            Dt = max(int(c.knn_drop_qa), 6)
+            s0 = self._ringg.index_select(
+                0, (e - 1).clamp(min=0).reshape(1)
+                % c.ring_capacity)[0].long()
+            s1 = self._ringg.index_select(
+                0, (e % c.ring_capacity).reshape(1))[0].long()
+            wi = pos[:, None] + torch.arange(
+                1, Dt + 1, device=self._dev)[None, :]
+            wvld = (pos >= 0)[:, None] & (wi <= e - 2) & (wi >= 0)
+            wt = self._ringg.index_select(
+                0, (wi.clamp(min=0) % c.ring_capacity
+                    ).reshape(-1)).reshape(wi.shape).long()
+            hitq = (wt[:, :-1] == s0) & (wt[:, 1:] == s1) \
+                & wvld[:, :-1]
+            hasq = hitq.any(1)
+            ans0 = pos + hitq.float().argmax(1) + 2
+            twin_votes = torch.zeros(V, device=self._dev)
+            for d in range(3):
+                ap = ans0 + d
+                al = (ap <= e - 2) & hasq
+                at = self._ringg.index_select(
+                    0, (ap.clamp(min=0) % c.ring_capacity)
+                    ).long().clamp(0, V - 1)
+                twin_votes.index_add_(
+                    0, at, wv * float(c.knn_twin)
+                    * (0.5 ** d) * al.float())
+        need_ct = ((cover_on or c.knn_anchor > 0
+                    or c.knn_spread > 0)
+                   and end is not None
+                   and getattr(self, "_ringg", None) is not None)
+        ct = cw = None
+        if need_ct:
+            # the QUERY's high-idf content tokens - shared by coverage
+            # reranking and content-anchored span voting.  A row/token
+            # matters to the extent that the question's rare words sit
+            # near it.
+            e = end.reshape(-1)[-1]
+            W = int(c.knn_window) or 16
+            e0 = (self._prompt_g.reshape(-1)[-1]
+                  if c.knn_episode and getattr(
+                      self, "_prompt_g", None) is not None
+                  else (torch.as_tensor(
+                      self._prompt_start, device=self._dev)
+                      if c.knn_episode
+                      else (e - W + 1).clamp(min=0)))
+            qi = torch.minimum(
+                (e0 + torch.arange(W, device=self._dev)
+                 ).clamp(min=0), e)
+            qt = self._ringg.index_select(
+                0, qi % c.ring_capacity).long().clamp(0, V - 1)
+            qw = self._knn_tok_w(qt)
+            qw = torch.where(qi >= e0, qw,
+                             torch.zeros((), device=self._dev))
+            sel = qw.topk(min(16, int(qw.numel()))).indices
+            ct, cw = qt[sel], qw[sel]
+            cw = torch.where(cw >= 0.6 * cw.max().clamp(min=1e-8),
+                             cw, torch.zeros_like(cw))
+        if (c.knn_spread > 0 and ct is not None
+                and int(ct.numel()) > 0
+                and getattr(self, "_ringg", None) is not None):
+            # spreading-activation extraction: every stream position
+            # gets a field value = idf-weighted proximity to the
+            # question's content tokens; a token's vote = sum of field
+            # over its occurrences.  Corpus-wide, no top-k dependence.
+            cap = c.ring_capacity
+            ring_all = self._ringg.long().clamp(0, V - 1)
+            act = ((ring_all[:, None] == ct[None, :]).float()
+                   * cw[None, :]).sum(1)
+            hi_s = (end.reshape(-1)[-1] if end is not None
+                    else torch.as_tensor(self._count - 1,
+                                         device=self._dev))
+            live_ar = torch.arange(cap, device=self._dev)
+            pre_q = live_ar < e0
+            # the query's own positions carry every content token -
+            # leaving them live makes the question self-match and drown
+            # the evidence clusters
+            act = act * pre_q.float()
+            Ws = int(c.knn_spread_w)
+            koffs = torch.arange(-Ws, Ws + 1, device=self._dev)
+            kern = float(c.knn_spread) ** koffs.abs().float()
+            field = torch.nn.functional.conv1d(
+                act.view(1, 1, cap), kern.view(1, 1, -1),
+                padding=Ws).view(cap)
+            field = field * (live_ar <= hi_s).float() * pre_q.float()
+            if c.knn_spread_pow != 1.0:
+                field = field ** float(c.knn_spread_pow)
+            # vote only from the hottest content-cluster positions:
+            # a candidate must physically sit where the question's
+            # rare words concentrate - same-passage drift can't vote
+            ntop = min(int(c.knn_spread_minhit * 128) or 256, cap)
+            th = field.topk(ntop).values[-1]
+            field = field * (field >= th).float()
+            # index_add_ (atomic order) over the full ring - O(N) but
+            # float-order nondeterministic; acceptable for a readout
+            # channel (_scatter_sum is O(N^2) at cap scale)
+            votes = torch.zeros(V, device=self._dev)
+            votes.index_add_(0, ring_all, field)
+            if c.knn_subq and end is not None:
+                e = end.reshape(-1)[-1]
+                e0 = (self._prompt_g.reshape(-1)[-1]
+                      if c.knn_episode and getattr(
+                          self, "_prompt_g", None) is not None
+                      else (torch.as_tensor(
+                          self._prompt_start, device=self._dev)
+                          if c.knn_episode
+                          else (e - int(c.knn_window or 16) + 1
+                                ).clamp(min=0)))
+                Wq = int(c.knn_window) or 16
+                qids = self._ringg.index_select(
+                    0, (torch.minimum(
+                        (e0 + torch.arange(Wq, device=self._dev)
+                         ).clamp(min=0), e)
+                        % c.ring_capacity)).long().clamp(0, V - 1)
+                qm = torch.zeros(V, dtype=torch.bool,
+                                 device=self._dev)
+                qm.index_fill_(0, qids, True)
+                votes = votes * (~qm).float()
+            uni_t = (self._unig if getattr(
+                self, "_unig", None) is not None else
+                torch.as_tensor(self._uni, device=self._dev))
+            if c.knn_tokmin > 0 or c.knn_tokmax < 1e17:
+                votes = votes * ((uni_t >= float(c.knn_tokmin))
+                                 & (uni_t <= float(c.knn_tokmax))
+                                 ).float()
+            if c.knn_spread_norm > 0:
+                # mean field per occurrence: 'was' co-locates with
+                # everything but dilutes over 10^3 occurrences; the
+                # answer's few occurrences all sit near content
+                votes = votes / (uni_t + 1.0).clamp(
+                    min=1e-6) ** float(c.knn_spread_norm)
+            if c.knn_spread_idf > 0:
+                wall = self._knn_tok_w(torch.arange(
+                    V, device=self._dev))
+                votes = votes * wall.clamp(
+                    min=1e-8) ** float(c.knn_spread_idf)
+            if twin_votes is not None:
+                votes = votes + twin_votes
+            return votes, votes.sum()
+        if cover_on:
+            # coverage rerank on the pool: fraction of the QUERY's
+            # content-token idf present in each row's +/-R ring window.
+            # The sentence defining the answer carries the question's
+            # rare words; format-twin questions and topically-similar
+            # passages carry less.
+            R = int(c.knn_cover)
+            wi2 = pos[:, None] + torch.arange(
+                -R, R + 1, device=self._dev)[None, :]
+            live2 = (wi2 >= 0) & (wi2 <= e)
+            wt2 = self._ringg.index_select(
+                0, (wi2.clamp(min=0) % c.ring_capacity
+                    ).reshape(-1)).reshape(wi2.shape
+                                          ).long().clamp(0, V - 1)
+            hit = (wt2[:, :, None] == ct[None, None, :]
+                   ) & live2[:, :, None]
+            # per-token presence (dedupe): a content token counts ONCE
+            # no matter how many window positions contain it
+            cov = (hit.any(dim=1).float() * cw[None, :]).sum(
+                dim=1) / cw.sum().clamp(min=1e-8)
+            score = wv * (1.0 + float(c.knn_cover_w) * cov)
+            pick = torch.topk(score, ktop_n).indices
+            wv = wv.index_select(0, pick)
+            rows_i = rows_i.index_select(0, pick)
+            pos = pos.index_select(0, pick)
+        if c.knn_clus > 0 and pos.numel() > 1:
+            # the true passage retrieves at MANY adjacent positions;
+            # false matches are scattered singletons - boost clustered
+            # rows by neighbour count within knn_span
+            Kc = max(int(c.knn_span), 1)
+            deg = ((pos[:, None] - pos[None, :]).abs()
+                   <= Kc).float().sum(1) - 1.0
+            wv = wv * (1.0 + float(c.knn_clus) * deg)
         if c.knn_span > 0 and getattr(self, "_ringg", None) is not None:
             # span voting: neighbours retrieve CONTEXTS - every token
             # within +/-K stream positions of a match votes, so the
             # answer needn't be the direct successor (extractive QA:
             # retrieve the passage, read off the entity).  end bounds
             # the span to observed positions; all device ops.
-            K = int(c.knn_span)
-            pos = self._knn_pos.index_select(0, top.indices).long()
+            # anchored voting widens the gather to the coverage radius
+            # so a content hit at R> K still anchors a vote.
+            K = max(int(c.knn_span),
+                    int(c.knn_cover) if c.knn_anchor > 0 else 0)
             offs = torch.arange(-K, K + 1, device=self._dev)
             pj = pos[:, None] + offs[None, :]
             hi = (end.reshape(-1)[-1] if end is not None
@@ -516,18 +794,95 @@ class _PredictMixin:
             live = (pj >= 0) & (pj <= hi)
             pj = pj.clamp(min=0) % c.ring_capacity
             toks = self._ringg.index_select(
-                0, pj.reshape(-1)).long().clamp(0, V - 1)
-            dw = (float(c.knn_span_decay)
-                  ** offs.abs().float())[None, :]
+                0, pj.reshape(-1)).reshape(pj.shape
+                                          ).long().clamp(0, V - 1)
+            dw0 = (float(c.knn_span_decay)
+                   ** offs.abs().float())[None, :]
+            if (c.knn_anchor > 0 and ct is not None
+                    and int(ct.numel()) > 0):
+                # content-anchored vote: the answer sits ADJACENT to
+                # the question's content words inside the passage, not
+                # at the matched-row centre.  Weight each span position
+                # by decayed proximity to the nearest content-token hit
+                # (idf-weighted hits anchor harder).  Center decay is
+                # kept as a floor so zero-hit rows still vote weakly.
+                hmask = ((toks[:, :, None] == ct[None, None, :]).float()
+                         * cw[None, None, :]).sum(-1)
+                d2 = (offs[:, None] - offs[None, :]).abs()
+                M = float(c.knn_anchor) ** d2.float()
+                field = hmask @ M.T
+                field = field / field.amax(
+                    dim=1, keepdim=True).clamp(min=1e-8)
+                dw = torch.maximum(field, 0.05 * dw0)
+            else:
+                dw = dw0
             wij = wv[:, None] * dw * live
-            kv = _scatter_sum(toks.reshape(-1), wij.reshape(-1), V)
+            if c.knn_subq and end is not None:
+                # the answer is the token the question does NOT
+                # contain - mask every prompt token out of the span
+                # vote (without this, votes re-emit the question's
+                # own content words)
+                e = end.reshape(-1)[-1]
+                e0 = (self._prompt_g.reshape(-1)[-1]
+                      if c.knn_episode and getattr(
+                          self, "_prompt_g", None) is not None
+                      else (torch.as_tensor(
+                          self._prompt_start, device=self._dev)
+                          if c.knn_episode
+                          else (e - int(c.knn_window or 16) + 1
+                                ).clamp(min=0)))
+                Wq = int(c.knn_window) or 16
+                qids = self._ringg.index_select(
+                    0, (torch.minimum(
+                        (e0 + torch.arange(Wq, device=self._dev)
+                         ).clamp(min=0), e)
+                        % c.ring_capacity)).long().clamp(0, V - 1)
+                qm = torch.zeros(V, dtype=torch.bool,
+                                 device=self._dev)
+                qm.index_fill_(0, qids, True)
+                wij = wij * (~qm.index_select(
+                    0, toks.reshape(-1))).reshape(toks.shape).float()
+            if c.knn_span_idf > 0:
+                iw = self._knn_tok_w(toks.reshape(-1))
+                iw = (iw / iw.mean().clamp(min=1e-6)
+                      ) ** float(c.knn_span_idf)
+                wij = wij * iw.reshape(toks.shape)
+            if c.knn_tokmin > 0 or c.knn_tokmax < 1e17:
+                # entity band: boilerplate words and one-off junk can't
+                # be answers - gate candidates by corpus frequency
+                uni_t = (self._unig if getattr(
+                    self, "_unig", None) is not None else
+                    torch.as_tensor(self._uni, device=self._dev))
+                cnt = uni_t.index_select(
+                    0, toks.reshape(-1)).reshape(toks.shape)
+                band = (cnt >= float(c.knn_tokmin)) & (
+                    cnt <= float(c.knn_tokmax))
+                wij = wij * band.float()
+            if c.knn_dedup:
+                # a token contributes at most its strongest position per
+                # row - support-counting: entities spread across many
+                # retrieved rows beat words repeated inside one span
+                contrib = torch.zeros(
+                    (toks.shape[0], V), device=self._dev)
+                contrib.scatter_reduce_(
+                    1, toks, wij, reduce="amax", include_self=False)
+                kv = contrib.sum(0)
+                if c.knn_minsup > 1:
+                    sup = (contrib > 0).sum(0)
+                    kv = kv * (sup >= int(c.knn_minsup)).float()
+            else:
+                kv = _scatter_sum(toks.reshape(-1), wij.reshape(-1), V)
+            if twin_votes is not None:
+                kv = kv + twin_votes
             return kv, kv.sum()
         ksucc = self._knn_succ.index_select(
-            0, top.indices).long().clamp(0, V - 1)
+            0, rows_i).long().clamp(0, V - 1)
         # deterministic accumulation - neighbours can share a
         # successor, and index_add_ atomics made logits
         # timing-dependent
         kv = _scatter_sum(ksucc, wv, V)
+        if twin_votes is not None:
+            kv = kv + twin_votes
         return kv, kv.sum()
 
     @torch._dynamo.disable
@@ -562,6 +917,11 @@ class _PredictMixin:
             dw = (float(c.knn_span_decay)
                   ** offs.abs().float())[None, :]
             wij = kwv[:, None] * dw * live
+            if c.knn_span_idf > 0:
+                iw = self._knn_tok_w(toks.reshape(-1))
+                iw = (iw / iw.mean().clamp(min=1e-6)
+                      ) ** float(c.knn_span_idf)
+                wij = wij * iw.reshape(toks.shape)
             kvt = wij.sum().double()
             kvx = (wij * (toks == x)).sum().double()
             return kvt, kvx
@@ -830,7 +1190,7 @@ class _PredictMixin:
             # where t appeared vs the content window query - the
             # semantic bridge (question entity -> answer entity) that
             # successor-only channels can't reach.  One [V,192] matvec.
-            xq = self._knn_ctx_feat(end)
+            xq = self._knn_ctx_feat(end, episode=c.knn_episode)
             xn = xq.norm()
             cos_f = (self._A @ xq) / (self._An * xn + 1e-8)
             cos_f = torch.where(self._An > 1e-8, cos_f,
@@ -2072,7 +2432,7 @@ class _PredictMixin:
         # topic channel: cosine readout on candidates only - or, with
         # topic_full, the 2-hop association over all of vocab
         if c.topic_full:
-            xq = self._knn_ctx_feat(end)
+            xq = self._knn_ctx_feat(end, episode=c.knn_episode)
             xn = float(xq.norm())
             if xn > 1e-8:
                 an = (self._An
@@ -2586,7 +2946,8 @@ class _PredictMixin:
         kb = self._knn_rows()
         if not self.config.use_knn or kb <= 0:
             return []
-        qk = self._knn_fp_ctx(self._count - 1)
+        qk = self._knn_fp_ctx(self._count - 1,
+                              episode=self.config.knn_episode)
         sims = self._knn_fp[:kb].float() @ qk.float()
         sims = torch.where(self._knn_pos[:kb] >= 0, sims,
                            torch.full_like(sims, -1e9))
@@ -2596,6 +2957,60 @@ class _PredictMixin:
                 for s, i in zip(top.values.tolist(),
                                 top.indices.tolist())
                 if s > self.config.knn_min_sim]
+
+    def attach_vocab(self, itos: list) -> None:
+        """Attach decoded token strings (one per id) so the answer-type
+        prior can classify prompts and build entity/digit masks without
+        an external tokenizer reference.  Cheap; safe to call post-load."""
+        self._vocab_str = [str(s) for s in itos]
+        self._cls_masks = None
+
+    def _atype_mask(self, kind: str):
+        """V-bool device mask for an answer class, lazily built from
+        _vocab_str: 'ent' = word-initial alpha pieces (starts a word -
+        named entities survive regardless of case since QA answers are
+        ingested lowercased), 'cap' = capitalized pieces, 'num' = pieces
+        containing a digit.  None without an attached vocab."""
+        if not getattr(self, "_vocab_str", None):
+            return None
+        if getattr(self, "_cls_masks", None) is None:
+            V = self.vocab_size
+            ent = torch.zeros(V, dtype=torch.bool, device=self._dev)
+            cap = torch.zeros(V, dtype=torch.bool, device=self._dev)
+            num = torch.zeros(V, dtype=torch.bool, device=self._dev)
+            ent_l, cap_l, num_l = [], [], []
+            for s in self._vocab_str[:V]:
+                # word-initial = space-initial alpha piece: BPE
+                # continuation pieces ('ered','th') start with a letter
+                # but can never begin a word
+                word_initial = bool(
+                    len(s) > 1 and s[0] == " " and s[1].isalpha())
+                ent_l.append(word_initial)
+                cap_l.append(bool(
+                    len(s) > 1 and s[0] == " " and s[1].isupper()))
+                num_l.append(any(ch.isdigit() for ch in s))
+            ent[: len(ent_l)] = torch.as_tensor(
+                ent_l, dtype=torch.bool, device=self._dev)
+            cap[: len(cap_l)] = torch.as_tensor(
+                cap_l, dtype=torch.bool, device=self._dev)
+            num[: len(num_l)] = torch.as_tensor(
+                num_l, dtype=torch.bool, device=self._dev)
+            self._cls_masks = {"ent": ent, "cap": cap, "num": num}
+        return self._cls_masks.get(kind)
+
+    def _q_atype(self, ids) -> str:
+        """Classify a question prompt's answer type from its decoded
+        text: numeric-expectation words -> 'num', else 'ent' (trivia
+        answers are overwhelmingly named entities)."""
+        if not getattr(self, "_vocab_str", None):
+            return "any"
+        vs = self._vocab_str
+        txt = "".join(vs[i] if 0 <= i < len(vs) else " "
+                      for i in ids[-200:]).lower()
+        return ("num" if re.search(
+            r"\b(year|when|date|day|age|old|many|much|number|long|"
+            r"far|tall|high|population|score|percent|frequency)\b",
+            txt) else "ent")
 
     def forward(self, idx: torch.Tensor, targets=None,
                 past_key_values=None, use_cache: bool = False,
@@ -2666,7 +3081,8 @@ class _PredictMixin:
     def generate(self, prompt_ids, max_new: int = 64,
                  temperature: float = 0.0, top_p: float = 1.0,
                  learn: bool = True, tag: str = "gen",
-                 generator: torch.Generator | None = None
+                 generator: torch.Generator | None = None,
+                 atype: str | None = None
                  ) -> list[int]:
         """Autoregressive decode with support-restricted sampling.
 
@@ -2686,9 +3102,64 @@ class _PredictMixin:
         self.tag = tag
         V = self.vocab_size
         out: list[int] = []
+        amask = None
+        if c.knn_atype and c.knn_lift > 0:
+            kind = atype if atype is not None else self._q_atype(prompt)
+            amask = self._atype_mask(kind)
+        seen_q = False
+        if (c.knn_lift > 0 and c.knn_lift_deep > 0
+                and getattr(self, "_gpu", False)
+                and prompt):
+            # any deep-order cell at the prompt end = the question's
+            # exact long suffix was trained - recall owns the answer
+            end_t = torch.as_tensor(
+                self._count - 1, dtype=torch.int64, device=self._dev)
+            _sl, _f, _e, _lk, _cok, _dok, _dk, _pk = \
+                self._probes_at(end_t)
+            n_ord = _f.numel() - 2
+            ord_t = torch.as_tensor(
+                list(c.orders), dtype=torch.int64, device=self._dev)
+            seen_q = bool((_f[:n_ord].bool()
+                           & (ord_t >= int(c.knn_lift_deep))).any())
         try:
-            for _ in range(max_new):
+            for _step in range(max_new):
                 lg = torch.as_tensor(self._predict()).float().clone()
+                if (c.knn_lift > 0 and c.use_knn
+                        and self._knn_cur > 0
+                        and _step < int(c.knn_lift_steps)
+                        and not seen_q
+                        and (not c.knn_lift_thin
+                             or int(getattr(
+                                 self, "_dthin_g",
+                                 torch.zeros((), dtype=torch.int64,
+                                             device=self._dev)
+                                 ).item()) == 0)
+                        and (c.knn_lift_conf <= 0
+                             or float(torch.softmax(lg, -1).max())
+                             < float(c.knn_lift_conf))):
+                    kb = self._knn_rows()
+                    e = torch.as_tensor(self._count - 1,
+                                        device=self._dev)
+                    if getattr(self, "_ringg", None) is not None:
+                        kv, kvt = self._knn_votes_dev(kb, end=e)
+                        if amask is not None:
+                            kv = kv * amask.float()
+                            kvt = kv.sum()
+                        if float(kvt) > 0:
+                            pk = kv / kvt.clamp(min=1e-8)
+                            lg = lg + float(c.knn_lift) * torch.log(
+                                pk.clamp(min=1e-12))
+                    else:
+                        vd = self._knn_votes(c.knn_k)
+                        if amask is not None:
+                            vd = {t: w for t, w in vd.items()
+                                  if bool(amask[t])}
+                        if vd:
+                            tot = sum(vd.values())
+                            for t, w in vd.items():
+                                lg[t] += float(c.knn_lift) * (
+                                    float(np.log(
+                                        max(w / tot, 1e-12))))
                 if temperature <= 0:
                     x = int(lg.argmax())
                 else:

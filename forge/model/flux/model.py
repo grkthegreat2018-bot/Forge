@@ -172,6 +172,8 @@ class FluxLM(_StateMixin, _PredictMixin, _LearnMixin, _RevertMixin,
         self._epi_dirty: set[int] = set()   # rows needing GPU resync
                                             # (drops batch the probes)
         self._ep_start = 0                  # current episode start (abs pos)
+        self._prompt_start = 0              # last ingest-call start
+                                            # (query-side fingerprints)
         self._pows = np.empty(
             max(max(c.orders), c.deep_order, c.csem_order,
                 *(c.cert_orders or (0,))) + 1,
@@ -441,6 +443,8 @@ class FluxLM(_StateMixin, _PredictMixin, _LearnMixin, _RevertMixin,
                                       device=self._dev)
             self._ep_g = torch.zeros((), dtype=torch.int64,
                                      device=self._dev)
+            self._prompt_g = torch.zeros((), dtype=torch.int64,
+                                         device=self._dev)
             self._tot_g = torch.zeros((), dtype=torch.float64,
                                       device=self._dev)
             self._bx = torch.zeros((), dtype=torch.int64,
