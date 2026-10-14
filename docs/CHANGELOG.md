@@ -1,4 +1,44 @@
 
+#### FLUX knn extractive recall lift (R69 — held-out QA retrieval)
+
+- **Pipeline** (`_knn_votes_dev`, all config-gated, defaults off):
+  two-stage retrieval — broad cosine pool (`knn_pool`) -> query-
+  content coverage rerank (`knn_cover`/`knn_cover_w`, high-idf
+  prompt tokens only) -> votes.  QA-format twins can be suppressed
+  (`knn_drop_qa`) or exploited (`knn_twin`: rows inside trained
+  "Q:..A:ans" lines adopt the tokens after the answer scaffold).
+  Vote sources: successor, span (`knn_span`, per-row `knn_dedup`,
+  `knn_span_idf`), and corpus-wide spreading-activation field
+  (`knn_spread*`) — a token votes the field at its occurrences,
+  `knn_spread_doc` switches the proximity-decayed conv for a flat
+  doc-coverage maxpool weighted by each token's own idf.
+- **Fingerprints**: `knn_window` bag-of-features over the last W
+  ring tokens (+ `knn_idf` rare-token weighting, `knn_residual`
+  prose-mean removal, `knn_episode` prompt-span-only query fp via
+  `_prompt_start`/`_prompt_g` set in `ingest()`).  Fixed the raw
+  collapse where all fps sat at cos~0.99 with everything.
+- **Merged decode** (`generate()`): `lg += knn_lift * log p_votes`
+  for the first `knn_lift_steps` tokens — recall merges INTO
+  generation instead of replacing it.  Gates: deep-order cell
+  existence (`knn_lift_deep` — seen questions keep verbatim recall),
+  thin-regime (`knn_lift_thin`), model confidence (`knn_lift_conf`),
+  and vote concentration (`knn_lift_topconf` — diffuse votes are
+  noise and cost more than they gain).
+- **Bug fix — prompt self-match**: the spread field's live mask
+  included the just-ingested prompt, so the question's own rare
+  tokens self-activated and drowned evidence clusters.  The query
+  span `[e0, e]` is now excluded from both the activation source
+  and the vote-read positions.
+- **Answer-type masks** (`attach_vocab`, `knn_atype`): word-initial
+  alpha piece filter, `knn_tokmin`/`knn_tokmax` unigram band.
+- **Measured capability profile** (4K trivia + evidence, v8):
+  seen_qa 0.86-0.96; paraphrase generalization 54-80% (content-
+  driven transfer where knowledge exists); held_qa ~5% — bounded
+  by corpus knowledge (answers absent from the 4K docs, not by
+  the mechanism: field correctly localizes content-bearing docs;
+  gold tokens simply never co-occur with question words there).
+- Tests 158/158 green.  Commits `03d50c8`, `6d929d7`, `eda1cb5`+.
+
 #### FLUX gen_live (R68 — the live generalizer "gen head")
 
 - **gen_live** (`config.py` `gen_live` + `gen_live_topm` +

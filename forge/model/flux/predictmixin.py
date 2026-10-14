@@ -582,7 +582,9 @@ class _PredictMixin:
         # answer-bearing passage ranks below format twins on raw sim
         # but separates cleanly once coverage reweights it
         ktop_n = min(c.knn_k, kb)
-        cover_on = (c.knn_cover > 0 and c.knn_span > 0
+        cover_on = (c.knn_cover > 0
+                    and (c.knn_span > 0 or c.knn_twin > 0
+                         or c.knn_spread > 0)
                     and end is not None
                     and getattr(self, "_ringg", None) is not None)
         pool_n = min(max(int(c.knn_pool), ktop_n), kb) if cover_on \
@@ -597,41 +599,6 @@ class _PredictMixin:
         wv = (top.values.clamp(min=0.0) ** c.knn_gamma) * keep
         rows_i = top.indices                    # bank-row indices
         pos = self._knn_pos.index_select(0, rows_i).long()
-        twin_votes = None
-        if (c.knn_twin > 0 and end is not None
-                and getattr(self, "_ringg", None) is not None):
-            # twin-question answer adoption: a pool row sitting inside
-            # a trained "Q:.. A:<ans>" line has the prompt's scaffold
-            # pair in its forward window - the tokens after it are ITS
-            # answer.  Near-duplicate held questions read the matching
-            # trained answer directly (generalized recall).
-            e = end.reshape(-1)[-1]
-            Dt = max(int(c.knn_drop_qa), 6)
-            s0 = self._ringg.index_select(
-                0, (e - 1).clamp(min=0).reshape(1)
-                % c.ring_capacity)[0].long()
-            s1 = self._ringg.index_select(
-                0, (e % c.ring_capacity).reshape(1))[0].long()
-            wi = pos[:, None] + torch.arange(
-                1, Dt + 1, device=self._dev)[None, :]
-            wvld = (pos >= 0)[:, None] & (wi <= e - 2) & (wi >= 0)
-            wt = self._ringg.index_select(
-                0, (wi.clamp(min=0) % c.ring_capacity
-                    ).reshape(-1)).reshape(wi.shape).long()
-            hitq = (wt[:, :-1] == s0) & (wt[:, 1:] == s1) \
-                & wvld[:, :-1]
-            hasq = hitq.any(1)
-            ans0 = pos + hitq.float().argmax(1) + 2
-            twin_votes = torch.zeros(V, device=self._dev)
-            for d in range(3):
-                ap = ans0 + d
-                al = (ap <= e - 2) & hasq
-                at = self._ringg.index_select(
-                    0, (ap.clamp(min=0) % c.ring_capacity)
-                    ).long().clamp(0, V - 1)
-                twin_votes.index_add_(
-                    0, at, wv * float(c.knn_twin)
-                    * (0.5 ** d) * al.float())
         need_ct = ((cover_on or c.knn_anchor > 0
                     or c.knn_spread > 0)
                    and end is not None
@@ -663,6 +630,77 @@ class _PredictMixin:
             ct, cw = qt[sel], qw[sel]
             cw = torch.where(cw >= 0.6 * cw.max().clamp(min=1e-8),
                              cw, torch.zeros_like(cw))
+        if cover_on:
+            # coverage rerank on the pool: fraction of the QUERY's
+            # content-token idf present in each row's +/-R ring window.
+            # The sentence defining the answer carries the question's
+            # rare words; format-twin questions and topically-similar
+            # passages carry less.
+            R = int(c.knn_cover)
+            wi2 = pos[:, None] + torch.arange(
+                -R, R + 1, device=self._dev)[None, :]
+            live2 = (wi2 >= 0) & (wi2 <= e)
+            wt2 = self._ringg.index_select(
+                0, (wi2.clamp(min=0) % c.ring_capacity
+                    ).reshape(-1)).reshape(wi2.shape
+                                          ).long().clamp(0, V - 1)
+            hit = (wt2[:, :, None] == ct[None, None, :]
+                   ) & live2[:, :, None]
+            # per-token presence (dedupe): a content token counts ONCE
+            # no matter how many window positions contain it
+            cov = (hit.any(dim=1).float() * cw[None, :]).sum(
+                dim=1) / cw.sum().clamp(min=1e-8)
+            score = wv * (1.0 + float(c.knn_cover_w) * cov)
+            pick = torch.topk(score, ktop_n).indices
+            wv = wv.index_select(0, pick)
+            rows_i = rows_i.index_select(0, pick)
+            pos = pos.index_select(0, pick)
+        if c.knn_clus > 0 and pos.numel() > 1:
+            # the true passage retrieves at MANY adjacent positions;
+            # false matches are scattered singletons - boost clustered
+            # rows by neighbour count within knn_span
+            Kc = max(int(c.knn_span), 1)
+            deg = ((pos[:, None] - pos[None, :]).abs()
+                   <= Kc).float().sum(1) - 1.0
+            wv = wv * (1.0 + float(c.knn_clus) * deg)
+        twin_votes = None
+        if (c.knn_twin > 0 and end is not None
+                and getattr(self, "_ringg", None) is not None):
+            # twin-question answer adoption: a pool row sitting inside
+            # a trained "Q:.. A:<ans>" line has the prompt's scaffold
+            # pair in its forward window - the tokens after it are ITS
+            # answer.  Near-duplicate held questions read the matching
+            # trained answer directly (generalized recall).  Runs on
+            # the coverage-reranked selection so the adopted answer
+            # comes from a row that also carries the question's
+            # content, not merely the format.
+            e = end.reshape(-1)[-1]
+            Dt = max(int(c.knn_drop_qa), 6)
+            s0 = self._ringg.index_select(
+                0, (e - 1).clamp(min=0).reshape(1)
+                % c.ring_capacity)[0].long()
+            s1 = self._ringg.index_select(
+                0, (e % c.ring_capacity).reshape(1))[0].long()
+            wi = pos[:, None] + torch.arange(
+                1, Dt + 1, device=self._dev)[None, :]
+            wvld = (pos >= 0)[:, None] & (wi <= e - 2) & (wi >= 0)
+            wt = self._ringg.index_select(
+                0, (wi.clamp(min=0) % c.ring_capacity
+                    ).reshape(-1)).reshape(wi.shape).long()
+            hitq = (wt[:, :-1] == s0) & (wt[:, 1:] == s1) \
+                & wvld[:, :-1]
+            hasq = hitq.any(1)
+            ans0 = pos + hitq.float().argmax(1) + 2
+            twin_votes = torch.zeros(V, device=self._dev)
+            for d in range(3):
+                ap = ans0 + d
+                al = (ap <= e - 2) & hasq
+                at = self._ringg.index_select(
+                    0, (ap.clamp(min=0) % c.ring_capacity)
+                    ).long().clamp(0, V - 1)
+                twin_votes.index_add_(
+                    0, at, wv * float(c.knn_twin)
+                    * (0.5 ** d) * al.float())
         if (c.knn_spread > 0 and ct is not None
                 and int(ct.numel()) > 0
                 and getattr(self, "_ringg", None) is not None):
@@ -684,11 +722,20 @@ class _PredictMixin:
             # the evidence clusters
             act = act * pre_q.float()
             Ws = int(c.knn_spread_w)
-            koffs = torch.arange(-Ws, Ws + 1, device=self._dev)
-            kern = float(c.knn_spread) ** koffs.abs().float()
-            field = torch.nn.functional.conv1d(
-                act.view(1, 1, cap), kern.view(1, 1, -1),
-                padding=Ws).view(cap)
+            if c.knn_spread_doc:
+                # doc-bag readout: every position inherits the max
+                # content mass in its +/-Ws neighbourhood - the answer
+                # needn't sit near the defining phrase, only inside
+                # the content-bearing document
+                field = torch.nn.functional.max_pool1d(
+                    act.view(1, 1, cap), kernel_size=2 * Ws + 1,
+                    stride=1, padding=Ws).view(cap)
+            else:
+                koffs = torch.arange(-Ws, Ws + 1, device=self._dev)
+                kern = float(c.knn_spread) ** koffs.abs().float()
+                field = torch.nn.functional.conv1d(
+                    act.view(1, 1, cap), kern.view(1, 1, -1),
+                    padding=Ws).view(cap)
             field = field * (live_ar <= hi_s).float() * pre_q.float()
             if c.knn_spread_pow != 1.0:
                 field = field ** float(c.knn_spread_pow)
@@ -702,7 +749,14 @@ class _PredictMixin:
             # float-order nondeterministic; acceptable for a readout
             # channel (_scatter_sum is O(N^2) at cap scale)
             votes = torch.zeros(V, device=self._dev)
-            votes.index_add_(0, ring_all, field)
+            if c.knn_spread_doc:
+                # doc mode scores a token by doc-mass x own rarity:
+                # boilerplate in the right doc still loses to rare
+                # answer entities
+                votes.index_add_(
+                    0, ring_all, field * self._knn_tok_w(ring_all))
+            else:
+                votes.index_add_(0, ring_all, field)
             if c.knn_subq and end is not None:
                 e = end.reshape(-1)[-1]
                 e0 = (self._prompt_g.reshape(-1)[-1]
@@ -744,39 +798,6 @@ class _PredictMixin:
             if twin_votes is not None:
                 votes = votes + twin_votes
             return votes, votes.sum()
-        if cover_on:
-            # coverage rerank on the pool: fraction of the QUERY's
-            # content-token idf present in each row's +/-R ring window.
-            # The sentence defining the answer carries the question's
-            # rare words; format-twin questions and topically-similar
-            # passages carry less.
-            R = int(c.knn_cover)
-            wi2 = pos[:, None] + torch.arange(
-                -R, R + 1, device=self._dev)[None, :]
-            live2 = (wi2 >= 0) & (wi2 <= e)
-            wt2 = self._ringg.index_select(
-                0, (wi2.clamp(min=0) % c.ring_capacity
-                    ).reshape(-1)).reshape(wi2.shape
-                                          ).long().clamp(0, V - 1)
-            hit = (wt2[:, :, None] == ct[None, None, :]
-                   ) & live2[:, :, None]
-            # per-token presence (dedupe): a content token counts ONCE
-            # no matter how many window positions contain it
-            cov = (hit.any(dim=1).float() * cw[None, :]).sum(
-                dim=1) / cw.sum().clamp(min=1e-8)
-            score = wv * (1.0 + float(c.knn_cover_w) * cov)
-            pick = torch.topk(score, ktop_n).indices
-            wv = wv.index_select(0, pick)
-            rows_i = rows_i.index_select(0, pick)
-            pos = pos.index_select(0, pick)
-        if c.knn_clus > 0 and pos.numel() > 1:
-            # the true passage retrieves at MANY adjacent positions;
-            # false matches are scattered singletons - boost clustered
-            # rows by neighbour count within knn_span
-            Kc = max(int(c.knn_span), 1)
-            deg = ((pos[:, None] - pos[None, :]).abs()
-                   <= Kc).float().sum(1) - 1.0
-            wv = wv * (1.0 + float(c.knn_clus) * deg)
         if c.knn_span > 0 and getattr(self, "_ringg", None) is not None:
             # span voting: neighbours retrieve CONTEXTS - every token
             # within +/-K stream positions of a match votes, so the
@@ -3145,7 +3166,12 @@ class _PredictMixin:
                         if amask is not None:
                             kv = kv * amask.float()
                             kvt = kv.sum()
-                        if float(kvt) > 0:
+                        share = float(
+                            kv.max() / kvt.clamp(min=1e-8)
+                        ) if float(kvt) > 0 else 0.0
+                        if (float(kvt) > 0
+                                and share >= float(
+                                    c.knn_lift_topconf)):
                             pk = kv / kvt.clamp(min=1e-8)
                             lg = lg + float(c.knn_lift) * torch.log(
                                 pk.clamp(min=1e-12))
@@ -3156,10 +3182,13 @@ class _PredictMixin:
                                   if bool(amask[t])}
                         if vd:
                             tot = sum(vd.values())
-                            for t, w in vd.items():
-                                lg[t] += float(c.knn_lift) * (
-                                    float(np.log(
-                                        max(w / tot, 1e-12))))
+                            top = max(vd.values())
+                            if (top / max(tot, 1e-8)
+                                    >= float(c.knn_lift_topconf)):
+                                for t, w in vd.items():
+                                    lg[t] += float(c.knn_lift) * (
+                                        float(np.log(
+                                            max(w / tot, 1e-12))))
                 if temperature <= 0:
                     x = int(lg.argmax())
                 else:

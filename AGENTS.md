@@ -722,6 +722,29 @@ Production code: `forge/` (was `research/`, migrated commit f1a7542)
   neutral on paraphrase frames (transfers stay distribution-
   consistent — benefit is continuous consolidation, not noisy
   writes).  Tests `test_gen_live_*` (6).
+  R69 — extractive knn recall lift for held-out QA (all knobs
+  default OFF in `config.py`): `_knn_votes_dev` is now a pipeline —
+  broad cosine pool (`knn_pool`) -> high-idf coverage rerank
+  (`knn_cover`/`knn_cover_w`) -> votes (successor; `knn_span` span
+  voting w/ `knn_dedup`+`knn_span_idf`; `knn_twin` answer-adoption
+  from rows inside trained "Q:..A:" lines; `knn_spread*` corpus-wide
+  content field, `knn_spread_doc` = flat doc-coverage maxpool x
+  own-idf).  Fingerprints: `knn_window` last-W bag + `knn_idf` +
+  `knn_residual` (prose-mean removal — fixes the cos~0.99 collapse)
+  + `knn_episode` prompt-span queries (`_prompt_start`/`_prompt_g`
+  set in `ingest()`).  Merged decode in `generate()`: `lg += knn_lift
+  * log p_votes` for `knn_lift_steps` — recall merges into
+  generation rather than replacing it, gated by deep-order cell
+  existence (`knn_lift_deep`, seen keep verbatim recall),
+  `knn_lift_thin`, `knn_lift_conf`, and vote concentration
+  (`knn_lift_topconf`).  Answer masks: `attach_vocab(itos)` +
+  `knn_atype` (word-initial alpha) + `knn_tokmin`/`knn_tokmax`.
+  BUG FIX: the spread field used to include the prompt span in the
+  live mask — the question self-matched its own rare tokens; the
+  query span is now excluded from field source and read positions.
+  Measured (4K trivia+evidence): seen_qa 0.86-0.96; paraphrase
+  generalization 54-80%; held_qa ~5% — corpus-knowledge bound
+  (answers absent from the docs), not a mechanism bound.
 - `forge/model/strata/` — STRATA (R60): FluxLM's successor as a
   three-artifact format — WEIGHTS `.strata` (labeled CellBlocks of
   packed 48B cells: tag32+meta+8×u32 followers+raw64, log-quantized

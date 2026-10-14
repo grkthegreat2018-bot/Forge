@@ -741,6 +741,10 @@ class FluxConfig:
     # above it (seen questions) the recalled answer already wins.
     # 0 = always lift.
     knn_lift_conf: float = 0.0
+    # vote-confidence gate: skip the lift unless the top-voted token
+    # carries >= this share of total knn vote mass.  Diffuse votes are
+    # noise - injecting them costs more than the lift gains.
+    knn_lift_topconf: float = 0.0
     # lift only in the THIN regime (_dthin_g==0): a warm deep-order
     # cell means this exact context was trained - recall already owns
     # the answer slot and retrieval must not override it.  1=thin-only.
@@ -806,6 +810,11 @@ class FluxConfig:
     # weighted by knn_twin * sim - near-duplicate held questions read
     # the matching trained answer directly (generalized recall).
     knn_twin: float = 0.0
+    # doc-bag spread readout: replace the proximity-decayed conv field
+    # with a maxpool field (flat document coverage) and weight votes
+    # by each token's own idf - surfaces answers that sit anywhere in
+    # the content-bearing doc, not only next to the defining phrase.
+    knn_spread_doc: int = 0
 
     # triton fused kernels (CUDA-primary only): single-launch deep-vote
     # eval + fused V-tail logit assembly.  Eager torch fallbacks cover
