@@ -215,6 +215,11 @@ class LoopConfig:
     flux_gen_channels: bool = False
     flux_gen_live: float = 0.0
     flux_gen_consolidate: float = 0.0
+    # R69 extractive recall lift: apply the tuned KNN
+    # retrieval/extraction/merge set to the resident model so
+    # self-play attempts read stored knowledge through the
+    # retrieve->extract->lift pipeline (see CHANGELOG R69)
+    flux_knn_qa: bool = False
 
     # ── R53: source-grounded goals + tool use ──
     # Goals are drawn from Wikipedia summaries, dictionary entries and
@@ -720,7 +725,33 @@ class InfiniteSelfPlayLoop:
                 if str(self.best_checkpoint).endswith(".flux") else None)
         self._engine = ForgeEngine.from_flux(fc, checkpoint=ckpt,
                                              device=cfg.device)
+        if cfg.flux_knn_qa:
+            self._flux_apply_knn_qa()
         return self._engine
+
+    _FLUX_KNN_QA = {
+        # tuned extractive-recall set (R69): windowed-IDF residual
+        # fingerprints, coverage-reranked pool, twin adoption + span
+        # votes, prompt-token subtraction, answer-type masks, and the
+        # gated answer-slot log-lift that merges recall into decode
+        "knn_window": 16, "knn_idf": 1.0, "knn_residual": 1.0,
+        "knn_episode": True, "knn_k": 64, "knn_pool": 256,
+        "knn_cover": 32, "knn_cover_w": 4.0, "knn_twin": 1.0,
+        "knn_span": 8, "knn_dedup": 1, "knn_subq": True,
+        "knn_atype": 1, "knn_lift": 8.0, "knn_lift_steps": 4,
+        "knn_lift_deep": 8, "knn_lift_topconf": 0.4,
+    }
+
+    def _flux_apply_knn_qa(self):
+        m = self._engine.model
+        for k, v in self._FLUX_KNN_QA.items():
+            setattr(m.config, k, v)
+        # answer-type masks need decoded token strings
+        if getattr(m, "_vocab_str", None) is None:
+            tok = getattr(self._engine, "tokenizer", None)
+            if tok is not None:
+                m.attach_vocab(
+                    [tok.decode([i]) for i in range(m.vocab_size)])
 
     # ── R53: source-grounded goals + tools ──
 
