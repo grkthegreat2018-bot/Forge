@@ -19,10 +19,19 @@ def main() -> int:
     ap.add_argument("--tokens", type=int, default=200_000)
     ap.add_argument("--gen", type=int, default=200)
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--cuda-primary", action="store_true")
+    ap.add_argument("--channels", default="",
+                    help="comma list: gcell,gsyn,gsyn_deep,dnet,r_live")
+    ap.add_argument("--tracemalloc", action="store_true",
+                    help="enable tracemalloc (adds ~3x overhead)")
     args = ap.parse_args()
 
-    tracemalloc.start()
-    cfg = FluxConfig(vocab_size=args.vocab, device=args.device)
+    if args.tracemalloc:
+        tracemalloc.start()
+    cfg = FluxConfig(vocab_size=args.vocab, device=args.device,
+                     cuda_primary=args.cuda_primary)
+    for ch in [s.strip() for s in args.channels.split(",") if s.strip()]:
+        setattr(cfg, ch, True)
     m = FluxLM(cfg)
 
     # synthetic corpus: repeated sentence patterns + noise
@@ -54,9 +63,15 @@ def main() -> int:
     print(f"generate: {args.gen / dt:,.0f} tok/s ({dt:.2f}s for {args.gen})")
 
     rep = m.memory_report()
-    cur, peak = tracemalloc.get_traced_memory()
-    print(f"memory_est: {rep['total_MB_est']:.0f} MB | "
-          f"tracemalloc peak: {peak / 1e6:.0f} MB")
+    line = f"memory_est: {rep['total_MB_est']:.0f} MB"
+    if tracemalloc.is_tracing():
+        cur, peak = tracemalloc.get_traced_memory()
+        line += f" | tracemalloc peak: {peak / 1e6:.0f} MB"
+    if torch.cuda.is_available() and args.device == "cuda":
+        line += (f" | vram: {torch.cuda.memory_allocated() / 1e6:.0f} MB "
+                 f"alloc / {torch.cuda.memory_reserved() / 1e6:.0f} MB "
+                 f"reserved / {torch.cuda.max_memory_allocated() / 1e6:.0f} MB peak")
+    print(line)
     print(f"channels: {m.channel_weights()}")
     print(f"journal: {len(m.journal):,} entries")
     return 0
