@@ -729,12 +729,18 @@ class InfiniteSelfPlayLoop:
             self._flux_apply_knn_qa()
         return self._engine
 
-    _FLUX_KNN_QA = {
-        # tuned extractive-recall set (R69): windowed-IDF residual
-        # fingerprints, coverage-reranked pool, twin adoption + span
-        # votes, prompt-token subtraction, answer-type masks, and the
-        # gated answer-slot log-lift that merges recall into decode
+    _FLUX_KNN_QA_WRITE = {
+        # write-side knobs: they define the fingerprint feature space -
+        # a resumed snapshot's bank was written under ITS config, so
+        # these only apply to fresh models
         "knn_window": 16, "knn_idf": 1.0, "knn_residual": 1.0,
+    }
+    _FLUX_KNN_QA = {
+        # tuned extractive-recall set (R69): coverage-reranked pool,
+        # twin adoption + span votes, prompt-token subtraction,
+        # answer-type masks, and the gated answer-slot log-lift that
+        # merges recall into decode - all predict-side, safe on any
+        # checkpoint
         "knn_episode": True, "knn_k": 64, "knn_pool": 256,
         "knn_cover": 32, "knn_cover_w": 4.0, "knn_twin": 1.0,
         "knn_span": 8, "knn_dedup": 1, "knn_subq": True,
@@ -744,7 +750,11 @@ class InfiniteSelfPlayLoop:
 
     def _flux_apply_knn_qa(self):
         m = self._engine.model
-        for k, v in self._FLUX_KNN_QA.items():
+        fresh = not str(self.best_checkpoint).endswith(".flux")
+        kv = dict(self._FLUX_KNN_QA)
+        if fresh:
+            kv.update(self._FLUX_KNN_QA_WRITE)
+        for k, v in kv.items():
             setattr(m.config, k, v)
         # answer-type masks need decoded token strings
         if getattr(m, "_vocab_str", None) is None:
