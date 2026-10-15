@@ -1853,12 +1853,17 @@ class _LearnMixin:
         n = len(ids)
         if n == 0:
             return 0
-        if c.auto_episode and 0 <= c.eos_token_id:
+        if (c.auto_episode and 0 <= c.eos_token_id
+                and c.eos_token_id in ids
+                and not getattr(self, "_bulk_split", False)):
             eos = c.eos_token_id
-            if eos in ids:
-                # document boundaries: bulk-ingest each [..EOS] segment
-                # as its own episode; boundary is a journaled soft_reset
-                total, last = 0, 0
+            # document boundaries: bulk-ingest each [..EOS] segment
+            # as its own episode; boundary is a journaled soft_reset.
+            # _bulk_split guards reentry: a segment ENDS with eos, so a
+            # recursive call that re-checked would loop forever.
+            total, last = 0, 0
+            self._bulk_split = True
+            try:
                 for i, x in enumerate(ids):
                     if x == eos:
                         total += self._ingest_bulk(ids[last:i + 1])
@@ -1866,7 +1871,9 @@ class _LearnMixin:
                         last = i + 1
                 if last < n:
                     total += self._ingest_bulk(ids[last:])
-                return total
+            finally:
+                self._bulk_split = False
+            return total
         base = self._count
         cap = c.ring_capacity
         ids_np = np.asarray(ids, dtype=np.int64)
