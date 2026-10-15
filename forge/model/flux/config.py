@@ -52,6 +52,13 @@ class FluxConfig:
     topic_decay: float = 0.995
     hebb_lr: float = 0.05
     topic_beta: float = 4.0        # sharpness of cosine -> pseudo-prob
+    # safety cap on _A/_Rl row norms (R69-2): grouped bulk writes apply
+    # sums of deltas computed against the pre-chunk row; for hot rows
+    # ('\n' seen ~120x/chunk) the stale-read sum overshoots the
+    # sequential update's geometric limit and ping-pongs to inf at
+    # multi-million-token scale.  Delta-rule saturation keeps healthy
+    # rows ~O(1), so the cap is a pure guard rail, never a tuner.
+    hebb_row_cap: float = 16.0
 
     # semantic-spread channel (generativity): proto = EMA fingerprint of
     # "what kind of token comes next"; tokens distributionally similar

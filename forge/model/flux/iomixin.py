@@ -379,7 +379,16 @@ class _IOMixin:
             model._graft = dict(rg[1])
         rl = state.get("Rl")
         if rl is not None:
-            model._Rl = rl.float().to(model._dev)
+            # heal a poisoned row: pre-R69-2 snapshots can carry inf/NaN
+            # (grouped _rl_bulk overshoot) - zero the nonfinite entries
+            # so _Reff targets stay finite; the EMA re-learns on use
+            model._Rl = torch.nan_to_num(
+                rl.float().to(model._dev),
+                nan=0.0, posinf=0.0, neginf=0.0)
+            rn = model._Rl.norm(dim=1, keepdim=True)
+            cap = float(model.config.topic_dim) ** 0.5
+            model._Rl = model._Rl * (cap
+                                     / rn.clamp(min=1e-8)).clamp(max=1.0)
         if model._Rl is not None:
             model._Reff = model._R.float() + model._Rl
         # remap channel weights by name - survives channel list changes
@@ -494,8 +503,9 @@ class _IOMixin:
                 n_g = min(keys_g.numel(), model._gt.S)
                 model._gt.tkeys[rc, :n_g] = keys_g[:n_g].to(
                     model._dev)
-                model._csem_rows[:n_g] = rows_g[:n_g].to(
-                    model._dev)
+                model._csem_rows[:n_g] = torch.nan_to_num(
+                    rows_g[:n_g].float(), nan=0.0,
+                    posinf=0.0, neginf=0.0).to(model._dev)
                 model._gt.used[rc] = int((keys_g != 0).sum())
         else:
             csem_cpu = state.get("csem_cpu")
@@ -556,12 +566,20 @@ class _IOMixin:
                                 if key == "A" else (cfg.topic_dim,))
             if not isinstance(v, torch.Tensor):
                 v = torch.from_numpy(np.asarray(v))
-            setattr(model, name, v.float().to(model._dev))
+            # heal nonfinite entries: a corrupt pre-R69-2 snapshot
+            # poisons every predict (inf _A row -> NaN cosine -> NaN
+            # logits -> argmax = pad); zero the bad entries so the
+            # intact sparse state stays usable
+            v = torch.nan_to_num(v.float(), nan=0.0,
+                                 posinf=0.0, neginf=0.0)
+            setattr(model, name, v.to(model._dev))
         c2 = state.get("c2")
         if c2 is not None:
             if not isinstance(c2, torch.Tensor):
                 c2 = torch.from_numpy(np.asarray(c2))
-            model._c2 = c2.float().to(model._dev)
+            model._c2 = torch.nan_to_num(
+                c2.float().to(model._dev),
+                nan=0.0, posinf=0.0, neginf=0.0)
         elif cfg.bigram_sketch:
             model._rebuild_c2()        # pre-sketch snapshot
         gc = state.get("gc")
@@ -583,11 +601,18 @@ class _IOMixin:
                 gs_s = None
             if not isinstance(gs, torch.Tensor):
                 gs = torch.from_numpy(np.asarray(gs))
-            model._S = gs.float().to(model._dev)
+            # heal: a poisoned _Reff target wrote inf into _S/_Ss on
+            # pre-R69-2 snapshots - decay never removes NaN, so a
+            # corrupt matrix must be zeroed to keep the channel usable
+            model._S = torch.nan_to_num(
+                gs.float().to(model._dev),
+                nan=0.0, posinf=0.0, neginf=0.0)
             if gs_s is not None:
                 if not isinstance(gs_s, torch.Tensor):
                     gs_s = torch.from_numpy(np.asarray(gs_s))
-                model._Ss = gs_s.float().to(model._dev)
+                model._Ss = torch.nan_to_num(
+                    gs_s.float().to(model._dev),
+                    nan=0.0, posinf=0.0, neginf=0.0)
             else:
                 model._Ss = torch.zeros_like(model._S)
         gsd = state.get("gsd")
@@ -595,11 +620,15 @@ class _IOMixin:
             # theta + momentum tuple -> device tensors; a snapshot
             # without gsyn_deep silently seeds fresh (config-off ablate)
             model._gsd_restore(
-                tuple(t.float() for t in gsd))
+                tuple(torch.nan_to_num(t.float(), nan=0.0,
+                                       posinf=0.0, neginf=0.0)
+                      for t in gsd))
         dn = state.get("dn")
         if dn is not None and model.config.dnet:
             model._dnet_restore(
-                tuple(t.float() for t in dn))
+                tuple(torch.nan_to_num(t.float(), nan=0.0,
+                                       posinf=0.0, neginf=0.0)
+                      for t in dn))
         wh = state.get("Wh")
         if wh is not None:
             if not isinstance(wh, torch.Tensor):

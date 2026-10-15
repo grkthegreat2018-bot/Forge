@@ -655,12 +655,26 @@ class _LearnMixin:
         """Hebbian/delta-rule topic write + incremental projections."""
         c = self.config
         if c.delta_rule:
+            # heal a corrupt row without a D2H branch - this runs under
+            # CUDA-graph capture: unconditional masked rewrite (finite
+            # rows rewrite as-is, corrupt rows zero out so the delta
+            # rule's pred can rebuild instead of re-seeding NaN) - R69-2
+            xrow = self._A.index_select(0, x.reshape(1))
+            self._A.index_copy_(
+                0, x.reshape(1),
+                torch.where(torch.isfinite(xrow), xrow,
+                            torch.zeros_like(xrow)))
+            a_x = self._A.index_select(0, x.reshape(1)).squeeze(0)
             chat = self._c / (cn + 1e-8)
             pred = (a_x * chat).sum()
             delta = chat * ((self._const_1.float() - pred)
                             * c.hebb_lr * sv)
         else:
             delta = self._c * (c.hebb_lr * sv)
+        # drop nonfinite deltas: a pre-corrupt row (pred=inf) would
+        # otherwise re-seed inf/NaN into _A every touch (R69-2)
+        delta = torch.nan_to_num(delta, nan=0.0,
+                                 posinf=0.0, neginf=0.0)
         self._avec_g.index_copy_(0, jcur.reshape(1),
                                  delta.unsqueeze(0))
         self._A.index_add_(0, x.reshape(1), delta.unsqueeze(0))
@@ -1791,6 +1805,9 @@ class _LearnMixin:
         if c.delta_rule:
             cn = float(self._c.norm())
             if cn > 1e-8:
+                if not bool(torch.isfinite(self._A[x]).all()):
+                    # heal: a corrupt row's pred re-seeds NaN forever
+                    self._A[x].zero_()
                 chat = self._c / cn
                 pred = float(self._A[x] @ chat)
                 delta_t = chat * ((1.0 - pred) * c.hebb_lr * s)
@@ -1799,6 +1816,10 @@ class _LearnMixin:
         else:
             delta_t = self._c * (c.hebb_lr * s)
         if not self._predict_only:
+            # drop nonfinite deltas: a pre-corrupt row re-seeds
+            # inf/NaN into _A on every touch otherwise (R69-2)
+            delta_t = torch.nan_to_num(delta_t, nan=0.0,
+                                       posinf=0.0, neginf=0.0)
             self._A[x].add_(delta_t)
             self.journal.append(
                 self.journal.append_vec(x, delta_t.cpu().numpy()))
@@ -2439,8 +2460,27 @@ class _LearnMixin:
             dtot = dtot.to(self._A.dtype)
             _group_add(self._A, u, dtot)
             blk["deltas"].append((u.cpu(), dtot.cpu()))  # grouped, host
-            # keep incremental Ac/An/Acn consistent (predict reads them)
-            _group_add(self._Ac, u, dtot @ self._Pcsem)
+            if c.hebb_row_cap > 0:
+                # stale-read guard (R69-2): phi only damps ALIGNED
+                # duplicate writes (kap -> 0 for near-orthogonal
+                # contexts), so a hot row can still random-walk until
+                # its residuals ping-pong to inf - observed _A['\n']
+                # -> inf at 3.1M tok.  Heal nonfinite and cap the row
+                # norm; healthy delta-rule rows sit ~O(1), the cap is
+                # a guard rail not a tuner.
+                rows_a = torch.nan_to_num(
+                    self._A.index_select(0, u).float(),
+                    nan=0.0, posinf=0.0, neginf=0.0)
+                rna = rows_a.norm(dim=1, keepdim=True)
+                rows_a = rows_a * (float(c.hebb_row_cap)
+                                   / rna.clamp(min=1e-8)).clamp(max=1.0)
+                self._A.index_copy_(0, u, rows_a.to(self._A.dtype))
+                # _Ac must mirror the healed rows, not the raw dtot
+                self._Ac.index_copy_(
+                    0, u, (rows_a @ self._Pcsem).to(self._Ac.dtype))
+            else:
+                # keep incremental Ac/An/Acn consistent (predict reads them)
+                _group_add(self._Ac, u, dtot @ self._Pcsem)
             axn = self._A.index_select(0, u)
             self._An.index_copy_(0, u, axn.norm(dim=1))
             self._Acn.index_copy_(

@@ -715,10 +715,15 @@ class _StateMixin:
         # S - one NaN entry destroys the dense matrix permanently
         # (decay never removes NaN).  s NaN -> maximal (R60
         # convention); non-finite k/v rows zeroed -> their outer
-        # products degenerate to no-ops.
-        s_f = torch.nan_to_num(s.float(), nan=1.0)
-        k = torch.nan_to_num(k.float(), nan=0.0)
-        v_all = torch.nan_to_num(v_all, nan=0.0)
+        # products degenerate to no-ops.  Explicit posinf/neginf ->
+        # 0/1: the default maps inf to +-3.4e38, still finite, which
+        # overflows S to inf on the next write (R69-2).
+        s_f = torch.nan_to_num(s.float(), nan=1.0,
+                               posinf=1.0, neginf=1.0)
+        k = torch.nan_to_num(k.float(), nan=0.0,
+                             posinf=0.0, neginf=0.0)
+        v_all = torch.nan_to_num(v_all, nan=0.0,
+                               posinf=0.0, neginf=0.0)
         for b0 in range(0, int(k.shape[0]), bs):
             kb = k[b0:b0 + bs].double()                     # [nb, dk]
             vb = v_all[b0:b0 + bs].double()                 # [nb, d]
@@ -1060,9 +1065,16 @@ class _StateMixin:
         if v is None:
             Rm = self._Reff if self._Reff is not None else self._R
             v = Rm[xs.long()].float()
-        s_f = torch.nan_to_num(s.float(), nan=1.0)
-        ks = torch.nan_to_num(ks.float(), nan=0.0)
-        v = torch.nan_to_num(v.float(), nan=0.0)
+        # nonfinite guards: default nan_to_num maps +-inf to +-3.4e38 -
+        # STILL finite, so a poisoned _Reff target row would write a
+        # 1e38 error into _DS and the next readout's inf-inf -> NaN
+        # kills the layer permanently (R69-2).  Zero nonfinite instead.
+        s_f = torch.nan_to_num(s.float(), nan=1.0,
+                               posinf=1.0, neginf=1.0)
+        ks = torch.nan_to_num(ks.float(), nan=0.0,
+                              posinf=0.0, neginf=0.0)
+        v = torch.nan_to_num(v.float(), nan=0.0,
+                             posinf=0.0, neginf=0.0)
         bs = int(c.dnet_chunk)
         if bs <= 0:                          # exact sequential path
             for i in range(int(ks.shape[0])):
@@ -1251,8 +1263,20 @@ class _StateMixin:
         resid = torch.nan_to_num(resid, nan=0.0, posinf=0.0,
                                  neginf=0.0)
         u2, tot = _group_totals(xl, resid)          # deterministic add
-        self._Rl.index_copy_(0, u2,
-                             self._Rl.index_select(0, u2) + tot)
+        new = self._Rl.index_select(0, u2) + tot
+        # the grouped resid is computed against the PRE-chunk row: m
+        # same-token duplicates in one chunk each contribute the full
+        # w*(u - old), so a hot token ('\n' ~120x/chunk) overshoots the
+        # sequential EMA's geometric limit and ping-pongs to inf at
+        # multi-million-token scale (R69-2: poisoned _Reff -> inf
+        # targets -> _S/_DS blowup).  Re-impose the sequential
+        # invariant exactly: targets are u = unit*sqrt(d), convex EMA
+        # keeps ||row|| <= sqrt(topic_dim); nonfinite heals to 0.
+        new = torch.nan_to_num(new, nan=0.0, posinf=0.0, neginf=0.0)
+        rn = new.norm(dim=1, keepdim=True)
+        cap = float(c.topic_dim) ** 0.5
+        new = new * (cap / rn.clamp(min=1e-8)).clamp(max=1.0)
+        self._Rl.index_copy_(0, u2, new)
         self._Reff.index_copy_(
             0, u2, self._R.index_select(0, u2).float()
             + self._Rl.index_select(0, u2))

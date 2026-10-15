@@ -1975,7 +1975,7 @@ class _PredictMixin:
                             or self.config.gsyn_deep or self.config.dnet):
                         self._apply_sparse_lift_dev(
                             lg, int(self._dthin_g.item()))
-                    return lg
+                    return self._finite_lg(lg)
             if self._pwarm < 3:
                 self._pwarm += 1
                 lg = self._predict_dev(self._bend)
@@ -1995,7 +1995,20 @@ class _PredictMixin:
                 or self.config.dnet):
             self._apply_sparse_lift_dev(
                 lg, int(self._dthin_g.item()))
-        return lg
+        return self._finite_lg(lg)
+
+    def _finite_lg(self, lg: torch.Tensor) -> torch.Tensor:
+        """Backstop: a corrupt channel state (pre-R69-2 snapshot or a
+        write-path bug) must degrade to the unigram prior, not emit
+        NaN logits -> argmax = pad forever.  Per-token fallback keeps
+        every finite channel vote intact."""
+        if bool(torch.isfinite(lg).all()):
+            return lg
+        c = self.config
+        uni = self._log_uni_num - math.log(
+            float(self._tot_g.item())
+            + c.uni_alpha * self.vocab_size)
+        return torch.where(torch.isfinite(lg), lg, uni)
 
     def _decay_table(self, tab: dict[int, dict[int, float]],
                      tots: dict[int, float]) -> None:
@@ -2642,6 +2655,11 @@ class _PredictMixin:
                 logits if torch.is_tensor(logits)
                 else torch.as_tensor(np.asarray(logits)),
                 cap, self, warm=self._regime)
+        if not bool(torch.isfinite(logits).all()):
+            # same backstop as _predict_gpu: corrupt channel state
+            # degrades to the unigram prior, not NaN -> pad (R69-2)
+            uni = self._log_uni_num - log_denom
+            logits = torch.where(torch.isfinite(logits), logits, uni)
         return logits
 
     # -- public API ------------------------------------------------------
