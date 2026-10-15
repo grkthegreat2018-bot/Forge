@@ -72,6 +72,29 @@ def main() -> int:
     ap.add_argument("--top-k", type=int, default=5)
     ap.add_argument("--scale", type=float, default=2.0,
                     help="teacher prob -> count multiplier")
+    ap.add_argument("--mode", default="tables",
+                    choices=["tables", "hebbian", "head"],
+                    help="distillation target: order/key tables (verbatim + "
+                         "chosen families), _A Hebbian delta writes "
+                         "(generalizes via fingerprint cosine), or a "
+                         "trained linear readout head (function "
+                         "approximation - strongest transfer, reads in "
+                         "_predict at weight config.head_w)")
+    ap.add_argument("--families", default="orders",
+                    help="tables mode only: comma list of key families - "
+                         "orders,class,sparse,hybrid,word. Non-order "
+                         "families recur on NOVEL text so teacher mass "
+                         "written there transfers off-verbatim")
+    ap.add_argument("--eta", type=float, default=1.0,
+                    help="hebbian mode: write strength multiplier")
+    ap.add_argument("--epochs", type=int, default=2,
+                    help="head mode: training epochs over collected pairs")
+    ap.add_argument("--lr", type=float, default=3e-3,
+                    help="head mode: readout-head learning rate")
+    ap.add_argument("--scope", default="gaps",
+                    choices=["gaps", "all"],
+                    help="head mode: train at thin-gap positions only, or "
+                         "every ring-retained position")
     ap.add_argument("--max-gaps", type=int, default=50_000)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--ctx-len", type=int, default=32)
@@ -111,10 +134,25 @@ def main() -> int:
         print(f"  {done:,}/{total:,} gaps  ({done / max(el, 1e-9):,.0f}/s)",
                 flush=True)
 
-    rep = m.distill_from(score_fn, top_k=args.top_k, scale=args.scale,
-                         max_gaps=args.max_gaps, batch_size=args.batch,
-                         ctx_len=args.ctx_len, tag="distill",
-                         progress=progress)
+    if args.mode == "tables":
+        rep = m.distill_from(
+            score_fn, top_k=args.top_k, scale=args.scale,
+            max_gaps=args.max_gaps, batch_size=args.batch,
+            ctx_len=args.ctx_len, tag="distill",
+            families=tuple(f.strip() for f in args.families.split(",")
+                           if f.strip()),
+            progress=progress)
+    elif args.mode == "hebbian":
+        rep = m.distill_hebbian(
+            score_fn, top_k=args.top_k, eta=args.eta,
+            max_gaps=args.max_gaps, batch_size=args.batch,
+            ctx_len=args.ctx_len, tag="distill", progress=progress)
+    else:
+        rep = m.distill_head(
+            score_fn, top_k=args.top_k, ctx_len=args.ctx_len,
+            epochs=args.epochs, lr=args.lr, batch_size=args.batch,
+            max_gaps=args.max_gaps, scope=args.scope,
+            tag="distill", progress=progress)
     print(rep)
     out = args.out or args.model
     m.snapshot(out)
