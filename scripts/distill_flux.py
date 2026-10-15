@@ -95,6 +95,12 @@ def main() -> int:
                     choices=["gaps", "all"],
                     help="head mode: train at thin-gap positions only, or "
                          "every ring-retained position")
+    ap.add_argument("--head-hidden", type=int, default=0,
+                    help="head mode: hidden width >0 trains the MLP "
+                         "channel (Wh @ relu(Wh1 @ x)) - measured better "
+                         "than linear, which tops out at marginal-"
+                         "frequency predictions. Sets config.head_hidden "
+                         "on the loaded model before training")
     ap.add_argument("--max-gaps", type=int, default=50_000)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--ctx-len", type=int, default=32)
@@ -148,6 +154,8 @@ def main() -> int:
             max_gaps=args.max_gaps, batch_size=args.batch,
             ctx_len=args.ctx_len, tag="distill", progress=progress)
     else:
+        if args.head_hidden:
+            m.config.head_hidden = args.head_hidden
         rep = m.distill_head(
             score_fn, top_k=args.top_k, ctx_len=args.ctx_len,
             epochs=args.epochs, lr=args.lr, batch_size=args.batch,
