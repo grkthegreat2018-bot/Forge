@@ -2274,6 +2274,66 @@ def test_gen_live_gpu(gpu_available):
     assert float(m_on._S.norm()) > float(m_off._S.norm())
 
 
+def test_teach_writes_all_gen_stores():
+    """teach(generalize=True) is the self-play write path: one call
+    pushes the binding through EVERY enabled gen channel - gcell map,
+    gsyn matrix, gsyn_deep theta, dnet layer states and the r_live row
+    all move inside the same journaled block."""
+    m = FluxLM(_cfg_rlive(gen_live=1.0, gsyn_deep=True, dnet=True))
+    m.ingest(_ids("background stream " * 4), tag="t")
+    S0, Rl0, Wd0 = m._S.clone(), m._Rl.clone(), m._Wd1.clone()
+    DS0 = [s.clone() for s in m._DS]
+    gc0 = {k: dict(v) for k, v in m._gc.items()}
+    rep = m.teach(_ids("the capital of france is"), _ids(" paris"),
+                  tag="T")
+    assert rep["cells"] > 0                     # exact recall too
+    assert rep.get("gcell", 0) > 0
+    assert rep.get("gsyn", 0) > 0
+    assert rep.get("gsyn_deep", 0) > 0
+    assert rep.get("dnet", 0) > 0
+    assert not torch.equal(m._S, S0)
+    assert not torch.equal(m._Rl, Rl0)
+    assert not torch.equal(m._Wd1, Wd0)
+    assert any(not torch.equal(a, b) for a, b in zip(m._DS, DS0))
+    assert m._gc != gc0
+
+
+def test_teach_generalize_flag_isolates_gen_writes():
+    """generalize=False writes ONLY the recall cells - the gen stores
+    stay bit-identical, proving the gen-channel writes are the head's
+    share of a live teach rather than a side effect of cell writes."""
+    kw = dict(gen_live=1.0, gsyn_deep=True, dnet=True)
+    ctx, tgt = _ids("the capital of france is"), _ids(" paris")
+    m_g, m_e = FluxLM(_cfg_rlive(**kw)), FluxLM(_cfg_rlive(**kw))
+    for m in (m_g, m_e):
+        m.ingest(_ids("background stream " * 4), tag="t")
+    S0 = m_g._S.clone()
+    gc0 = {k: dict(v) for k, v in m_g._gc.items()}
+    m_g.teach(ctx, tgt, tag="T", generalize=True)
+    m_e.teach(ctx, tgt, tag="T", generalize=False)
+    assert torch.equal(m_e._S, S0) and m_e._gc == gc0
+    assert not torch.equal(m_g._S, S0) and m_g._gc != gc0
+    # and the extra gen mass is observable at predict time: same
+    # recall cells, different logits
+    for m in (m_g, m_e):
+        for x in ctx:
+            m._learn_token(x)
+    assert not torch.equal(torch.as_tensor(m_g._predict()),
+                           torch.as_tensor(m_e._predict()))
+
+
+def test_gen_head_holds_no_params():
+    """The generalizer is a routing mechanism, not a module: FluxLM
+    registers zero nn.Parameters, and teach/gen_live never create the
+    distill head (_Wh/_Wh1 stay None) - every gen 'weight' lives in
+    the journaled stores."""
+    m = FluxLM(_cfg_rlive(gen_live=1.0, gsyn_deep=True, dnet=True))
+    m.ingest(_ids("warmup stream " * 4), tag="t")
+    m.teach(_ids("ctx here"), _ids(" tgt"), tag="T")
+    assert len(list(m.parameters())) == 0
+    assert m._Wh is None and m._Wh1 is None
+
+
 # -- gsyn_deep: separate nonlinear (TTT-MLP) memory channel ----------
 
 
