@@ -2702,6 +2702,13 @@ def main():
                         help="flux mode: per-epoch consolidate_gen mass "
                              "(0=off, ~1.0 full) - batch complement to "
                              "live gen_live transfers")
+    parser.add_argument("--flux-knn-qa", action="store_true",
+                        help="flux mode: apply the tuned R69 extractive-"
+                             "recall set (coverage rerank, twin/span "
+                             "votes, gated answer-slot lift). Write-side "
+                             "knobs only apply to fresh models - a "
+                             "resumed .flux keeps its own fingerprint "
+                             "space")
     parser.add_argument("--grpo-algorithm", type=str, default="grpo",
                         choices=["grpo", "gtpo", "cispo", "sppo", "psppo",
                                  "evpo", "grpo_or"],
@@ -2873,6 +2880,7 @@ def main():
         flux_gen_channels=args.flux_gen_channels,
         flux_gen_live=args.flux_gen_live,
         flux_gen_consolidate=args.flux_gen_consolidate,
+        flux_knn_qa=args.flux_knn_qa,
         grpo_max_steps=args.grpo_steps,
         grpo_lr=args.grpo_lr,
         grpo_group_size=args.grpo_group_size,
