@@ -373,6 +373,7 @@ class _StateMixin:
             u = torch.as_tensor(self._uni, dtype=torch.float32,
                                 device=self._dev)[toks]
             tot = float(self._total)
+            return torch.log1p(max(tot, 1.0) / (u + c.uni_alpha))
         return torch.log1p(
             tot.float().clamp(min=1.0) / (u.float() + c.uni_alpha))
 
